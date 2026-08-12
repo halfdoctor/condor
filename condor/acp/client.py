@@ -215,7 +215,7 @@ def reap_stale_acp_trees(token: str, *, wait_s: float = 2.0) -> int:
 ACP_COMMANDS: dict[str, str] = {
     "claude-code": "claude-agent-acp",
     "claude-acp": "claude-agent-acp",  # model-configurable form: claude-acp:<model>
-    "gemini": "npx @google/gemini-cli --acp",
+    "gemini": "npx antigravity-acp",
     "copilot": "npx @github/copilot --acp --stdio",
     "codex": "npx @agentclientprotocol/codex-acp",
 }
@@ -271,6 +271,20 @@ def resolve_acp(agent_key: str) -> tuple[str, dict[str, str], str]:
     if model and base in _CLAUDE_ACP_BASES:
         env["ANTHROPIC_MODEL"] = model
         model_pref = model
+    elif base == "gemini":
+        from pathlib import Path
+        home = Path.home()
+        paths = []
+        bun_bin = home / ".bun" / "bin"
+        local_bin = home / ".local" / "bin"
+        if bun_bin.exists():
+            paths.append(str(bun_bin))
+        if local_bin.exists():
+            paths.append(str(local_bin))
+            env["AGY_BIN"] = str(local_bin / "agy")
+        if paths:
+            existing_path = os.environ.get("PATH", "")
+            env["PATH"] = os.pathsep.join(paths + [existing_path]) if existing_path else os.pathsep.join(paths)
     return command, env, model_pref
 
 

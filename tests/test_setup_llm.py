@@ -38,7 +38,7 @@ def recorder():
 READY_STATES = {
     "claude-code": Readiness(READY, "installed and logged in"),
     "claude-acp": Readiness(UNVERIFIED, "installed; run `claude` once and log in"),
-    "gemini": Readiness(MISSING, "not installed — npm install -g @google/gemini-cli"),
+    "gemini": Readiness(MISSING, "not installed — npm install -g antigravity-acp"),
     "copilot": Readiness(MISSING, "not installed"),
     "codex": Readiness(MISSING, "not installed"),
     "ollama": Readiness(READY, "2 model(s) available", ["qwen3:32b", "llama3"]),
@@ -241,7 +241,7 @@ def test_menu_marks_the_current_default_and_badges_each_row():
     assert "← current default" in text
     assert "[✓ installed and logged in]" in text
     assert "[? installed; run `claude` once and log in]" in text
-    assert "[✗ not installed — npm install -g @google/gemini-cli]" in text
+    assert "[✗ not installed — npm install -g antigravity-acp]" in text
     assert "s. Skip" in text
 
 

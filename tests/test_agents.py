@@ -593,7 +593,7 @@ def test_resolve_acp_model_suffix():
     assert resolve_acp("claude-acp") == ("claude-agent-acp", {}, "")
 
     cmd, env, pref = resolve_acp("gemini")
-    assert "gemini" in cmd and env == {} and pref == ""
+    assert ("gemini" in cmd or "antigravity" in cmd) and pref == ""
 
 
 def test_resolve_model_id_matching():

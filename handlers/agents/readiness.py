@@ -56,7 +56,7 @@ LOCAL_PREFIXES = ("ollama", "lmstudio")
 _LOGIN_COMMANDS = {
     "claude-code": "claude",
     "claude-acp": "claude",
-    "gemini": "npx @google/gemini-cli",
+    "gemini": "agy",
     "copilot": "npx @github/copilot",
     "codex": "codex",
 }

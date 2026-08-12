@@ -25,7 +25,7 @@ def test_npx_packages_finds_local_global_and_cache(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / ".npm" / "_npx" / "abc123" / "node_modules" / "cached").mkdir(parents=True)
     global_root = tmp_path / "global" / "node_modules"
-    (global_root / "@google" / "gemini-cli").mkdir(parents=True)
+    (global_root / "antigravity-acp").mkdir(parents=True)
 
     monkeypatch.setattr(readiness.Path, "cwd", staticmethod(lambda: cwd))
     monkeypatch.setattr(readiness.Path, "home", staticmethod(lambda: home))
@@ -37,7 +37,7 @@ def test_npx_packages_finds_local_global_and_cache(tmp_path, monkeypatch):
     )
 
     found = readiness.npx_packages_installed()
-    assert {"local-pkg", "@scope/scoped", "cached", "@google/gemini-cli"} <= found
+    assert {"local-pkg", "@scope/scoped", "cached", "antigravity-acp"} <= found
 
 
 def test_npx_packages_survives_unusable_npm(tmp_path, monkeypatch):
@@ -135,7 +135,7 @@ def test_acp_bridges_probes_the_package_not_the_launcher(monkeypatch):
 
 def test_acp_bridges_surface_login_state(monkeypatch):
     monkeypatch.setattr(
-        readiness, "npx_packages_installed", lambda: {"@google/gemini-cli"}
+        readiness, "npx_packages_installed", lambda: {"antigravity-acp"}
     )
     monkeypatch.setattr(readiness.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(
@@ -154,8 +154,8 @@ def test_acp_bridges_surface_login_state(monkeypatch):
 
 
 def test_install_command_names_the_package():
-    assert readiness.install_command("npx @google/gemini-cli --acp") == (
-        "npm install -g @google/gemini-cli"
+    assert readiness.install_command("npx antigravity-acp") == (
+        "npm install -g antigravity-acp"
     )
     assert readiness.install_command("claude-agent-acp") == (
         "npm install -g @agentclientprotocol/claude-agent-acp"
@@ -184,7 +184,7 @@ def test_probe_missing_bridge_names_the_install_command(monkeypatch):
         bridges=[
             {
                 "agent_key": "gemini",
-                "command": "npx @google/gemini-cli --acp",
+                "command": "npx antigravity-acp",
                 "available": False,
                 "logged_in": None,
             }
@@ -192,7 +192,7 @@ def test_probe_missing_bridge_names_the_install_command(monkeypatch):
         monkeypatch=monkeypatch,
     )
     assert r.state == MISSING
-    assert "npm install -g @google/gemini-cli" in r.detail
+    assert "npm install -g antigravity-acp" in r.detail
     assert r.usable is False
 
 
