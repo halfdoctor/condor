@@ -6,7 +6,7 @@ description: Directional perp trader on Derive (`derive_perpetual`) — reads ca
 # custom endpoint "opencode"; register it once (Settings -> LLM Endpoints, or
 # CUSTOM_LLM_BASE_URL / CUSTOM_LLM_API_KEY in .env for headless deploys) pointing
 # at https://opencode.ai/zen/go/v1 with your OPENCODE_GO_API_KEY.
-agent_key: custom@opencode:deepseek-v4-flash
+agent_key: gemini
 tools:
 - manage_routines
 - manage_executors

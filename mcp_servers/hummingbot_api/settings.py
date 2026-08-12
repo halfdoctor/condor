@@ -31,12 +31,30 @@ class ServerConfig(BaseModel):
 
 
 def _load_server_config() -> ServerConfig:
-    """Load server config from ~/.hummingbot_mcp/server.yml, fallback to env vars."""
+    """Load server config from ~/.hummingbot_mcp/server.yml, fallback to env vars or local config.yml."""
     if SERVER_CONFIG_PATH.exists():
         try:
             with open(SERVER_CONFIG_PATH) as f:
                 data = yaml.safe_load(f) or {}
             return ServerConfig(**data)
+        except Exception:
+            pass
+
+    # Try loading from local config.yml in the current workspace directory
+    config_yml_path = Path("config.yml")
+    if config_yml_path.exists():
+        try:
+            with open(config_yml_path) as f:
+                data = yaml.safe_load(f) or {}
+            servers = data.get("servers", {})
+            local_server = servers.get("local", {})
+            if local_server:
+                return ServerConfig(
+                    name="local",
+                    url=os.getenv("HUMMINGBOT_API_URL", f"http://{local_server.get('host', 'localhost')}:{local_server.get('port', 8000)}"),
+                    username=os.getenv("HUMMINGBOT_USERNAME", local_server.get("username", "admin")),
+                    password=os.getenv("HUMMINGBOT_PASSWORD", local_server.get("password", "admin")),
+                )
         except Exception:
             pass
 

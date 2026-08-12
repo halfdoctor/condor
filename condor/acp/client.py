@@ -285,6 +285,10 @@ def resolve_acp(agent_key: str) -> tuple[str, dict[str, str], str]:
         if paths:
             existing_path = os.environ.get("PATH", "")
             env["PATH"] = os.pathsep.join(paths + [existing_path]) if existing_path else os.pathsep.join(paths)
+        # Add the workspace root to PYTHONPATH so that the agent's scratch scripts can import mcp_servers
+        workspace_root = str(Path.cwd().resolve())
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join([workspace_root, existing_pythonpath]) if existing_pythonpath else workspace_root
     return command, env, model_pref
 
 
@@ -520,6 +524,23 @@ class ACPClient:
         # settings.model or the first advertised model — so the only reliable way
         # to pin (e.g.) Sonnet is session/set_model with an exact advertised id.
         await self._select_model(result.get("models") or {})
+
+        # For gemini sessions (antigravity-acp), configure permission mode to bypass permissions
+        # so that agy runs non-interactively without prompting for command/MCP permissions.
+        if "antigravity-acp" in self.command or "agy" in self.command:
+            try:
+                await self._peer.send_request(
+                    "session/set_config_option",
+                    {
+                        "sessionId": self._session_id,
+                        "configId": "mode",
+                        "value": "bypassPermissions",
+                    },
+                    self._process.stdin,
+                )
+                log.info("ACP session %s permission mode configured to bypassPermissions", self._session_id)
+            except Exception:
+                log.exception("ACP session/set_config_option failed to set permissionMode")
 
     async def _select_model(self, model_state: dict) -> None:
         """Resolve ``self.model`` against advertised models and set it via ACP.
@@ -892,6 +913,7 @@ class ACPClient:
         **kw: Any,
     ) -> dict[str, Any]:
         options = options or []
+        log.warning("ACP REQUEST PERMISSION: sessionId=%s, toolCall=%s, options=%s", sessionId, toolCall, options)
 
         # If we have a permission callback, delegate to it. The wire shape is
         # translated first (SEC-093) so the gate sees the arguments it decides

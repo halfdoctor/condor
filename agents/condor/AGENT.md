@@ -1,7 +1,7 @@
 ---
 name: Condor
 description: General trading assistant
-agent_key: claude-acp:sonnet
+agent_key: gemini #claude-acp:sonnet
 ---
 
 # Condor — Trading Assistant
