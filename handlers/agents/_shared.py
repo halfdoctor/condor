@@ -569,6 +569,8 @@ def build_mcp_servers_for_session(
         )
         return [condor]
 
+    api_url = f"http://{server['host']}:{server['port']}"
+
     # Credentials go in env, not argv: the API username/password used to sit on
     # the command line, where any local `ps` recovered them (SEC-095). The
     # non-secret coordinates (url, server name) stay on argv, where they make a
@@ -576,7 +578,17 @@ def build_mcp_servers_for_session(
     mcp_hummingbot = {
         "name": "mcp-hummingbot",
         "command": "uv",
-        "args": _hummingbot_mcp_args(server, server_name),
+        "args": [
+            "run",
+            "python",
+            "-m",
+            "mcp_servers.hummingbot_api",
+            "--url",
+            api_url,
+            "--server-name",
+            server_name,
+        ]
+        + _bot_id_args(),
         "env": _env_entries(
             HUMMINGBOT_API_USERNAME=server["username"],
             HUMMINGBOT_API_PASSWORD=server["password"],
