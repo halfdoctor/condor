@@ -755,9 +755,9 @@ def format_portfolio_overview(
                 conn_total = sum(
                     b.get("value", 0)
                     for b in connector_balances
-                    if b.get("value", 0) > 0
+                    if b.get("value", 0) != 0
                 )
-                if conn_total > 0:
+                if conn_total != 0 or connector_balances:
                     connector_list.append(
                         (connector_name, connector_balances, conn_total)
                     )
@@ -765,7 +765,7 @@ def format_portfolio_overview(
             if not connector_list:
                 continue
 
-            connector_list.sort(key=lambda x: x[2], reverse=True)
+            connector_list.sort(key=lambda x: abs(x[2]), reverse=True)
 
             message += f"*Account:* _{escape_markdown_v2(account_name)}_\n"
 
@@ -773,17 +773,17 @@ def format_portfolio_overview(
                 conn_total_str = format_number(conn_total)
                 message += f"  🏦 *{escape_markdown_v2(connector_name)}* \\- `{escape_markdown_v2(conn_total_str)}`\n\n"
 
-                # Sort tokens by value descending, filter > $1
+                # Sort tokens by absolute value descending
                 sorted_tokens = sorted(
-                    [b for b in connector_balances if b.get("value", 0) >= 1],
-                    key=lambda x: x.get("value", 0),
+                    [b for b in connector_balances if abs(b.get("value", 0)) >= 0.01 or b.get("units", 0) != 0],
+                    key=lambda x: abs(x.get("value", 0)),
                     reverse=True,
                 )
 
                 if sorted_tokens:
                     message += "```\n"
-                    message += f"{'Token':<6} {'Price':<9} {'Value':<8} {'%Tot':>5}\n"
-                    message += f"{'─'*6} {'─'*9} {'─'*8} {'─'*5}\n"
+                    message += f"{'Token':<22} {'Price':<9} {'Value':<8} {'%Tot':>5}\n"
+                    message += f"{'─'*22} {'─'*9} {'─'*8} {'─'*5}\n"
 
                     for balance in sorted_tokens[:10]:
                         token = balance.get("token", "???")
@@ -801,14 +801,14 @@ def format_portfolio_overview(
                             except (ValueError, TypeError):
                                 value = 0
 
-                        token_display = token[:5] if len(token) > 5 else token
+                        token_display = token[:22]
                         price = value / units if units > 0 else 0
                         price_str = format_price(price)[:9]
                         value_str = format_number(value)[:8]
                         pct = (value / total_value * 100) if total_value > 0 else 0
                         pct_str = f"{pct:.1f}%" if pct < 100 else f"{pct:.0f}%"
 
-                        message += f"{token_display:<6} {price_str:<9} {value_str:<8} {pct_str:>5}\n"
+                        message += f"{token_display:<22} {price_str:<9} {value_str:<8} {pct_str:>5}\n"
 
                     if len(sorted_tokens) > 10:
                         message += f"\n... +{len(sorted_tokens) - 10} more\n"

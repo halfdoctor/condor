@@ -143,9 +143,9 @@ async def get_portfolio(
                     )
                     connector_total += usd_val
 
-                # Filter out zero-value tokens and sort by value descending
-                balances = [b for b in balances if b.usd_value >= 0.01]
-                balances.sort(key=lambda b: b.usd_value, reverse=True)
+                # Filter out zero-value tokens and sort by absolute value descending
+                balances = [b for b in balances if abs(b.usd_value) >= 0.01 or abs(b.total) > 0]
+                balances.sort(key=lambda b: abs(b.usd_value), reverse=True)
 
                 connectors.append(
                     ConnectorBalance(
@@ -496,7 +496,7 @@ def _extract_token_values(data: object) -> dict[str, float]:
                         if isinstance(item, dict):
                             token = item.get("token", item.get("asset", ""))
                             usd = float(item.get("value", item.get("usd_value", 0)))
-                            if token and usd > 0:
+                            if token and (usd != 0 or float(item.get("units", item.get("total_balance", 0))) != 0):
                                 tokens[token] = tokens.get(token, 0) + usd
     return tokens
 

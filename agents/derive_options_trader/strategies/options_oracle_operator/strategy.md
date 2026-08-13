@@ -2,7 +2,7 @@
 name: Options Oracle Operator
 description: Trades SOL-USDC perps on Derive using the options_flow signal — 25D risk
   reversal, put/call OI ratio, IV term structure, and GEX composite. 5-minute cadence.
-agent_key: claude-acp:sonnet
+agent_key: gemini
 skills:
 - derive_options_trader:smart_money_playbook
 default_config:

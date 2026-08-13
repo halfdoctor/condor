@@ -96,11 +96,11 @@ def _get_connector_keys(balances: dict) -> list:
                 total = sum(
                     b.get("value", 0)
                     for b in connector_balances
-                    if b.get("value", 0) > 0
+                    if b.get("value", 0) != 0
                 )
-                if total > 0:
+                if total != 0 or connector_balances:
                     connector_values.append(
-                        {"key": f"{account_name}:{connector_name}", "value": total}
+                        {"key": f"{account_name}:{connector_name}", "value": abs(total)}
                     )
 
     # Sort by value descending
