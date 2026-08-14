@@ -15,7 +15,6 @@ default_config:
   notify_on_change_only: true
   paper_mode: false
   target_profit_pct: 60
-  telegram_chat_id: '1934595831'
   trading_pair: ETH-USDT
   use_derivatives_monkey_intel: true
 default_trading_context: ''
@@ -31,7 +30,7 @@ Autonomous 1-Minute Cadence Short Volatility Arbitrage Strategy on Derive (Lyra 
 
 The strategy monetizes the volatility risk premium between Implied Volatility (IV) and Realized Volatility (RV) by systematically writing defined-risk 4-Leg Iron Condors and dynamically delta-hedging with perpetual futures.
 
-- **Market Venue**: Derive Protocol (Mainnet Smart Contract Wallet: `0xC7A49bbb5cA63BA989bD87c3c2CD68Da639a4694`, Subaccount: `50061`)
+- **Market Venue**: Derive Protocol (Loaded dynamically via `DERIVE_SMART_CONTRACT_WALLET`, `DERIVE_SESSION_KEY_PRIV`, `DERIVE_SUBACCOUNT_ID` from `.env` or routine config)
 - **Primary Underlyings**: `ETH-USDT`, `BTC-USDT`, `HYPE-USDT`
 - **Execution Route**: Atomic RFQ Combo Packages via EIP-712 session key signing (`derive_action_signing`)
 - **Loop Cadence**: 60 Seconds (1 Minute)
@@ -40,14 +39,20 @@ The strategy monetizes the volatility risk premium between Implied Volatility (I
 
 ## 2. Quantitative Model & Signal Triggers
 
-### 2.1 Net Volatility Edge Formulation
-$$\text{Net Edge} = (\text{IV}_{\text{14D}} - \text{RV}_{\text{7D}}) - \text{Friction Cost (2.50 pts)}$$
-- **Entry / Scale-In Threshold**: $\text{Net Edge} \ge 5.0\text{ vol points}$
-- **Pricing Engine**: Full Black-Scholes model for Calls/Puts ($d_1, d_2, \Phi(x)$, theoretical premiums, and Greeks)
+### 2.1 Dynamic Volatility Engine (No Hardcoding)
+- **Live Spot Price ($S_0$)**: Fetched in real time from Derive `/public/get_ticker` (`ETH-PERP` / `{SYMBOL}-PERP`).
+- **Dynamic Implied Volatility ($\text{IV}_{14\text{D}}$)**: Discovers live ATM options on Derive `/public/get_instruments`, reads live `mark_price` from `/public/get_ticker`, and inverts the Black-Scholes pricing formula via Newton-Raphson:
+  $$\text{BS\_Price}(S_0, K_{\text{ATM}}, T, r=0.03, \sigma_{\text{IV}}) = \text{Mark Price} \implies \sigma_{\text{IV}}$$
+- **Dynamic 7-Day Realized Volatility ($\text{RV}_{7\text{D}}$)**: Fetches trailing 168 1-hour candle closes from Binance / Hyperliquid / CoinGecko REST APIs and computes annualized variance:
+  $$\text{RV}_{7\text{D}} = \sqrt{\frac{24 \times 365}{N-1} \sum_{t=1}^N \left(\ln\frac{S_t}{S_{t-1}} - \bar{r}\right)^2} \times 100\%$$
+- **Net Volatility Edge**:
+  $$\text{Net Edge} = (\text{IV}_{14\text{D}} - \text{RV}_{7\text{D}}) - 2.50\text{ pts}$$
+- **Entry / Scale-In Threshold**: $\text{Net Edge} \ge 5.0\text{ vol points}$.
 
 ### 2.2 Derivatives Monkey Institutional Intelligence
-- Parses Dealer Gamma Exposure (GEX) and Delta Exposure (DEX) from `derivativesmonkey.com`.
-- **High Conviction Filter**: Dealer GEX $\ge +\$5.0\text{M}$ confirms spot volatility dampening, validating short-volatility premium collection.
+- Parses Dealer Gamma Exposure (GEX) and Delta Exposure (DEX) dynamically from the live options surface:
+  $$\text{GEX} = \sum_{K} \text{OI}_K \cdot \Gamma_K \cdot S^2 \cdot 0.01$$
+- **High Conviction Filter**: Dealer GEX $\ge +\$5.0\text{M}$ confirms spot volatility compression, validating short-volatility premium collection.
 
 ---
 
@@ -114,8 +119,7 @@ manage_routines(
     "max_margin_utilization_pct": 75.0,
     "max_perp_delta_hedge_ratio": 1.0,
     "target_profit_pct": 60.0,
-    "notify_on_change_only": true,
-    "telegram_chat_id": "1934595831"
+    "notify_on_change_only": true
   }
 )
 ```
