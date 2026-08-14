@@ -274,6 +274,23 @@ async def _poll_until_done(instance_id: str) -> dict | None:
     return None
 
 
+def _resolve_active_server() -> str | None:
+    if settings.active_server:
+        return settings.active_server
+    try:
+        from config_manager import get_config_manager
+        cm = get_config_manager()
+        server = cm.get_chat_default_server(settings.chat_id)
+        if server:
+            return server
+        accessible = cm.get_accessible_servers(settings.user_id)
+        if accessible:
+            return accessible[0]
+    except Exception:
+        pass
+    return None
+
+
 async def _submit_oneshot(
     name: str, config: dict | None, target: str | None
 ) -> tuple[str | None, dict | None]:
@@ -303,7 +320,8 @@ async def _submit_oneshot(
     except Exception as e:
         return None, {"error": f"Invalid config: {e}"}
 
-    if not settings.active_server:
+    active_server = _resolve_active_server()
+    if not active_server:
         return None, {"error": _NO_SERVER}
 
     try:
@@ -313,7 +331,7 @@ async def _submit_oneshot(
             _with_provenance(
                 {
                     "routine_name": _store_name(routine, name),
-                    "server_name": settings.active_server,
+                    "server_name": active_server,
                     "config": config or {},
                     "attribute_to": agent,
                 }
@@ -450,7 +468,8 @@ async def start_routine(name: str, config: dict | None) -> dict:
     except Exception as e:
         return {"error": f"Invalid config: {e}"}
 
-    if not settings.active_server:
+    active_server = _resolve_active_server()
+    if not active_server:
         return {"error": _NO_SERVER}
 
     try:
@@ -460,7 +479,7 @@ async def start_routine(name: str, config: dict | None) -> dict:
             _with_provenance(
                 {
                     "routine_name": _store_name(routine, name),
-                    "server_name": settings.active_server,
+                    "server_name": active_server,
                     "config": config or {},
                     "attribute_to": settings.specialist_slug or "condor",
                 }
