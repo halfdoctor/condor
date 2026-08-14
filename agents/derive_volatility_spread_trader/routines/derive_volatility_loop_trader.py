@@ -4,25 +4,29 @@ import logging
 import datetime
 import os
 import requests
+import asyncio
 from pathlib import Path
 from decimal import Decimal
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from telegram.ext import ContextTypes
-from condor.reports import ReportBuilder
+from condor.reports import LiveReport, ReportBuilder
 from routines.base import RoutineResult
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# Mark as continuous routine for Condor server-side background lifecycle
+CONTINUOUS = True
 CATEGORY = "Autonomous Trading"
 STATE_FILE = Path("/home/nemin/condor/agents/derive_volatility_spread_trader/routines/.position_state.json")
+HEARTBEAT_FILE = Path("/home/nemin/condor/agents/derive_volatility_spread_trader/routines/.heartbeat.json")
 
 class Config(BaseModel):
-    """Autonomous 1-Minute Cadence Loop Trader: Precise Margin Assessment (Cap 75%), Strict Perp Delta Cap & Position-Change-Only Telegram Alerts"""
+    """Autonomous 5-Minute Continuous Loop Trader: Precise Margin Assessment (Cap 75%), Strict Perp Delta Cap & Position-Change-Only Telegram Alerts"""
     trading_pair: str = Field(default="ETH-USDT", description="Underlying asset trading pair (ETH-USDT, BTC-USDT, HYPE-USDT)")
-    poll_interval_seconds: int = Field(default=60, description="Loop monitoring interval in seconds (1-minute cadence)")
+    poll_interval_seconds: int = Field(default=300, description="Loop monitoring interval in seconds (5-minute default cadence)")
     paper_mode: bool = Field(default=False, description="Dry-run paper mode (True = Simulated execution & alerts; False = Live exchange orders)")
     dte: int = Field(default=14, description="Target Days to Expiration for options structure")
     min_edge: float = Field(default=5.0, description="Minimum net volatility edge required for entry/scale-in (vol points)")
@@ -72,6 +76,12 @@ def bs_call_delta(S, K, T, r, sigma):
 def bs_put_delta(S, K, T, r, sigma):
     return bs_call_delta(S, K, T, r, sigma) - 1.0
 
+def bs_vega(S, K, T, r, sigma):
+    if T <= 1e-5 or sigma <= 1e-5:
+        return 0.0
+    d1 = bs_d1(S, K, T, r, sigma)
+    return S * math.sqrt(T) * (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * d1 ** 2)
+
 def round_derive_strike(strike: float, spot: float, pair: str = "ETH") -> float:
     symbol = pair.upper().split("-")[0]
     if symbol == "BTC" or spot > 10000:
@@ -97,6 +107,19 @@ def save_position_state(state: dict):
             json.dump(state, f, indent=2)
     except Exception as e:
         logger.warning(f"Failed to save position state: {e}")
+
+def save_heartbeat(data: dict):
+    try:
+        payload = {
+            **data,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "timestamp_epoch": datetime.datetime.now(datetime.timezone.utc).timestamp(),
+            "status": "healthy"
+        }
+        with open(HEARTBEAT_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save heartbeat: {e}")
 
 def resolve_derive_credentials(config: Config) -> tuple[str, str, int | None]:
     wallet = (config.smart_contract_wallet or "").strip()
@@ -156,9 +179,6 @@ def resolve_derive_credentials(config: Config) -> tuple[str, str, int | None]:
 
     return wallet, priv, sub_id
 
-import os
-import aiohttp
-
 async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: str | None, message: str):
     target_chat = chat_id or os.environ.get("ADMIN_USER_ID") or os.environ.get("TELEGRAM_CHAT_ID")
     if not target_chat:
@@ -175,6 +195,7 @@ async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: str |
 
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if bot_token:
+        import aiohttp
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             payload = {"chat_id": target_chat, "text": message, "parse_mode": "Markdown"}
@@ -189,12 +210,6 @@ async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: str |
             logger.warning(f"Failed to send Telegram alert via direct HTTP fallback: {e}")
     else:
         logger.info("Telegram direct alert skipped: No TELEGRAM_TOKEN or TELEGRAM_BOT_TOKEN set in .env")
-
-def bs_vega(S, K, T, r, sigma):
-    if T <= 1e-5 or sigma <= 1e-5:
-        return 0.0
-    d1 = bs_d1(S, K, T, r, sigma)
-    return S * math.sqrt(T) * (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * d1 ** 2)
 
 def calculate_implied_volatility(mark_price: float, S: float, K: float, T: float, r: float = 0.03, is_call: bool = True) -> float:
     """Invert Black-Scholes formula to calculate dynamic Implied Volatility (IV) from live mark price"""
@@ -278,7 +293,8 @@ def fetch_dynamic_market_volatility(pair: str = "ETH-USDT", target_dte: int = 14
     
     return round(spot_price, 2), round(iv_14d, 2), round(rv_7d, 2), dm_dealer_gex_m, gex_conviction
 
-async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResult:
+async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> tuple[dict, list, list, str]:
+    """Execute a single complete monitoring and execution cycle."""
     timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     symbol = config.trading_pair.upper().split("-")[0]
     perp_symbol = f"{symbol}-PERP"
@@ -324,14 +340,12 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
     contracts = float(config.contract_size)
     total_credit = round(net_premium_per_unit * contracts, 2)
     
-    import os
-    import requests
     from web3 import Web3
     from eth_account.messages import encode_defunct
     from derive_action_signing import SignedAction, RFQQuoteDetails, RFQExecuteModuleData, TradeModuleData, utils
 
     # -------------------------------------------------------------
-    # 2. Derive Credentials & Subaccount Resolution (Env / Config / Condor Keys)
+    # 2. Derive Credentials & Subaccount Resolution
     # -------------------------------------------------------------
     smart_contract_wallet, session_key_priv, subaccount_id = resolve_derive_credentials(config)
     
@@ -360,10 +374,10 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
         except Exception as e:
             logger.warning(f"Failed to initialize Derive session key signature: {e}")
     elif not config.paper_mode:
-        logger.warning("Derive credentials (DERIVE_SMART_CONTRACT_WALLET, DERIVE_SESSION_KEY_PRIV, DERIVE_SUBACCOUNT_ID) not fully resolved.")
+        logger.warning("Derive credentials not fully resolved.")
     
     # -------------------------------------------------------------
-    # 2. Live Derive Subaccount & Positions Discovery
+    # 3. Live Derive Subaccount & Positions Discovery
     # -------------------------------------------------------------
     collateral = 0.0
     subaccount_value = 0.0
@@ -378,7 +392,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
     live_active_positions_table = []
     subaccount_queried_successfully = False
 
-    # Attempt direct authenticated query to Derive private API
     if auth_headers and subaccount_id:
         try:
             sub_resp = requests.post(
@@ -457,7 +470,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
         except Exception as e:
             logger.warning(f"Error querying live Derive subaccount from private API: {e}")
 
-    # Fallback to HummingbotClient portfolio state if private API call was not possible
     if not subaccount_queried_successfully:
         try:
             from mcp_servers.hummingbot_api.hummingbot_client import HummingbotClient
@@ -494,9 +506,9 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
             logger.warning(f"Error querying live Derive subaccount from portfolio state: {e}")
         
         margin_headroom_usd = max(0.0, (config.max_margin_utilization_pct / 100.0 * collateral) - (collateral - buying_power)) if collateral > 0 else 0.0
-    
+
     # -------------------------------------------------------------
-    # 3. Dynamic Volatility Scale-In (Cap 75% Margin Utilization)
+    # 4. Dynamic Volatility Scale-In (Cap 75% Margin Utilization)
     # -------------------------------------------------------------
     options_execution_status = "HOLDING POSITION (EDGE ACTIVE)"
     position_change_occurred = False
@@ -506,26 +518,20 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
         if margin_utilization_pct < config.max_margin_utilization_pct:
             if not config.paper_mode and margin_headroom_usd >= 25.0:
                 if not (session_key_wallet and smart_contract_wallet and subaccount_id):
-                    logger.warning("Live scale-in RFQ skipped: Derive credentials (DERIVE_SMART_CONTRACT_WALLET, DERIVE_SESSION_KEY_PRIV, DERIVE_SUBACCOUNT_ID) not found.")
                     options_execution_status = f"LIVE RFQ SKIPPED (Credentials missing in .env | Headroom: ${margin_headroom_usd:,.2f})"
                 else:
-                    options_rfq_id = f"DERIVE-RFQ-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S')}"
                     try:
                         inst_resp = requests.post("https://api.lyra.finance/public/get_instruments", json={"currency": symbol, "instrument_type": "option", "expired": False}, timeout=5)
                         inst_data = inst_resp.json().get("result", [])
                         now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
-                        # 1. Group valid unexpired options by distinct expiry timestamp
                         valid_expiries = sorted(list(set(
                             i.get("option_details", {}).get("expiry", 0)
                             for i in inst_data
                             if (i.get("option_details", {}).get("expiry", 0) - now_ts) >= 3 * 86400
                         )))
-                        
-                        # 2. Select the single expiry timestamp closest to target DTE (14 days)
                         target_expiry_ts = now_ts + (config.dte * 86400)
                         chosen_expiry = min(valid_expiries, key=lambda exp: abs(exp - target_expiry_ts)) if valid_expiries else (now_ts + 14 * 86400)
                         
-                        # 3. Filter instruments strictly to that single chosen expiry to guarantee 100% tenor synchronization
                         same_expiry_options = [i for i in inst_data if i.get("option_details", {}).get("expiry") == chosen_expiry]
                         calls = [i for i in same_expiry_options if i.get("option_details", {}).get("option_type") == "C"]
                         puts = [i for i in same_expiry_options if i.get("option_details", {}).get("option_type") == "P"]
@@ -542,7 +548,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
                         package_scales = [1.00, 0.75, 0.50, 0.25]
                         package_filled = False
                         
-                        # Clear any stale open RFQs before submitting new ones
                         try:
                             poll_stale = requests.post("https://api.lyra.finance/private/poll_quotes", json={"subaccount_id": subaccount_id, "status": "open"}, headers=auth_headers, timeout=5).json()
                             stale_quotes = poll_stale.get("result", {}).get("quotes", [])
@@ -553,7 +558,6 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
                         except Exception as e:
                             logger.warning(f"Error checking stale RFQs: {e}")
 
-                        # Pre-calculate projected margin utilization to ensure full complete package fits under 75% cap
                         for scale in package_scales:
                             candidate_size = round(config.contract_size * scale, 2)
                             est_package_margin = wing_width * candidate_size
@@ -577,12 +581,9 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
                             live_rfq_id = send_rfq_resp.json().get("result", {}).get("rfq_id")
                             
                             if not live_rfq_id:
-                                # Sized down complete package to preserve 4-leg uniformity
-                                logger.info(f"Package size {candidate_size} {symbol} exceeds cash buffer. Sizing down to next discrete package tier.")
                                 continue
                                 
-                            import time
-                            time.sleep(2)
+                            await asyncio.sleep(2)
                             poll_resp = requests.post("https://api.lyra.finance/private/poll_quotes", json={"subaccount_id": subaccount_id, "status": "open"}, headers=auth_headers, timeout=5)
                             quotes = poll_resp.json().get("result", {}).get("quotes", [])
                             matching_quotes = [q for q in quotes if q.get("rfq_id") == live_rfq_id and q.get("direction") == "sell"]
@@ -596,16 +597,15 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
                                 
                                 exec_resp = requests.post("https://api.lyra.finance/private/execute_quote", json={**action.to_json(), "label": f"{symbol}-IC-PACKAGE-{candidate_size}", "rfq_id": best_quote["rfq_id"], "quote_id": best_quote["quote_id"]}, headers=auth_headers, timeout=5)
                                 if exec_resp.json().get("result", {}).get("status") == "filled":
-                                    options_execution_status = f"LIVE RFQ PACKAGE FILLED (+{candidate_size} {symbol} Complete Iron Condor @ Margin Util {margin_utilization_pct:.1f}%)"
+                                    options_execution_status = f"LIVE RFQ PACKAGE FILLED (+{candidate_size} {symbol} Iron Condor)"
                                     position_change_occurred = True
-                                    change_event_details.append(f"Complete Package Scaled In: +{candidate_size} {symbol} Iron Condor")
+                                    change_event_details.append(f"Scaled In: +{candidate_size} {symbol} Iron Condor")
                                     package_filled = True
                                     break
                                 else:
                                     options_execution_status = f"LIVE RFQ PACKAGE DISPATCHED [RFQ: {live_rfq_id[:8]}...]"
                                     break
                             else:
-                                # Cancel unquoted RFQ so it does not linger
                                 requests.post("https://api.lyra.finance/private/cancel_rfq", json={"subaccount_id": subaccount_id, "rfq_id": live_rfq_id}, headers=auth_headers, timeout=5)
                         
                         if not package_filled and not options_execution_status.startswith("LIVE RFQ PACKAGE"):
@@ -619,7 +619,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
             options_execution_status = f"SCALE-IN CAPPED: Margin Utilization {margin_utilization_pct:.1f}% >= {config.max_margin_utilization_pct:.1f}% (Cap Enforced)"
 
     # -------------------------------------------------------------
-    # 4. Strict Perpetual Delta Hedge & Cap Enforcement
+    # 5. Strict Perpetual Delta Hedge & Cap Enforcement
     # -------------------------------------------------------------
     target_perp_delta = - live_options_delta
     max_allowed_perp_delta = max(min_order_size, abs(live_options_delta) * config.max_perp_delta_hedge_ratio)
@@ -640,12 +640,10 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
             
             if not config.paper_mode:
                 if not (session_key_wallet and smart_contract_wallet and subaccount_id):
-                    logger.warning("Live perpetual hedge skipped: Derive credentials not configured in .env.")
                     perp_order_summary += " | Skipped (Credentials missing in .env)"
                 else:
                     try:
                         inst_perp = requests.post("https://api.lyra.finance/public/get_instrument", json={"instrument_name": f"{symbol}-PERP"}).json()["result"]
-                        # Dynamic limit price calculated from live spot price
                         dyn_limit_price = Decimal(str(round(spot_price * 0.90 if is_sell else spot_price * 1.10, 2)))
                         trade_data = TradeModuleData(
                             asset_address=inst_perp["base_asset_address"],
@@ -694,12 +692,11 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
                         perp_order_summary += f" | Error: {e}"
 
     # -------------------------------------------------------------
-    # 5. Position Change Detection & Telegram Notification
+    # 6. Position Change Detection & Telegram Notification
     # -------------------------------------------------------------
     prev_state = load_previous_position_state()
     prev_positions = prev_state.get("positions", {})
     
-    # Check if positions changed from previous record
     if current_positions_summary != prev_positions:
         position_change_occurred = True
         save_position_state({
@@ -712,9 +709,8 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
         
     alerts_log = []
     
-    # Only dispatch Telegram message if position changed OR notify_on_change_only is False
     if position_change_occurred or not config.notify_on_change_only:
-        telegram_event_title = "⚡ *[POSITION CHANGE EXECUTED]* ⚡" if position_change_occurred else "⏱️ *[1-Min Monitoring Cycle]* ⏱️"
+        telegram_event_title = "⚡ *[POSITION CHANGE EXECUTED]* ⚡" if position_change_occurred else "⏱️ *[5-Min Monitoring Cycle]* ⏱️"
         cadence_alert_msg = (
             f"{telegram_event_title}\n"
             f"*Asset*: `{config.trading_pair}` | *Spot*: `${spot_price:,.2f}`\n\n"
@@ -740,7 +736,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
             "Status": "DELIVERED TO TELEGRAM"
         })
     else:
-        logger.info("1-minute tick: No position change occurred. Telegram notification skipped.")
+        logger.info("Monitoring tick: No position change occurred. Telegram notification skipped.")
         alerts_log.append({
             "Event": "Idle Monitoring Tick",
             "Asset": config.trading_pair,
@@ -750,44 +746,30 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
             "Status": "IDLE (TELEGRAM SKIPPED)"
         })
 
-    # Dynamic Greeks for Active Table
+    # Save Heartbeat for external Watchdog Monitor
+    save_heartbeat({
+        "trading_pair": config.trading_pair,
+        "spot_price": spot_price,
+        "vol_edge": net_edge,
+        "dealer_gex_m": dm_dealer_gex_m,
+        "margin_utilization_pct": margin_utilization_pct,
+        "buying_power": buying_power,
+        "collateral": collateral,
+        "options_delta": live_options_delta,
+        "perp_delta": live_perp_delta,
+        "options_status": options_execution_status,
+        "perp_action": perp_order_summary,
+        "subaccount_id": subaccount_id,
+        "status": "healthy"
+    })
+
+    # Greeks calculation for strikes table
     delta_sc = -round(bs_call_delta(spot_price, k_short_call, T, r, sigma), 4)
     delta_sp = round(bs_put_delta(spot_price, k_short_put, T, r, sigma), 4)
     delta_lc = round(bs_call_delta(spot_price, k_long_call, T, r, sigma), 4)
     delta_lp = -round(bs_put_delta(spot_price, k_long_put, T, r, sigma), 4)
     exp_str = datetime.datetime.fromtimestamp(datetime.datetime.now(datetime.timezone.utc).timestamp() + config.dte * 86400).strftime("%Y%m%d")
 
-    # Report Builder
-    builder = ReportBuilder("Derive Autonomous 1-Minute Volatility Trader")
-    builder.source("routine", "derive_volatility_loop_trader")
-    builder.tags(["derive", "options", "1min_cadence", "delta_cap", "margin_utilization", "telegram"])
-    
-    builder.section("01 / DYNAMIC 1-MINUTE CADENCE STATUS", f"Real-Time Subaccount & Risk Assessment (Interval: {config.poll_interval_seconds}s)")
-    builder.kpi("Execution Mode", execution_mode_str)
-    builder.kpi("Trading Pair", config.trading_pair)
-    builder.kpi("Margin Utilization", f"{margin_utilization_pct:.2f}%")
-    builder.kpi("Buying Power", f"${buying_power:,.2f}")
-    builder.kpi("Collateral", f"${collateral:,.2f}")
-    builder.kpi("Positions Margin Used", f"${positions_margin_used:,.2f}")
-    builder.kpi("Margin Utilization Cap", f"{config.max_margin_utilization_pct:.1f}%")
-    builder.kpi("Margin Headroom ($)", f"${margin_headroom_usd:,.2f}")
-    
-    builder.section("02 / VOLATILITY SPREAD & DERIVATIVES MONKEY INTEL", "Short Volatility Edge Verification")
-    builder.kpi(f"{symbol} Spot Price", f"${spot_price:,.2f}")
-    builder.kpi("Net Volatility Edge", f"{net_edge:.2f} pts")
-    builder.kpi("Dealer GEX Exposure", f"+${dm_dealer_gex_m:.2f}M")
-    builder.kpi("GEX Conviction", gex_conviction)
-    builder.kpi("Options Scale-In Status", options_execution_status)
-    
-    builder.section("03 / STRICT PERPETUAL DELTA HEDGE & CAP COMPLIANCE", "Enforces Perp Delta <= Options Delta Hedge Requirement")
-    builder.kpi("Aggregate Options Delta", f"{live_options_delta:+.4f} ETH")
-    builder.kpi("Current Perpetual Delta", f"{live_perp_delta:+.4f} ETH")
-    builder.kpi("Target Perpetual Hedge", f"{target_perp_delta:+.4f} ETH")
-    builder.kpi("Max Allowed Perp Cap", f"{max_allowed_perp_delta:+.4f} ETH")
-    builder.kpi("Delta Rebalance Order", perp_order_summary)
-    builder.kpi("Hedge Compliance Status", hedge_action_status)
-    
-    subaccount_label = f"Subaccount #{subaccount_id}" if subaccount_id else "Configured Subaccount"
     strikes_table = [
         {"Leg": "Short Call", "Contract": f"{symbol}-{exp_str}-{int(k_short_call)}-C", "Strike": f"${k_short_call:.0f}", "Size": f"-{contracts:.1f}", "Delta": f"{delta_sc:+.4f}"},
         {"Leg": "Short Put", "Contract": f"{symbol}-{exp_str}-{int(k_short_put)}-P", "Strike": f"${k_short_put:.0f}", "Size": f"-{contracts:.1f}", "Delta": f"{delta_sp:+.4f}"},
@@ -795,17 +777,38 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
         {"Leg": "Long Put Wing", "Contract": f"{symbol}-{exp_str}-{int(k_long_put)}-P", "Strike": f"${k_long_put:.0f}", "Size": f"+{contracts:.1f}", "Delta": f"{delta_lp:+.4f}"},
     ]
     display_table = live_active_positions_table if live_active_positions_table else strikes_table
-    builder.section("04 / ACTIVE CONTRACTS & DELTA BREAKDOWN", f"Live Derive {subaccount_label}")
-    builder.table(display_table, ["Leg", "Contract", "Strike", "Size", "Delta"])
-    
-    builder.section("05 / AUDIT LOG", "1-Minute Event Records")
-    builder.table(alerts_log, ["Event", "Asset", "Margin Utilization", "Options Delta", "Perp Delta", "Status"])
-    
-    builder.manual_order()
-    await builder.save()
-    
+
+    metrics_dict = {
+        "subaccount_id": subaccount_id,
+        "section_01": {
+            "Execution Mode": execution_mode_str,
+            "Trading Pair": config.trading_pair,
+            "Margin Utilization": f"{margin_utilization_pct:.2f}%",
+            "Buying Power": f"${buying_power:,.2f}",
+            "Collateral": f"${collateral:,.2f}",
+            "Positions Margin Used": f"${positions_margin_used:,.2f}",
+            "Margin Utilization Cap": f"{config.max_margin_utilization_pct:.1f}%",
+            "Margin Headroom ($)": f"${margin_headroom_usd:,.2f}",
+        },
+        "section_02": {
+            f"{symbol} Spot Price": f"${spot_price:,.2f}",
+            "Net Volatility Edge": f"{net_edge:.2f} pts",
+            "Dealer GEX Exposure": f"+${dm_dealer_gex_m:.2f}M",
+            "GEX Conviction": gex_conviction,
+            "Options Scale-In Status": options_execution_status,
+        },
+        "section_03": {
+            "Aggregate Options Delta": f"{live_options_delta:+.4f} ETH",
+            "Current Perpetual Delta": f"{live_perp_delta:+.4f} ETH",
+            "Target Perpetual Hedge": f"{target_perp_delta:+.4f} ETH",
+            "Max Allowed Perp Cap": f"{max_allowed_perp_delta:+.4f} ETH",
+            "Delta Rebalance Order": perp_order_summary,
+            "Hedge Compliance Status": hedge_action_status,
+        }
+    }
+
     summary_text = (
-        f"Derive 1-Minute Cadence Autonomous Volatility Loop Trader executed.\n"
+        f"Derive 5-Minute Cadence Autonomous Volatility Loop Trader executed.\n"
         f"- Mode: {execution_mode_str} | Asset: {config.trading_pair} (${spot_price:,.2f})\n"
         f"- Vol Edge: {net_edge:.2f} pts | Derivatives Monkey GEX: +${dm_dealer_gex_m:.2f}M ({gex_conviction})\n"
         f"- Subaccount: #{subaccount_id} | Subaccount Value: ${subaccount_value:,.2f} | Collateral: ${collateral:,.2f}\n"
@@ -817,9 +820,63 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> RoutineResu
         f"- Perpetual Action: {perp_order_summary}\n"
         f"- Telegram Notification: {'SENT (Position Change Triggered)' if position_change_occurred else 'SKIPPED (No Position Change)'}"
     )
-    
-    return RoutineResult(
-        text=summary_text,
-        table_data=display_table,
-        table_columns=["Leg", "Contract", "Strike", "Size", "Delta"]
+
+    return metrics_dict, display_table, alerts_log, summary_text
+
+async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Continuous 5-minute autonomous volatility loop runner."""
+    chat_id = context._chat_id if hasattr(context, "_chat_id") else None
+
+    # Setup LiveReport
+    report = LiveReport(
+        "Derive Autonomous Volatility Loop Trader",
+        source_name="derive_volatility_loop_trader",
+        tags=["derive", "options", "continuous", "delta_cap", "margin_utilization", "telegram"],
+        auto_refresh_seconds=60,
     )
+
+    cycle_count = 0
+    try:
+        while True:
+            cycle_count += 1
+            try:
+                metrics_dict, display_table, alerts_log, summary_text = await execute_cycle(config, context)
+                
+                # Update LiveReport dashboard
+                report.clear()
+                report.builder.manual_order()
+                
+                report.builder.section("01 / DYNAMIC AUTONOMOUS STATUS", f"Real-Time Risk & Margin Assessment (Cadence: {config.poll_interval_seconds}s | Cycle #{cycle_count})")
+                for k, v in metrics_dict.get("section_01", {}).items():
+                    report.builder.kpi(k, v)
+                    
+                report.builder.section("02 / VOLATILITY SPREAD & DERIVATIVES MONKEY INTEL", "Short Volatility Edge Verification")
+                for k, v in metrics_dict.get("section_02", {}).items():
+                    report.builder.kpi(k, v)
+
+                report.builder.section("03 / STRICT PERPETUAL DELTA HEDGE & CAP COMPLIANCE", "Enforces Perp Delta <= Options Delta Hedge Requirement")
+                for k, v in metrics_dict.get("section_03", {}).items():
+                    report.builder.kpi(k, v)
+
+                sub_label = metrics_dict.get("subaccount_id") or "50061"
+                report.builder.section("04 / ACTIVE CONTRACTS & DELTA BREAKDOWN", f"Live Derive Subaccount #{sub_label}")
+                report.builder.table(display_table, ["Leg", "Contract", "Strike", "Size", "Delta"])
+
+                report.builder.section("05 / AUDIT LOG", "Continuous Event Records")
+                report.builder.table(alerts_log, ["Event", "Asset", "Margin Utilization", "Options Delta", "Perp Delta", "Status"])
+
+                await report.update()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in volatility loop cycle #{cycle_count}: {e}")
+            
+            await asyncio.sleep(config.poll_interval_seconds)
+            
+    except asyncio.CancelledError:
+        if report.report_id is not None:
+            report.clear()
+            report.builder.auto_refresh(None)
+            report.builder.section("MONITOR STOPPED", "Autonomous Trader Stopped")
+            await report.update()
+        return f"Derive Volatility Loop Trader stopped after {cycle_count} cycles."
