@@ -254,45 +254,56 @@ def save_heartbeat(data: dict):
     save_json_atomic(HEARTBEAT_FILE, payload)
 
 def resolve_derive_credentials(config: Config) -> tuple[str, str, int | None]:
+    """Resolve Derive credentials with PRIMARY source from hummingbot-api (encrypted connector files & GATEWAY_PASSPHRASE/CONFIG_PASSWORD) and SECONDARY fallback to root .env / environment variables.
+    
+    Priority Mapping:
+    1. Explicit config overrides (if provided via UI or command args)
+    2. hummingbot-api encrypted connector files (derive_perpetual.yml / derive.yml):
+       - derive_perpetual_api_key / derive_api_key -> DERIVE_SMART_CONTRACT_WALLET
+       - derive_perpetual_api_secret / derive_api_secret -> DERIVE_SESSION_KEY_PRIV
+       - sub_id / subaccount_id -> DERIVE_SUBACCOUNT_ID
+       - Decryption password: GATEWAY_PASSPHRASE -> CONFIG_PASSWORD from hummingbot-api/.env
+    3. Root .env / OS environment variables fallback:
+       - DERIVE_SMART_CONTRACT_WALLET / derive_perpetual_api_key / derive_api_key
+       - DERIVE_SESSION_KEY_PRIV / derive_perpetual_api_secret / derive_api_secret
+       - DERIVE_SUBACCOUNT_ID / sub_id / subaccount_id
+       - GATEWAY_PASSPHRASE / CONFIG_PASSWORD
+    """
     wallet = (config.smart_contract_wallet or "").strip()
     priv = (config.session_key_priv or "").strip()
     sub_id = config.subaccount_id
 
-    # 1. Fallback to .env / environment variables
-    if not wallet:
-        wallet = (os.getenv("DERIVE_SMART_CONTRACT_WALLET") or "").strip()
-    if not priv:
-        priv = (os.getenv("DERIVE_SESSION_KEY_PRIV") or "").strip()
-    if sub_id is None:
-        raw_env_sub = os.getenv("DERIVE_SUBACCOUNT_ID")
-        if raw_env_sub:
-            try:
-                sub_id = int(str(raw_env_sub).strip())
-            except ValueError:
-                pass
-
-    # 2. Fallback to Condor / Hummingbot portfolio connector keys with dynamic path discovery
-    if not (wallet and priv and sub_id):
+    # 1. Primary Source: Hummingbot-API connector files & hummingbot-api/.env
+    if not (wallet and priv and sub_id is not None):
         import binascii
         import yaml
         from eth_account import Account
 
         hummingbot_base = Path(os.getenv("HUMMINGBOT_API_DIR", Path.home() / "hummingbot-api"))
+        hb_env_file = hummingbot_base / ".env"
+        
+        # Resolve decryption password: Check hummingbot-api/.env first (GATEWAY_PASSPHRASE, then CONFIG_PASSWORD)
+        pwd = None
+        if hb_env_file.exists():
+            try:
+                from dotenv import dotenv_values
+                hb_env = dotenv_values(hb_env_file)
+                pwd = hb_env.get("GATEWAY_PASSPHRASE") or hb_env.get("CONFIG_PASSWORD")
+            except Exception as e:
+                logger.debug(f"Could not load hummingbot-api .env: {e}")
+                
+        # Fallback password from process environment or root .env
+        if not pwd:
+            pwd = os.getenv("GATEWAY_PASSPHRASE") or os.getenv("CONFIG_PASSWORD")
+
         connector_candidates = [
-            hummingbot_base / "bots" / "credentials" / "master_account" / "connectors" / "derive.yml",
             hummingbot_base / "bots" / "credentials" / "master_account" / "connectors" / "derive_perpetual.yml",
+            hummingbot_base / "bots" / "credentials" / "master_account" / "connectors" / "derive.yml",
+            Path("/app/hummingbot-api/bots/credentials/master_account/connectors/derive_perpetual.yml"),
             Path("/app/hummingbot-api/bots/credentials/master_account/connectors/derive.yml"),
+            Path("/workspace/hummingbot-api/bots/credentials/master_account/connectors/derive_perpetual.yml"),
             Path("/workspace/hummingbot-api/bots/credentials/master_account/connectors/derive.yml"),
         ]
-        pwd = os.getenv("CONFIG_PASSWORD")
-        if not pwd:
-            hb_env_file = hummingbot_base / ".env"
-            if hb_env_file.exists():
-                try:
-                    from dotenv import dotenv_values
-                    pwd = dotenv_values(hb_env_file).get("CONFIG_PASSWORD")
-                except Exception:
-                    pass
 
         if pwd:
             for p in connector_candidates:
@@ -310,19 +321,33 @@ def resolve_derive_credentials(config: Config) -> tuple[str, str, int | None]:
                                     dec[k] = Account.decrypt(raw_json, pwd).decode("utf-8")
                                 except Exception:
                                     dec[k] = v
+                                    
                             if not wallet:
-                                wallet = (dec.get("derive_api_key") or dec.get("derive_perpetual_api_key") or "").strip()
+                                wallet = (dec.get("derive_perpetual_api_key") or dec.get("derive_api_key") or "").strip()
                             if not priv:
-                                priv = (dec.get("derive_api_secret") or dec.get("derive_perpetual_api_secret") or "").strip()
-                            if sub_id is None and "sub_id" in dec:
+                                priv = (dec.get("derive_perpetual_api_secret") or dec.get("derive_api_secret") or "").strip()
+                            if sub_id is None and ("sub_id" in dec or "subaccount_id" in dec):
                                 try:
-                                    sub_id = int(dec["sub_id"])
+                                    sub_id = int(dec.get("sub_id") or dec.get("subaccount_id"))
                                 except (ValueError, TypeError):
                                     pass
                     except Exception as e:
                         logger.debug(f"Could not load credentials from {p}: {e}")
         else:
-            logger.debug("CONFIG_PASSWORD not set in environment or .env; skipping connector decryption.")
+            logger.debug("GATEWAY_PASSPHRASE / CONFIG_PASSWORD not set in hummingbot-api/.env or environment; skipping connector decryption.")
+
+    # 2. Secondary Fallback: Root .env / OS environment variables
+    if not wallet:
+        wallet = (os.getenv("DERIVE_SMART_CONTRACT_WALLET") or os.getenv("derive_perpetual_api_key") or os.getenv("derive_api_key") or "").strip()
+    if not priv:
+        priv = (os.getenv("DERIVE_SESSION_KEY_PRIV") or os.getenv("derive_perpetual_api_secret") or os.getenv("derive_api_secret") or "").strip()
+    if sub_id is None:
+        raw_env_sub = os.getenv("DERIVE_SUBACCOUNT_ID") or os.getenv("sub_id") or os.getenv("subaccount_id")
+        if raw_env_sub:
+            try:
+                sub_id = int(str(raw_env_sub).strip())
+            except ValueError:
+                pass
 
     return wallet, priv, sub_id
 
