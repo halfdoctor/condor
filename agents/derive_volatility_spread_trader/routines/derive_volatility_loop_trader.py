@@ -24,7 +24,7 @@ STATE_FILE = Path("/home/nemin/condor/agents/derive_volatility_spread_trader/rou
 HEARTBEAT_FILE = Path("/home/nemin/condor/agents/derive_volatility_spread_trader/routines/.heartbeat.json")
 
 class Config(BaseModel):
-    """Autonomous 5-Minute Continuous Loop Trader: Precise Margin Assessment (Cap 75%), Strict Perp Delta Cap & Position-Change-Only Telegram Alerts"""
+    """Autonomous 5-Minute Continuous Loop Trader: Precise Net Spread Credit Resolution, Strict Perp Delta Cap, Automated Take-Profit (60%) & Stop-Loss"""
     trading_pair: str = Field(default="ETH-USDT", description="Underlying asset trading pair (ETH-USDT, BTC-USDT, HYPE-USDT)")
     poll_interval_seconds: int = Field(default=300, description="Loop monitoring interval in seconds (5-minute default cadence)")
     paper_mode: bool = Field(default=False, description="Dry-run paper mode (True = Simulated execution & alerts; False = Live exchange orders)")
@@ -34,7 +34,8 @@ class Config(BaseModel):
     emergency_band: float = Field(default=0.20, description="Emergency delta threshold triggering market hedge rebalance")
     max_margin_utilization_pct: float = Field(default=75.0, description="Maximum subaccount margin utilization cap (%) beyond which no new options are entered")
     max_perp_delta_hedge_ratio: float = Field(default=1.0, description="Cap multiplier ensuring perpetual delta never exceeds options delta hedge requirement")
-    target_profit_pct: float = Field(default=60.0, description="Take-profit percentage of initial premium collected")
+    target_profit_pct: float = Field(default=60.0, description="Take-profit percentage of net premium collected (e.g. 60.0%)")
+    stop_loss_pct: float = Field(default=100.0, description="Stop-loss percentage of net premium collected (e.g. 100.0% = 1x net credit loss)")
     capital_allocation: float = Field(default=10000.0, description="Capital allocated for strategy collateral ($)")
     contract_size: float = Field(default=1.0, description="Option leg contract sizing in base currency (e.g. 1.0 ETH)")
     use_derivatives_monkey_intel: bool = Field(default=True, description="Enable Derivatives Monkey (derivativesmonkey.com) GEX/DEX & block RFQ parsing")
@@ -293,8 +294,53 @@ def fetch_dynamic_market_volatility(pair: str = "ETH-USDT", target_dte: int = 14
     
     return round(spot_price, 2), round(iv_14d, 2), round(rv_7d, 2), dm_dealer_gex_m, gex_conviction
 
+def resolve_actual_entry_credit(subaccount_id: int, auth_headers: dict, active_legs: list, fallback_spread_unit_credit: float) -> float:
+    """Resolve the true net entry credit received when opening the active Iron Condor position."""
+    if not auth_headers or not subaccount_id or not active_legs:
+        contracts = sum(abs(float(p.get("amount", 0.0))) for p in active_legs if float(p.get("amount", 0.0)) < 0) or 1.0
+        return round(fallback_spread_unit_credit * contracts, 2)
+        
+    try:
+        trades_res = requests.post(
+            "https://api.lyra.finance/private/get_trade_history",
+            json={"subaccount_id": subaccount_id, "page_size": 20},
+            headers=auth_headers,
+            timeout=5
+        ).json().get("result", {}).get("trades", [])
+        
+        active_inames = {p.get("instrument_name") for p in active_legs}
+        
+        # Find the most recent open RFQ package containing these active legs
+        by_rfq = {}
+        for t in trades_res:
+            rfq = t.get("rfq_id")
+            if rfq:
+                by_rfq.setdefault(rfq, []).append(t)
+                
+        # Look for the opening RFQ package (sells short legs, buys long legs)
+        for rfq, tlist in by_rfq.items():
+            package_inames = {t.get("instrument_name") for t in tlist}
+            if active_inames.issubset(package_inames) or package_inames.issubset(active_inames):
+                # Calculate net premium received
+                net_rfq_credit = 0.0
+                for t in tlist:
+                    p = float(t.get("trade_price") or 0.0)
+                    amt = float(t.get("trade_amount") or 0.0)
+                    d = t.get("direction")
+                    if d == "sell":
+                        net_rfq_credit += p * amt
+                    elif d == "buy":
+                        net_rfq_credit -= p * amt
+                if net_rfq_credit > 0.0:
+                    return round(net_rfq_credit, 2)
+    except Exception as e:
+        logger.warning(f"Error querying live trade history for entry credit: {e}")
+        
+    contracts = sum(abs(float(p.get("amount", 0.0))) for p in active_legs if float(p.get("amount", 0.0)) < 0) or 1.0
+    return round(fallback_spread_unit_credit * contracts, 2)
+
 async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> tuple[dict, list, list, str]:
-    """Execute a single complete monitoring and execution cycle."""
+    """Execute a single complete monitoring, take-profit evaluation, and execution cycle."""
     timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     symbol = config.trading_pair.upper().split("-")[0]
     perp_symbol = f"{symbol}-PERP"
@@ -310,10 +356,6 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
     raw_vol_premium = iv_14d - rv_7d
     friction_cost = 2.50
     net_edge = raw_vol_premium - friction_cost
-    
-    dm_dealer_dex_m = 4.80
-    dm_block_rfq_bias = "INSTITUTIONAL_VOL_SELLING"
-    dm_iv_skew_pts = +2.40
     
     edge_open = net_edge >= config.min_edge
     signal_status = "ACTIVE (ENTRY THRESHOLD MET)" if edge_open else "INACTIVE (EDGE BELOW THRESHOLD)"
@@ -336,9 +378,9 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
     p_sp = bs_put_price(spot_price, k_short_put, T, r, sigma)
     c_lc = bs_call_price(spot_price, k_long_call, T, r, sigma)
     p_lp = bs_put_price(spot_price, k_long_put, T, r, sigma)
-    net_premium_per_unit = (c_sc + p_sp - c_lc - p_lp)
+    theoretical_net_unit_credit = round(max(5.0, (c_sc + p_sp - c_lc - p_lp)), 2) # True defined-risk spread net credit per unit (~$25-35)
     contracts = float(config.contract_size)
-    total_credit = round(net_premium_per_unit * contracts, 2)
+    total_credit = round(theoretical_net_unit_credit * contracts, 2)
     
     from web3 import Web3
     from eth_account.messages import encode_defunct
@@ -390,6 +432,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
     active_options_count = 0
     current_positions_summary = {}
     live_active_positions_table = []
+    active_options_legs_raw = []
     subaccount_queried_successfully = False
 
     if auth_headers and subaccount_id:
@@ -436,6 +479,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
                         if symbol in iname:
                             opt_cnt += 1
                             calc_opt_delta += pos_d
+                            active_options_legs_raw.append(pos)
                         parts = iname.split("-")
                         strike_disp = f"${float(parts[2]):,.0f}" if len(parts) >= 4 and parts[2].replace('.', '', 1).isdigit() else "-"
                         leg_desc = "Long Option" if amt > 0 else "Short Option"
@@ -470,156 +514,209 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
         except Exception as e:
             logger.warning(f"Error querying live Derive subaccount from private API: {e}")
 
-    if not subaccount_queried_successfully:
-        try:
-            from mcp_servers.hummingbot_api.hummingbot_client import HummingbotClient
-            hb_client = HummingbotClient()
-            hb_api = await hb_client.initialize()
-            port_state = await hb_api.portfolio.get_state()
-            derive_items = port_state.get("master_account", {}).get("derive", [])
-            if derive_items:
-                spot_collateral = sum(float(it.get("value", 0.0)) for it in derive_items if "-" not in it.get("token", ""))
-                collateral = round(spot_collateral, 2)
-                opt_cnt = 0
-                calc_live_opt_delta = 0.0
-                for it in derive_items:
-                    t = it.get("token", "")
-                    u = float(it.get("units", 0.0))
-                    if "-" in t:
-                        current_positions_summary[t] = u
-                        if symbol in t:
-                            opt_cnt += 1
-                            try:
-                                parts = t.split("-")
-                                leg_k = float(parts[2])
-                                leg_type = parts[3]
-                                leg_d = bs_call_delta(spot_price, leg_k, T, r, sigma) if leg_type == "C" else bs_put_delta(spot_price, leg_k, T, r, sigma)
-                                calc_live_opt_delta += u * leg_d
-                            except Exception:
-                                pass
-                buying_power = round(sum(float(it.get("units", 0.0)) for it in derive_items if it.get("token") == "USDC"), 2)
-                margin_utilization_pct = round(((collateral - buying_power) / collateral) * 100.0, 2) if collateral > 0 else 0.0
-                positions_margin_used = round(collateral - buying_power, 2)
-                active_options_count = opt_cnt
-                live_options_delta = round(calc_live_opt_delta, 4)
-        except Exception as e:
-            logger.warning(f"Error querying live Derive subaccount from portfolio state: {e}")
-        
-        margin_headroom_usd = max(0.0, (config.max_margin_utilization_pct / 100.0 * collateral) - (collateral - buying_power)) if collateral > 0 else 0.0
+    # -------------------------------------------------------------
+    # 4. Rigorous Mark-to-Market PnL & Take-Profit (60%) / Stop-Loss Engine
+    # -------------------------------------------------------------
+    prev_state = load_previous_position_state()
+    eth_opt_legs = [p for p in active_options_legs_raw if symbol in p.get("instrument_name", "")]
+    has_eth_ic_open = bool(eth_opt_legs and len(eth_opt_legs) >= 4)
+    
+    # Resolve true actual net credit from trade history (or exact spread credit)
+    entry_credit_usd = resolve_actual_entry_credit(subaccount_id, auth_headers, eth_opt_legs, theoretical_net_unit_credit)
+    current_cost_to_close = 0.0
+    
+    if has_eth_ic_open:
+        for p in eth_opt_legs:
+            iname = p.get("instrument_name", "")
+            amt = float(p.get("amount", 0.0))
+            leg_mark = 0.0
+            try:
+                t_resp = requests.post("https://api.lyra.finance/public/get_ticker", json={"instrument_name": iname}, timeout=3).json().get("result", {})
+                leg_mark = float(t_resp.get("mark_price") or 0.0)
+            except Exception:
+                pass
+            # Cost to close: buy back shorts (+), sell longs (-)
+            current_cost_to_close += (-amt) * leg_mark
 
-    # -------------------------------------------------------------
-    # 4. Dynamic Volatility Scale-In (Cap 75% Margin Utilization)
-    # -------------------------------------------------------------
-    options_execution_status = "HOLDING POSITION (EDGE ACTIVE)"
+    current_cost_to_close = round(max(0.0, current_cost_to_close), 2)
+    unrealized_pnl = round(entry_credit_usd - current_cost_to_close, 2)
+    profit_captured_pct = round((unrealized_pnl / entry_credit_usd * 100.0), 2) if entry_credit_usd > 0 else 0.0
+    
+    # Strict Guard: Take-Profit only triggers when profit is genuinely >= 60% of true net entry credit AND PnL > 0
+    take_profit_triggered = has_eth_ic_open and (profit_captured_pct >= config.target_profit_pct) and (unrealized_pnl >= 0.60 * entry_credit_usd) and (unrealized_pnl > 3.0)
+    stop_loss_triggered = has_eth_ic_open and (unrealized_pnl <= -(config.stop_loss_pct / 100.0 * entry_credit_usd))
+    
+    options_execution_status = f"HOLDING POSITION (PnL: +${unrealized_pnl:,.2f} | {profit_captured_pct:.1f}% of ${entry_credit_usd:.2f} credit | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "NO ACTIVE OPTIONS (MONITORING ENTRY)"
     position_change_occurred = False
     change_event_details = []
-    
-    if edge_open:
-        if margin_utilization_pct < config.max_margin_utilization_pct:
-            if not config.paper_mode and margin_headroom_usd >= 25.0:
-                if not (session_key_wallet and smart_contract_wallet and subaccount_id):
-                    options_execution_status = f"LIVE RFQ SKIPPED (Credentials missing in .env | Headroom: ${margin_headroom_usd:,.2f})"
-                else:
-                    try:
-                        inst_resp = requests.post("https://api.lyra.finance/public/get_instruments", json={"currency": symbol, "instrument_type": "option", "expired": False}, timeout=5)
-                        inst_data = inst_resp.json().get("result", [])
-                        now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
-                        valid_expiries = sorted(list(set(
-                            i.get("option_details", {}).get("expiry", 0)
-                            for i in inst_data
-                            if (i.get("option_details", {}).get("expiry", 0) - now_ts) >= 3 * 86400
-                        )))
-                        target_expiry_ts = now_ts + (config.dte * 86400)
-                        chosen_expiry = min(valid_expiries, key=lambda exp: abs(exp - target_expiry_ts)) if valid_expiries else (now_ts + 14 * 86400)
-                        
-                        same_expiry_options = [i for i in inst_data if i.get("option_details", {}).get("expiry") == chosen_expiry]
-                        calls = [i for i in same_expiry_options if i.get("option_details", {}).get("option_type") == "C"]
-                        puts = [i for i in same_expiry_options if i.get("option_details", {}).get("option_type") == "P"]
-                        
-                        def find_closest(opts, target_strike):
-                            return min(opts, key=lambda x: abs(float(x.get("option_details", {}).get("strike", 0)) - target_strike))
-                        
-                        inst_sc = find_closest(calls, k_short_call)
-                        inst_sp = find_closest(puts, k_short_put)
-                        inst_lc = find_closest(calls, k_long_call)
-                        inst_lp = find_closest(puts, k_long_put)
-                        
-                        wing_width = abs(k_long_call - k_short_call) or 100.0
-                        package_scales = [1.00, 0.75, 0.50, 0.25]
-                        package_filled = False
-                        
-                        try:
-                            poll_stale = requests.post("https://api.lyra.finance/private/poll_quotes", json={"subaccount_id": subaccount_id, "status": "open"}, headers=auth_headers, timeout=5).json()
-                            stale_quotes = poll_stale.get("result", {}).get("quotes", [])
-                            for sq in stale_quotes:
-                                sq_rfq = sq.get("rfq_id")
-                                if sq_rfq:
-                                    requests.post("https://api.lyra.finance/private/cancel_rfq", json={"subaccount_id": subaccount_id, "rfq_id": sq_rfq}, headers=auth_headers, timeout=5)
-                        except Exception as e:
-                            logger.warning(f"Error checking stale RFQs: {e}")
-
-                        for scale in package_scales:
-                            candidate_size = round(config.contract_size * scale, 2)
-                            est_package_margin = wing_width * candidate_size
-                            projected_margin_used = positions_margin_used + est_package_margin
-                            projected_utilization = (projected_margin_used / collateral * 100.0) if collateral > 0 else 100.0
-                            
-                            if projected_utilization > config.max_margin_utilization_pct or est_package_margin > buying_power:
-                                continue
-                                
-                            c_amount = Decimal(str(candidate_size))
-                            legs = [
-                                RFQQuoteDetails(instrument_name=inst_sc["instrument_name"], direction="sell", asset_address=inst_sc["base_asset_address"], sub_id=int(inst_sc["base_asset_sub_id"]), price=Decimal("0"), amount=c_amount),
-                                RFQQuoteDetails(instrument_name=inst_sp["instrument_name"], direction="sell", asset_address=inst_sp["base_asset_address"], sub_id=int(inst_sp["base_asset_sub_id"]), price=Decimal("0"), amount=c_amount),
-                                RFQQuoteDetails(instrument_name=inst_lc["instrument_name"], direction="buy", asset_address=inst_lc["base_asset_address"], sub_id=int(inst_lc["base_asset_sub_id"]), price=Decimal("0"), amount=c_amount),
-                                RFQQuoteDetails(instrument_name=inst_lp["instrument_name"], direction="buy", asset_address=inst_lp["base_asset_address"], sub_id=int(inst_lp["base_asset_sub_id"]), price=Decimal("0"), amount=c_amount),
-                            ]
-                            legs.sort(key=lambda x: x.instrument_name)
-                            rfq_module_data = RFQExecuteModuleData(global_direction="buy", max_fee=Decimal("1000"), legs=legs)
-                            
-                            send_rfq_resp = requests.post("https://api.lyra.finance/private/send_rfq", json={"subaccount_id": subaccount_id, **rfq_module_data.to_rfq_json()}, headers=auth_headers, timeout=5)
-                            live_rfq_id = send_rfq_resp.json().get("result", {}).get("rfq_id")
-                            
-                            if not live_rfq_id:
-                                continue
-                                
-                            await asyncio.sleep(2)
-                            poll_resp = requests.post("https://api.lyra.finance/private/poll_quotes", json={"subaccount_id": subaccount_id, "status": "open"}, headers=auth_headers, timeout=5)
-                            quotes = poll_resp.json().get("result", {}).get("quotes", [])
-                            matching_quotes = [q for q in quotes if q.get("rfq_id") == live_rfq_id and q.get("direction") == "sell"]
-                            if matching_quotes:
-                                best_quote = matching_quotes[0]
-                                for idx, leg in enumerate(rfq_module_data.legs):
-                                    leg.price = Decimal(str(best_quote["legs"][idx]["price"]))
-                                
-                                action = SignedAction(subaccount_id=subaccount_id, owner=smart_contract_wallet, signer=session_key_wallet.address, signature_expiry_sec=utils.MAX_INT_32, nonce=utils.get_action_nonce(), module_address=RFQ_MODULE_ADDRESS, module_data=rfq_module_data, DOMAIN_SEPARATOR=DOMAIN_SEPARATOR, ACTION_TYPEHASH=ACTION_TYPEHASH)
-                                action.sign(session_key_wallet.key)
-                                
-                                exec_resp = requests.post("https://api.lyra.finance/private/execute_quote", json={**action.to_json(), "label": f"{symbol}-IC-PACKAGE-{candidate_size}", "rfq_id": best_quote["rfq_id"], "quote_id": best_quote["quote_id"]}, headers=auth_headers, timeout=5)
-                                if exec_resp.json().get("result", {}).get("status") == "filled":
-                                    options_execution_status = f"LIVE RFQ PACKAGE FILLED (+{candidate_size} {symbol} Iron Condor)"
-                                    position_change_occurred = True
-                                    change_event_details.append(f"Scaled In: +{candidate_size} {symbol} Iron Condor")
-                                    package_filled = True
-                                    break
-                                else:
-                                    options_execution_status = f"LIVE RFQ PACKAGE DISPATCHED [RFQ: {live_rfq_id[:8]}...]"
-                                    break
-                            else:
-                                requests.post("https://api.lyra.finance/private/cancel_rfq", json={"subaccount_id": subaccount_id, "rfq_id": live_rfq_id}, headers=auth_headers, timeout=5)
-                        
-                        if not package_filled and not options_execution_status.startswith("LIVE RFQ PACKAGE"):
-                            options_execution_status = f"LIVE VOL STRUCTURE ACTIVE (Existing Position Monitored | Headroom: ${margin_headroom_usd:,.2f})"
-                    except Exception as e:
-                        logger.error(f"Scale-in RFQ error: {e}")
-                        options_execution_status = f"LIVE VOL STRUCTURE ACTIVE (Margin Util: {margin_utilization_pct:.1f}%)"
-            else:
-                options_execution_status = f"LIVE VOL STRUCTURE ACTIVE (Margin Util: {margin_utilization_pct:.1f}% | Headroom: ${margin_headroom_usd:,.2f})"
-        else:
-            options_execution_status = f"SCALE-IN CAPPED: Margin Utilization {margin_utilization_pct:.1f}% >= {config.max_margin_utilization_pct:.1f}% (Cap Enforced)"
 
     # -------------------------------------------------------------
-    # 5. Strict Perpetual Delta Hedge & Cap Enforcement
+    # 5. Automated Take-Profit (>=60%) or Stop-Loss Unwind Execution
+    # -------------------------------------------------------------
+    if (take_profit_triggered or stop_loss_triggered) and not config.paper_mode and session_key_wallet and smart_contract_wallet and subaccount_id:
+        trigger_name = "TAKE-PROFIT (>=60% Captured)" if take_profit_triggered else "STOP-LOSS"
+        logger.info(f"Triggering automated exit: {trigger_name} | Profit: {profit_captured_pct:.1f}% | PnL: ${unrealized_pnl:,.2f}")
+        try:
+            close_legs = []
+            for p in eth_opt_legs:
+                iname = p.get("instrument_name", "")
+                amt = float(p.get("amount", 0.0))
+                if amt == 0:
+                    continue
+                close_dir = "buy" if amt < 0 else "sell"
+                c_amount = Decimal(str(abs(amt)))
+                
+                inst_info = requests.post("https://api.lyra.finance/public/get_instrument", json={"instrument_name": iname}, timeout=3).json().get("result", {})
+                b_addr = inst_info.get("base_asset_address", "0x0000000000000000000000000000000000000000")
+                b_sub = int(inst_info.get("base_asset_sub_id", 0))
+                
+                close_legs.append(RFQQuoteDetails(
+                    instrument_name=iname,
+                    direction=close_dir,
+                    asset_address=b_addr,
+                    sub_id=b_sub,
+                    price=Decimal("0"),
+                    amount=c_amount
+                ))
+                
+            if close_legs:
+                close_legs.sort(key=lambda x: x.instrument_name)
+                rfq_close_data = RFQExecuteModuleData(global_direction="buy", max_fee=Decimal("1000"), legs=close_legs)
+                send_rfq_resp = requests.post("https://api.lyra.finance/private/send_rfq", json={"subaccount_id": subaccount_id, **rfq_close_data.to_rfq_json()}, headers=auth_headers, timeout=5)
+                close_rfq_id = send_rfq_resp.json().get("result", {}).get("rfq_id")
+                
+                if close_rfq_id:
+                    await asyncio.sleep(2)
+                    poll_resp = requests.post("https://api.lyra.finance/private/poll_quotes", json={"subaccount_id": subaccount_id, "status": "open"}, headers=auth_headers, timeout=5)
+                    quotes = poll_resp.json().get("result", {}).get("quotes", [])
+                    matching_quotes = [q for q in quotes if q.get("rfq_id") == close_rfq_id and q.get("direction") == "sell"]
+                    if matching_quotes:
+                        best_quote = matching_quotes[0]
+                        for idx, leg in enumerate(rfq_close_data.legs):
+                            leg.price = Decimal(str(best_quote["legs"][idx]["price"]))
+                        
+                        action = SignedAction(subaccount_id=subaccount_id, owner=smart_contract_wallet, signer=session_key_wallet.address, signature_expiry_sec=utils.MAX_INT_32, nonce=utils.get_action_nonce(), module_address=RFQ_MODULE_ADDRESS, module_data=rfq_close_data, DOMAIN_SEPARATOR=DOMAIN_SEPARATOR, ACTION_TYPEHASH=ACTION_TYPEHASH)
+                        action.sign(session_key_wallet.key)
+                        
+                        exec_resp = requests.post("https://api.lyra.finance/private/execute_quote", json={**action.to_json(), "label": f"{symbol}-IC-CLOSE-TP", "rfq_id": best_quote["rfq_id"], "quote_id": best_quote["quote_id"]}, headers=auth_headers, timeout=5)
+                        if exec_resp.json().get("result", {}).get("status") == "filled":
+                            options_execution_status = f"CLOSED VIA {trigger_name} (+${unrealized_pnl:,.2f} Realized PnL | {profit_captured_pct:.1f}% Captured)"
+                            position_change_occurred = True
+                            change_event_details.append(f"Options Package Closed via {trigger_name} (+${unrealized_pnl:,.2f})")
+            
+            # Flatten Perpetual Hedge Position to 0.00 ETH
+            if live_perp_delta != 0.0:
+                is_perp_long = live_perp_delta > 0
+                flat_side = "sell" if is_perp_long else "buy"
+                flat_size = abs(live_perp_delta)
+                inst_perp = requests.post("https://api.lyra.finance/public/get_instrument", json={"instrument_name": f"{symbol}-PERP"}).json()["result"]
+                dyn_limit_price = Decimal(str(round(spot_price * 0.90 if is_perp_long else spot_price * 1.10, 2)))
+                trade_data = TradeModuleData(
+                    asset_address=inst_perp["base_asset_address"],
+                    sub_id=int(inst_perp["base_asset_sub_id"]),
+                    limit_price=dyn_limit_price,
+                    amount=Decimal(str(flat_size)),
+                    max_fee=Decimal("100"),
+                    recipient_id=subaccount_id,
+                    is_bid=not is_perp_long
+                )
+                action_flat = SignedAction(subaccount_id=subaccount_id, owner=smart_contract_wallet, signer=session_key_wallet.address, signature_expiry_sec=utils.MAX_INT_32, nonce=utils.get_action_nonce(), module_address=TRADE_MODULE_ADDRESS, module_data=trade_data, DOMAIN_SEPARATOR=DOMAIN_SEPARATOR, ACTION_TYPEHASH=ACTION_TYPEHASH)
+                action_flat.sign(session_key_wallet.key)
+                order_resp = requests.post("https://api.lyra.finance/private/order", json={**action_flat.to_json(), "instrument_name": f"{symbol}-PERP", "direction": flat_side, "order_type": "market", "reduce_only": True, "time_in_force": "ioc", "label": "tp-flatten-perp"}, headers=auth_headers, timeout=5)
+                if order_resp.json().get("result", {}).get("order", {}).get("order_status") == "filled":
+                    live_perp_delta = 0.0
+                    change_event_details.append(f"Perpetual Hedge Flattened to 0.00 ETH")
+
+        except Exception as e:
+            logger.error(f"Error during automated exit execution: {e}")
+            options_execution_status = f"EXIT TRIGGER FAILED: {e}"
+
+    # -------------------------------------------------------------
+    # 6. Dynamic Volatility Scale-In (Only if NO position active & under 75% margin)
+    # -------------------------------------------------------------
+    if not has_eth_ic_open and edge_open and margin_utilization_pct < config.max_margin_utilization_pct:
+        if not config.paper_mode and margin_headroom_usd >= 25.0:
+            if not (session_key_wallet and smart_contract_wallet and subaccount_id):
+                options_execution_status = f"LIVE RFQ SKIPPED (Credentials missing in .env)"
+            else:
+                try:
+                    inst_resp = requests.post("https://api.lyra.finance/public/get_instruments", json={"currency": symbol, "instrument_type": "option", "expired": False}, timeout=5)
+                    inst_data = inst_resp.json().get("result", [])
+                    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+                    valid_expiries = sorted(list(set(
+                        i.get("option_details", {}).get("expiry", 0)
+                        for i in inst_data
+                        if (i.get("option_details", {}).get("expiry", 0) - now_ts) >= 3 * 86400
+                    )))
+                    target_expiry_ts = now_ts + (config.dte * 86400)
+                    chosen_expiry = min(valid_expiries, key=lambda exp: abs(exp - target_expiry_ts)) if valid_expiries else (now_ts + 14 * 86400)
+                    
+                    same_expiry_options = [i for i in inst_data if i.get("option_details", {}).get("expiry") == chosen_expiry]
+                    calls = [i for i in same_expiry_options if i.get("option_details", {}).get("option_type") == "C"]
+                    puts = [i for i in same_expiry_options if i.get("option_details", {}).get("option_type") == "P"]
+                    
+                    def find_closest(opts, target_strike):
+                        return min(opts, key=lambda x: abs(float(x.get("option_details", {}).get("strike", 0)) - target_strike))
+                    
+                    inst_sc = find_closest(calls, k_short_call)
+                    inst_sp = find_closest(puts, k_short_put)
+                    inst_lc = find_closest(calls, k_long_call)
+                    inst_lp = find_closest(puts, k_long_put)
+                    
+                    wing_width = abs(k_long_call - k_short_call) or 100.0
+                    package_scales = [1.00, 0.75, 0.50, 0.25]
+                    package_filled = False
+                    
+                    for scale in package_scales:
+                        candidate_size = round(config.contract_size * scale, 2)
+                        est_package_margin = wing_width * candidate_size
+                        projected_margin_used = positions_margin_used + est_package_margin
+                        projected_utilization = (projected_margin_used / collateral * 100.0) if collateral > 0 else 100.0
+                        
+                        if projected_utilization > config.max_margin_utilization_pct or est_package_margin > buying_power:
+                            continue
+                            
+                        c_amount = Decimal(str(candidate_size))
+                        legs = [
+                            RFQQuoteDetails(instrument_name=inst_sc["instrument_name"], direction="sell", asset_address=inst_sc["base_asset_address"], sub_id=int(inst_sc["base_asset_sub_id"]), price=Decimal("0"), amount=c_amount),
+                            RFQQuoteDetails(instrument_name=inst_sp["instrument_name"], direction="sell", asset_address=inst_sp["base_asset_address"], sub_id=int(inst_sp["base_asset_sub_id"]), price=Decimal("0"), amount=c_amount),
+                            RFQQuoteDetails(instrument_name=inst_lc["instrument_name"], direction="buy", asset_address=inst_lc["base_asset_address"], sub_id=int(inst_lc["base_asset_sub_id"]), price=Decimal("0"), amount=c_amount),
+                            RFQQuoteDetails(instrument_name=inst_lp["instrument_name"], direction="buy", asset_address=inst_lp["base_asset_address"], sub_id=int(inst_lp["base_asset_sub_id"]), price=Decimal("0"), amount=c_amount),
+                        ]
+                        legs.sort(key=lambda x: x.instrument_name)
+                        rfq_module_data = RFQExecuteModuleData(global_direction="buy", max_fee=Decimal("1000"), legs=legs)
+                        
+                        send_rfq_resp = requests.post("https://api.lyra.finance/private/send_rfq", json={"subaccount_id": subaccount_id, **rfq_module_data.to_rfq_json()}, headers=auth_headers, timeout=5)
+                        live_rfq_id = send_rfq_resp.json().get("result", {}).get("rfq_id")
+                        
+                        if not live_rfq_id:
+                            continue
+                            
+                        await asyncio.sleep(2)
+                        poll_resp = requests.post("https://api.lyra.finance/private/poll_quotes", json={"subaccount_id": subaccount_id, "status": "open"}, headers=auth_headers, timeout=5)
+                        quotes = poll_resp.json().get("result", {}).get("quotes", [])
+                        matching_quotes = [q for q in quotes if q.get("rfq_id") == live_rfq_id and q.get("direction") == "sell"]
+                        if matching_quotes:
+                            best_quote = matching_quotes[0]
+                            for idx, leg in enumerate(rfq_module_data.legs):
+                                leg.price = Decimal(str(best_quote["legs"][idx]["price"]))
+                            
+                            action = SignedAction(subaccount_id=subaccount_id, owner=smart_contract_wallet, signer=session_key_wallet.address, signature_expiry_sec=utils.MAX_INT_32, nonce=utils.get_action_nonce(), module_address=RFQ_MODULE_ADDRESS, module_data=rfq_module_data, DOMAIN_SEPARATOR=DOMAIN_SEPARATOR, ACTION_TYPEHASH=ACTION_TYPEHASH)
+                            action.sign(session_key_wallet.key)
+                            
+                            exec_resp = requests.post("https://api.lyra.finance/private/execute_quote", json={**action.to_json(), "label": f"{symbol}-IC-PACKAGE-{candidate_size}", "rfq_id": best_quote["rfq_id"], "quote_id": best_quote["quote_id"]}, headers=auth_headers, timeout=5)
+                            if exec_resp.json().get("result", {}).get("status") == "filled":
+                                options_execution_status = f"LIVE RFQ PACKAGE FILLED (+{candidate_size} {symbol} Iron Condor)"
+                                position_change_occurred = True
+                                change_event_details.append(f"Scaled In: +{candidate_size} {symbol} Iron Condor")
+                                package_filled = True
+                                entry_credit_usd = total_credit
+                                break
+                except Exception as e:
+                    logger.error(f"Scale-in RFQ error: {e}")
+
+    # -------------------------------------------------------------
+    # 7. Strict Perpetual Delta Hedge & Cap Enforcement
     # -------------------------------------------------------------
     target_perp_delta = - live_options_delta
     max_allowed_perp_delta = max(min_order_size, abs(live_options_delta) * config.max_perp_delta_hedge_ratio)
@@ -630,7 +727,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
     
     is_overhedged = live_perp_delta > (max_allowed_perp_delta + 0.05) or live_perp_delta < (-max_allowed_perp_delta - 0.05)
     
-    if is_overhedged or abs(delta_imbalance) > config.hedge_band:
+    if (is_overhedged or abs(delta_imbalance) > config.hedge_band) and not (take_profit_triggered or stop_loss_triggered):
         rebalance_size = round(abs(delta_imbalance), 2)
         if rebalance_size >= min_order_size:
             is_sell = delta_imbalance < 0
@@ -692,18 +789,19 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
                         perp_order_summary += f" | Error: {e}"
 
     # -------------------------------------------------------------
-    # 6. Position Change Detection & Telegram Notification
+    # 8. Position Change Detection & Telegram Notification
     # -------------------------------------------------------------
-    prev_state = load_previous_position_state()
-    prev_positions = prev_state.get("positions", {})
-    
-    if current_positions_summary != prev_positions:
+    if current_positions_summary != prev_state.get("positions", {}):
         position_change_occurred = True
         save_position_state({
             "positions": current_positions_summary,
             "options_delta": live_options_delta,
             "perp_delta": live_perp_delta,
             "margin_utilization_pct": margin_utilization_pct,
+            "entry_credit_usd": entry_credit_usd,
+            "unrealized_pnl": unrealized_pnl,
+            "profit_captured_pct": profit_captured_pct,
+            "cost_to_close": current_cost_to_close,
             "timestamp": timestamp_str
         })
         
@@ -715,7 +813,8 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
             f"{telegram_event_title}\n"
             f"*Asset*: `{config.trading_pair}` | *Spot*: `${spot_price:,.2f}`\n\n"
             f"• *Vol Edge*: `{net_edge:.2f} pts` (IV {iv_14d:.1f}% vs RV {rv_7d:.1f}%)\n"
-            f"• *Derivatives Monkey*: GEX `+${dm_dealer_gex_m:.2f}M` ({gex_conviction})\n"
+            f"• *Net Entry Credit*: `${entry_credit_usd:,.2f}` | *Cost to Close*: `${current_cost_to_close:,.2f}`\n"
+            f"• *Unrealized PnL*: `+${unrealized_pnl:,.2f}` (*{profit_captured_pct:.1f}%* / Target: `{config.target_profit_pct:.1f}%`)\n"
             f"• *Margin Utilization*: `{margin_utilization_pct:.2f}%` / *Cap*: `{config.max_margin_utilization_pct:.1f}%` (Headroom: `${margin_headroom_usd:,.2f}`)\n"
             f"• *Buying Power*: `${buying_power:,.2f}` | *Collateral*: `${collateral:,.2f}`\n"
             f"• *Options Delta*: `{live_options_delta:+.4f} ETH` ({active_options_count} active legs)\n"
@@ -757,6 +856,10 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
         "collateral": collateral,
         "options_delta": live_options_delta,
         "perp_delta": live_perp_delta,
+        "entry_credit_usd": entry_credit_usd,
+        "unrealized_pnl": unrealized_pnl,
+        "profit_captured_pct": profit_captured_pct,
+        "cost_to_close": current_cost_to_close,
         "options_status": options_execution_status,
         "perp_action": perp_order_summary,
         "subaccount_id": subaccount_id,
@@ -793,9 +896,11 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
         "section_02": {
             f"{symbol} Spot Price": f"${spot_price:,.2f}",
             "Net Volatility Edge": f"{net_edge:.2f} pts",
-            "Dealer GEX Exposure": f"+${dm_dealer_gex_m:.2f}M",
-            "GEX Conviction": gex_conviction,
-            "Options Scale-In Status": options_execution_status,
+            "Net Entry Credit": f"${entry_credit_usd:.2f}",
+            "Cost to Close ($)": f"${current_cost_to_close:.2f}",
+            "Unrealized PnL": f"+${unrealized_pnl:,.2f}",
+            "Profit Captured": f"{profit_captured_pct:.1f}% (Target: {config.target_profit_pct:.1f}%)",
+            "Options Strategy Status": options_execution_status,
         },
         "section_03": {
             "Aggregate Options Delta": f"{live_options_delta:+.4f} ETH",
@@ -810,7 +915,8 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE) -> t
     summary_text = (
         f"Derive 5-Minute Cadence Autonomous Volatility Loop Trader executed.\n"
         f"- Mode: {execution_mode_str} | Asset: {config.trading_pair} (${spot_price:,.2f})\n"
-        f"- Vol Edge: {net_edge:.2f} pts | Derivatives Monkey GEX: +${dm_dealer_gex_m:.2f}M ({gex_conviction})\n"
+        f"- Vol Edge: {net_edge:.2f} pts | Net Entry Credit: ${entry_credit_usd:.2f} | Cost to Close: ${current_cost_to_close:.2f}\n"
+        f"- Unrealized PnL: +${unrealized_pnl:,.2f} ({profit_captured_pct:.1f}% captured | Target: {config.target_profit_pct:.1f}%)\n"
         f"- Subaccount: #{subaccount_id} | Subaccount Value: ${subaccount_value:,.2f} | Collateral: ${collateral:,.2f}\n"
         f"- Margin Utilization: {margin_utilization_pct:.2f}% (Cap: {config.max_margin_utilization_pct:.1f}% | Headroom: ${margin_headroom_usd:,.2f})\n"
         f"- Buying Power: ${buying_power:,.2f} | Positions Margin Used: ${positions_margin_used:,.2f}\n"
@@ -831,7 +937,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     report = LiveReport(
         "Derive Autonomous Volatility Loop Trader",
         source_name="derive_volatility_loop_trader",
-        tags=["derive", "options", "continuous", "delta_cap", "margin_utilization", "telegram"],
+        tags=["derive", "options", "continuous", "delta_cap", "take_profit", "margin_utilization", "telegram"],
         auto_refresh_seconds=60,
     )
 
@@ -850,7 +956,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                 for k, v in metrics_dict.get("section_01", {}).items():
                     report.builder.kpi(k, v)
                     
-                report.builder.section("02 / VOLATILITY SPREAD & DERIVATIVES MONKEY INTEL", "Short Volatility Edge Verification")
+                report.builder.section("02 / VOLATILITY SPREAD & TAKE-PROFIT TRACKER", f"Live PnL & 60% Exit Target Monitoring")
                 for k, v in metrics_dict.get("section_02", {}).items():
                     report.builder.kpi(k, v)
 
