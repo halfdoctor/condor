@@ -28,7 +28,7 @@ STATE_FILE = Path(os.getenv("POSITION_STATE_FILE", ROUTINES_DIR / ".position_sta
 HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", ROUTINES_DIR / ".heartbeat.json"))
 
 class Config(BaseModel):
-    """Autonomous 5-Minute Continuous Loop Trader: Fully Non-Blocking Async I/O, Atomic State Writes, Portable Paths & 60% Take-Profit"""
+    """Autonomous 5-Minute Continuous Loop Trader: Multi-Tick RFQ Polling & Best-Profit Quote Selection, Non-Blocking Async, 60% Take-Profit"""
     trading_pair: str = Field(default="ETH-USDT", description="Underlying asset trading pair (ETH-USDT, BTC-USDT, HYPE-USDT)")
     poll_interval_seconds: int = Field(default=300, description="Loop monitoring interval in seconds (5-minute default cadence)")
     paper_mode: bool = Field(default=False, description="Dry-run paper mode (True = Simulated execution & alerts; False = Live exchange orders)")
@@ -502,6 +502,77 @@ def map_rfq_quote_prices(rfq_legs: list, quote_legs: list) -> bool:
                 
     return all_matched
 
+async def poll_best_rfq_quote(
+    client: httpx.AsyncClient, 
+    subaccount_id: int, 
+    auth_headers: dict, 
+    rfq_id: str, 
+    rfq_legs: list,
+    mode: str = "entry", 
+    max_wait_seconds: int = 5
+) -> dict | None:
+    """Poll Derive RFQ quotes across multiple ticks over a multi-second window and select the best profit quote:
+    - Entry (Selling Spread): Highest Net Credit Received
+    - Exit (Buying Spread to Close): Lowest Cost to Close
+    """
+    user_dir_map = {}
+    for l in rfq_legs:
+        iname = getattr(l, "instrument_name", None) or (l.get("instrument_name") if isinstance(l, dict) else None)
+        d = getattr(l, "direction", None) or (l.get("direction") if isinstance(l, dict) else None)
+        if iname and d:
+            user_dir_map[iname] = d
+            
+    def eval_quote_net(quote: dict) -> float:
+        net_val = 0.0
+        for leg in quote.get("legs", []):
+            iname = leg.get("instrument_name")
+            p = float(leg.get("price", 0.0))
+            amt = float(leg.get("amount", 1.0))
+            u_dir = user_dir_map.get(iname, "buy")
+            if u_dir == "sell":
+                net_val += p * amt  # Taker receives credit
+            else:
+                net_val -= p * amt  # Taker pays debit
+        return net_val
+
+    best_quote = None
+    best_score = -999999.0 if mode == "entry" else 999999.0
+
+    for tick in range(max_wait_seconds):
+        await asyncio.sleep(1.0)
+        try:
+            poll_resp = await client.post(
+                "https://api.lyra.finance/private/poll_quotes",
+                json={"subaccount_id": subaccount_id, "status": "open"},
+                headers=auth_headers,
+                timeout=4.0
+            )
+            quotes = poll_resp.json().get("result", {}).get("quotes", [])
+            matching = [q for q in quotes if q.get("rfq_id") == rfq_id and q.get("direction") == "sell"]
+            
+            if matching:
+                for q in matching:
+                    net_p = eval_quote_net(q)
+                    if mode == "entry":
+                        # Highest net credit is best
+                        if net_p > best_score:
+                            best_score = net_p
+                            best_quote = q
+                    else:
+                        # Lowest cost to close is best (cost = -net_p)
+                        cost = -net_p
+                        if cost < best_score:
+                            best_score = cost
+                            best_quote = q
+                            
+                # Once we have gathered competing quotes across 2+ ticks, return winner
+                if tick >= 2 and best_quote:
+                    break
+        except Exception as e:
+            logger.warning(f"Error during RFQ poll tick {tick+1}/{max_wait_seconds}: {e}")
+
+    return best_quote
+
 async def resolve_actual_entry_credit(client: httpx.AsyncClient, subaccount_id: int, auth_headers: dict, active_legs: list, fallback_spread_unit_credit: float) -> float:
     """Resolve the true net entry credit received when opening the active Iron Condor position."""
     if not auth_headers or not subaccount_id or not active_legs:
@@ -784,7 +855,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
     change_event_details = []
 
     # -------------------------------------------------------------
-    # 6. Automated Take-Profit (>=60%) or Stop-Loss Unwind Execution
+    # 6. Automated Take-Profit (>=60%) or Stop-Loss Unwind Execution with Multi-Tick Best Quote Selection
     # -------------------------------------------------------------
     if (take_profit_triggered or stop_loss_triggered) and not config.paper_mode and session_key_wallet and smart_contract_wallet and subaccount_id:
         trigger_name = "TAKE-PROFIT (>=60% Captured)" if take_profit_triggered else "STOP-LOSS"
@@ -819,13 +890,9 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
                 close_rfq_id = send_rfq_resp.json().get("result", {}).get("rfq_id")
                 
                 if close_rfq_id:
-                    await asyncio.sleep(2)
-                    poll_resp = await http_client.post("https://api.lyra.finance/private/poll_quotes", json={"subaccount_id": subaccount_id, "status": "open"}, headers=auth_headers, timeout=5.0)
-                    quotes = poll_resp.json().get("result", {}).get("quotes", [])
-                    matching_quotes = [q for q in quotes if q.get("rfq_id") == close_rfq_id and q.get("direction") == "sell"]
-                    if matching_quotes:
-                        best_quote = matching_quotes[0]
-                        
+                    # Multi-tick quote polling: selects lowest cost-to-close among competing market makers
+                    best_quote = await poll_best_rfq_quote(http_client, subaccount_id, auth_headers, close_rfq_id, rfq_close_data.legs, mode="exit", max_wait_seconds=5)
+                    if best_quote:
                         prices_mapped = map_rfq_quote_prices(rfq_close_data.legs, best_quote.get("legs", []))
                         if prices_mapped:
                             action = SignedAction(subaccount_id=subaccount_id, owner=smart_contract_wallet, signer=session_key_wallet.address, signature_expiry_sec=utils.MAX_INT_32, nonce=utils.get_action_nonce(), module_address=RFQ_MODULE_ADDRESS, module_data=rfq_close_data, DOMAIN_SEPARATOR=DOMAIN_SEPARATOR, ACTION_TYPEHASH=ACTION_TYPEHASH)
@@ -864,7 +931,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             options_execution_status = f"EXIT TRIGGER FAILED: {e}"
 
     # -------------------------------------------------------------
-    # 7. Dynamic Volatility Scale-In (Gradual Scaling while Margin Util < 75%)
+    # 7. Dynamic Volatility Scale-In with Multi-Tick Best Quote Selection
     # -------------------------------------------------------------
     can_scale_in = edge_open and (margin_utilization_pct < config.max_margin_utilization_pct) and (margin_headroom_usd >= 25.0) and not (take_profit_triggered or stop_loss_triggered)
     
@@ -930,13 +997,9 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
                         if not live_rfq_id:
                             continue
                             
-                        await asyncio.sleep(2)
-                        poll_resp = await http_client.post("https://api.lyra.finance/private/poll_quotes", json={"subaccount_id": subaccount_id, "status": "open"}, headers=auth_headers, timeout=5.0)
-                        quotes = poll_resp.json().get("result", {}).get("quotes", [])
-                        matching_quotes = [q for q in quotes if q.get("rfq_id") == live_rfq_id and q.get("direction") == "sell"]
-                        if matching_quotes:
-                            best_quote = matching_quotes[0]
-                            
+                        # Multi-tick quote polling: selects highest net premium credit among competing market makers
+                        best_quote = await poll_best_rfq_quote(http_client, subaccount_id, auth_headers, live_rfq_id, rfq_module_data.legs, mode="entry", max_wait_seconds=5)
+                        if best_quote:
                             prices_mapped = map_rfq_quote_prices(rfq_module_data.legs, best_quote.get("legs", []))
                             if prices_mapped:
                                 action = SignedAction(subaccount_id=subaccount_id, owner=smart_contract_wallet, signer=session_key_wallet.address, signature_expiry_sec=utils.MAX_INT_32, nonce=utils.get_action_nonce(), module_address=RFQ_MODULE_ADDRESS, module_data=rfq_module_data, DOMAIN_SEPARATOR=DOMAIN_SEPARATOR, ACTION_TYPEHASH=ACTION_TYPEHASH)
@@ -1186,7 +1249,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     report = LiveReport(
         "Derive Autonomous Volatility Loop Trader",
         source_name="derive_volatility_loop_trader",
-        tags=["derive", "options", "continuous", "non_blocking_async", "atomic_writes", "noise_free_alerts", "adaptive_precision", "exact_contract_dte", "delta_cap", "take_profit", "telegram"],
+        tags=["derive", "options", "continuous", "multi_tick_rfq", "best_quote_selection", "non_blocking_async", "atomic_writes", "noise_free_alerts", "delta_cap", "take_profit", "telegram"],
         auto_refresh_seconds=60,
     )
 
