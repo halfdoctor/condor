@@ -156,6 +156,7 @@ async def get_portfolio(
                 )
 
     _dedupe_hyperliquid_unified(connectors)
+    _dedupe_derive_unified(connectors)
     total_usd = sum(c.total_usd for c in connectors)
     return PortfolioResponse(server=name, connectors=connectors, total_usd=total_usd)
 
@@ -194,6 +195,43 @@ def _dedupe_hyperliquid_unified(connectors: list[ConnectorBalance]) -> None:
     perp.note = (
         "Unified account — USDC balance is reflected in the hyperliquid (spot) balance."
     )
+
+
+def _dedupe_derive_unified(connectors: list[ConnectorBalance]) -> None:
+    """Avoid double-counting Derive balances for unified subaccounts.
+
+    Derive uses a unified cross-collateral subaccount where the same collateral (USDC, ETH, HYPE,
+    etc.) backs both options and perpetuals. When both ``derive`` and ``derive_perpetual`` are
+    connected, the collateral assets are reported by both connectors. Deduplicate by dropping
+    matching collateral balances from ``derive_perpetual`` so they are reflected under ``derive`` only.
+    Mutates ``connectors`` in place.
+    """
+    spot = next((c for c in connectors if c.connector == "derive"), None)
+    perp = next((c for c in connectors if c.connector == "derive_perpetual"), None)
+    if spot is None or perp is None:
+        return
+
+    spot_by_token = {b.token: b for b in spot.balances}
+    deduped_balances: list[BalanceItem] = []
+    dropped_any = False
+
+    for b in perp.balances:
+        spot_b = spot_by_token.get(b.token)
+        if spot_b is not None:
+            # Check if units or USD values match within 1% (or float precision delta)
+            units_match = abs(b.total - spot_b.total) <= max(1e-4, 0.01 * abs(spot_b.total))
+            usd_match = abs(b.usd_value - spot_b.usd_value) <= max(0.1, 0.01 * max(abs(spot_b.usd_value), abs(b.usd_value)))
+            if units_match or usd_match:
+                dropped_any = True
+                continue
+        deduped_balances.append(b)
+
+    if dropped_any:
+        perp.balances = deduped_balances
+        perp.total_usd = sum(b.usd_value for b in perp.balances)
+        perp.note = (
+            "Unified account — balance is reflected in the derive balance."
+        )
 
 
 RANGE_CONFIG = {
@@ -483,6 +521,62 @@ def _parse_timestamp(val: object) -> float:
     return 0.0
 
 
+def _dedupe_snapshot_connectors(account_data: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of account connectors dict with duplicated unified balances removed."""
+    if not isinstance(account_data, dict):
+        return account_data
+
+    connectors = dict(account_data)
+
+    # Derive deduplication
+    if "derive" in connectors and "derive_perpetual" in connectors:
+        spot_list = connectors["derive"]
+        perp_list = connectors["derive_perpetual"]
+        if isinstance(spot_list, list) and isinstance(perp_list, list):
+            spot_by_token = {
+                item.get("token", item.get("asset", "")): item
+                for item in spot_list
+                if isinstance(item, dict)
+            }
+            cleaned_perp = []
+            for item in perp_list:
+                if isinstance(item, dict):
+                    token = item.get("token", item.get("asset", ""))
+                    spot_item = spot_by_token.get(token)
+                    if spot_item is not None:
+                        u1 = float(item.get("units", item.get("total_balance", 0)))
+                        u2 = float(spot_item.get("units", spot_item.get("total_balance", 0)))
+                        v1 = float(item.get("value", item.get("usd_value", 0)))
+                        v2 = float(spot_item.get("value", spot_item.get("usd_value", 0)))
+                        if abs(u1 - u2) <= max(1e-4, 0.01 * abs(u2)) or abs(v1 - v2) <= max(0.1, 0.01 * max(abs(v1), abs(v2))):
+                            continue
+                cleaned_perp.append(item)
+            connectors["derive_perpetual"] = cleaned_perp
+
+    # Hyperliquid deduplication
+    if "hyperliquid" in connectors and "hyperliquid_perpetual" in connectors:
+        spot_list = connectors["hyperliquid"]
+        perp_list = connectors["hyperliquid_perpetual"]
+        if isinstance(spot_list, list) and isinstance(perp_list, list):
+            spot_stables = sum(
+                float(item.get("value", item.get("usd_value", 0)))
+                for item in spot_list
+                if isinstance(item, dict) and item.get("token", item.get("asset", "")) in _HL_STABLES
+            )
+            perp_stables = sum(
+                float(item.get("value", item.get("usd_value", 0)))
+                for item in perp_list
+                if isinstance(item, dict) and item.get("token", item.get("asset", "")) in _HL_STABLES
+            )
+            if spot_stables > 0 and perp_stables > 0 and abs(perp_stables - spot_stables) <= max(0.01, 0.01 * spot_stables):
+                connectors["hyperliquid_perpetual"] = [
+                    item for item in perp_list
+                    if isinstance(item, dict) and item.get("token", item.get("asset", "")) not in _HL_STABLES
+                ]
+
+    return connectors
+
+
 def _extract_token_values(data: object) -> dict[str, float]:
     """Extract per-token USD values from a portfolio snapshot."""
     tokens: dict[str, float] = {}
@@ -490,7 +584,8 @@ def _extract_token_values(data: object) -> dict[str, float]:
         return tokens
     for val in data.values():
         if isinstance(val, dict):
-            for inner in val.values():
+            clean_val = _dedupe_snapshot_connectors(val)
+            for inner in clean_val.values():
                 if isinstance(inner, list):
                     for item in inner:
                         if isinstance(item, dict):
@@ -508,7 +603,8 @@ def _extract_connector_totals(data: object) -> dict[str, float]:
         return totals
     for account, val in data.items():
         if isinstance(val, dict):
-            for connector, inner in val.items():
+            clean_val = _dedupe_snapshot_connectors(val)
+            for connector, inner in clean_val.items():
                 key = f"{account}:{connector}"
                 if isinstance(inner, list):
                     s = 0.0
