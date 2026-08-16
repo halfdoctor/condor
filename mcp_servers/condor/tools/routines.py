@@ -182,8 +182,8 @@ def list_routines(target: str | None = None) -> dict:
     return {"routines": result}
 
 
-def describe_routine(name: str) -> dict:
-    routine = _resolve_routine(name)
+def describe_routine(name: str, target: str | None = None) -> dict:
+    routine, _ = _resolve_with_owner(name, target)
     if not routine:
         return {"error": f"Routine '{name}' not found"}
     fields = routine.get_fields()
@@ -453,9 +453,11 @@ async def get_instance(instance_id: str) -> dict:
     return _result_payload(name, instance_id, inst)
 
 
-async def start_routine(name: str, config: dict | None) -> dict:
+async def start_routine(
+    name: str, config: dict | None, target: str | None = None
+) -> dict:
     """Start a continuous routine in the main process, so it can be stopped there."""
-    routine = _resolve_routine(name)
+    routine, agent = _resolve_with_owner(name, target)
     if not routine:
         return {"error": f"Routine '{name}' not found"}
     if not routine.is_continuous:
@@ -481,7 +483,7 @@ async def start_routine(name: str, config: dict | None) -> dict:
                     "routine_name": _store_name(routine, name),
                     "server_name": active_server,
                     "config": config or {},
-                    "attribute_to": settings.specialist_slug or "condor",
+                    "attribute_to": agent or settings.specialist_slug or "condor",
                 }
             ),
         )
@@ -673,7 +675,7 @@ async def manage_routines(
     if action == "describe":
         if not name:
             return {"error": "name is required"}
-        return describe_routine(name)
+        return describe_routine(name, target)
     if action == "run":
         if not name:
             return {"error": "name is required"}
@@ -705,7 +707,7 @@ async def manage_routines(
     if action == "start":
         if not name:
             return {"error": "name is required"}
-        return await start_routine(name, config)
+        return await start_routine(name, config, target)
     if action == "stop":
         if not name:
             return {"error": "instance_id is required (pass as name)"}

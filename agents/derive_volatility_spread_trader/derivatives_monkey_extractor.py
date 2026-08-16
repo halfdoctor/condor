@@ -175,11 +175,12 @@ class DerivativesMonkeyExtractor:
         rule_skew_pass = False
 
         # Rule 1: Volatility Edge
+        vrp_display = f"{vrp_val:.2f}" if vrp_val is not None else "N/A"
         if vol_regime in ["rich", "elevated"] or (vrp_val is not None and vrp_val >= 2.5):
             rule_vol_pass = True
-            reasons.append(f"[PASS] Volatility edge is {vol_regime.upper()} (VRP: {vrp_val:.2f} vol pts, IV Rank: {iv_rank if iv_rank else 'N/A'}).")
+            reasons.append(f"[PASS] Volatility edge is {vol_regime.upper()} (VRP: {vrp_display} vol pts, IV Rank: {iv_rank if iv_rank is not None else 'N/A'}).")
         else:
-            reasons.append(f"[FAIL] Volatility edge is {vol_regime.upper()} (VRP: {vrp_val if vrp_val else 0:.2f} vol pts). IV is cheap or not rich enough for selling vol.")
+            reasons.append(f"[FAIL] Volatility edge is {vol_regime.upper()} (VRP: {vrp_display} vol pts). IV is cheap or not rich enough for selling vol.")
 
         # Rule 2: GEX Regime
         if gex_regime == "positive":
@@ -191,36 +192,40 @@ class DerivativesMonkeyExtractor:
             reasons.append(f"[FAIL] Net Gamma regime is NEGATIVE / BALANCED ({net_gamma_regime}). High trend risk.")
 
         # Rule 3: Spot vs Gamma Flip
+        dist_display = f"+{distance_pct:.2f}%" if distance_pct is not None else "N/A"
+        flip_display = f"{gamma_flip_strike:,.2f}" if gamma_flip_strike is not None else "N/A"
         if spot_above_flip and distance_pct is not None and distance_pct > 0.1:
             rule_spot_pass = True
-            reasons.append(f"[PASS] Spot price ({spot_val:,.2f}) is above Gamma Flip ({gamma_flip_strike:,.2f}) by +{distance_pct:.2f}%.")
+            reasons.append(f"[PASS] Spot price ({spot_val:,.2f}) is above Gamma Flip ({flip_display}) by {dist_display}.")
         else:
-            reasons.append(f"[FAIL] Spot price ({spot_val:,.2f}) is AT or BELOW Gamma Flip ({gamma_flip_strike if gamma_flip_strike else 'N/A'}).")
+            reasons.append(f"[FAIL] Spot price ({spot_val:,.2f}) is AT or BELOW Gamma Flip ({flip_display}).")
 
         # Rule 4: Term Structure (VIX / IV Contango vs Backwardation)
+        spread_display = f"{term_spread:+.2f}" if term_spread is not None else "N/A"
         if term_tag == "contango" or (term_spread is not None and term_spread >= 0):
             rule_term_pass = True
-            reasons.append(f"[PASS] Term Structure is in CONTANGO (30D-7D spread: {term_spread:+.2f} vol pts). Normal risk premium environment friendly to short vol.")
+            reasons.append(f"[PASS] Term Structure is in CONTANGO (30D-7D spread: {spread_display} vol pts). Normal risk premium environment friendly to short vol.")
         elif term_tag == "mild_backwardation" or (term_spread is not None and term_spread >= -3.0):
             rule_term_pass = True  # Allowed with caution
-            reasons.append(f"[WARN] Term Structure in MILD BACKWARDATION (30D-7D spread: {term_spread:+.2f} vol pts). VRP inversion risk; monitor or reduce size.")
+            reasons.append(f"[WARN] Term Structure in MILD BACKWARDATION (30D-7D spread: {spread_display} vol pts). VRP inversion risk; monitor or reduce size.")
         else:
             rule_term_pass = False
-            reasons.append(f"[FAIL] Term Structure in DEEP BACKWARDATION (30D-7D spread: {term_spread:+.2f} vol pts). Volatility stress / VRP inversion risk. Avoid short vol.")
+            reasons.append(f"[FAIL] Term Structure in DEEP BACKWARDATION (30D-7D spread: {spread_display} vol pts). Volatility stress / VRP inversion risk. Avoid short vol.")
 
         # Rule 5: Skew / Tail Risk Assessment
+        rr_display = f"{near_rr_25d:.2f}" if near_rr_25d is not None else "N/A"
         if skew_bias == "balanced":
             rule_skew_pass = True
-            reasons.append(f"[PASS] Skew is BALANCED (25D Risk Reversal: {near_rr_25d:.2f} if near_rr_25d else 'N/A'). Standard symmetric wings allowed.")
+            reasons.append(f"[PASS] Skew is BALANCED (25D Risk Reversal: {rr_display}). Standard symmetric wings allowed.")
         elif skew_bias == "heavy_put_skew":
             rule_skew_pass = True  # Pass with strike adjustment
-            reasons.append(f"[WARN] HEAVY PUT SKEW detected (25D RR: {near_rr_25d:.2f}). Heightened downside tail risk; recommend asymmetric wider put wing.")
+            reasons.append(f"[WARN] HEAVY PUT SKEW detected (25D RR: {rr_display}). Heightened downside tail risk; recommend asymmetric wider put wing.")
         elif skew_bias == "heavy_call_skew":
             rule_skew_pass = True
-            reasons.append(f"[PASS] CALL SKEW bias (25D RR: {near_rr_25d:.2f}). Upside call demand dominant.")
+            reasons.append(f"[PASS] CALL SKEW bias (25D RR: {rr_display}). Upside call demand dominant.")
         else:
             rule_skew_pass = False
-            reasons.append(f"[FAIL] EXTREME / PANIC PUT SKEW (25D RR: {near_rr_25d:.2f}). Downside panic; avoid standard short vol.")
+            reasons.append(f"[FAIL] EXTREME / PANIC PUT SKEW (25D RR: {rr_display}). Downside panic; avoid standard short vol.")
 
         # Iron Condor signal decision
         short_vol_allowed = rule_vol_pass and rule_gex_pass and rule_spot_pass and rule_term_pass and rule_skew_pass
