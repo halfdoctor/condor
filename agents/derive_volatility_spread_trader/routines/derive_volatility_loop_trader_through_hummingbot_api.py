@@ -28,6 +28,9 @@ ROUTINES_DIR = Path(__file__).resolve().parent
 STATE_FILE = Path(os.getenv("POSITION_STATE_FILE", ROUTINES_DIR / ".position_state.json"))
 HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", ROUTINES_DIR / ".heartbeat.json"))
 
+# Global in-memory cache for instrument mark prices across polling ticks
+LAST_KNOWN_MARK_PRICES: dict[str, float] = {}
+
 class Config(BaseModel):
     """Autonomous Decoupled Dual-Cadence Trader: Derivatives Monkey Consensus Cross-Check, Pure Target Delta (30Δ/10Δ), 30s Fast Rehedge, 50 Bps Slippage Protection"""
     trading_pair: str = Field(default="ETH-USDT", description="Underlying asset trading pair (ETH-USDT, BTC-USDT, HYPE-USDT)")
@@ -237,7 +240,16 @@ def load_previous_position_state() -> dict:
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE, "r") as f:
-                return json.load(f)
+                state = json.load(f)
+                if isinstance(state, dict):
+                    for k, v in state.get("leg_marks", {}).items():
+                        try:
+                            val = float(v)
+                            if val > 0.0:
+                                LAST_KNOWN_MARK_PRICES.setdefault(k, val)
+                        except (ValueError, TypeError):
+                            pass
+                    return state
         except Exception:
             pass
     return {}
@@ -247,10 +259,10 @@ def save_position_state(state: dict):
 
 def save_heartbeat(data: dict):
     payload = {
+        "status": "healthy",
         **data,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "timestamp_epoch": datetime.datetime.now(datetime.timezone.utc).timestamp(),
-        "status": "healthy"
     }
     save_json_atomic(HEARTBEAT_FILE, payload)
 
@@ -352,40 +364,119 @@ def resolve_derive_credentials(config: Config) -> tuple[str, str, int | None]:
 
     return wallet, priv, sub_id
 
-async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE, chat_id: str | None, message: str, client: httpx.AsyncClient | None = None):
+async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE | None, chat_id: str | None, message: str, client: httpx.AsyncClient | None = None):
     target_chat = chat_id or os.environ.get("ADMIN_USER_ID") or os.environ.get("TELEGRAM_CHAT_ID")
     if not target_chat:
         logger.info("Telegram alert skipped: No chat_id provided and ADMIN_USER_ID/TELEGRAM_CHAT_ID not set in .env")
         return
 
-    if hasattr(context, "bot") and context.bot:
+    if context is not None and hasattr(context, "bot") and context.bot:
         try:
             await context.bot.send_message(chat_id=target_chat, text=message, parse_mode="Markdown")
             logger.info(f"Telegram notification sent to chat {target_chat} via context.bot")
             return
         except Exception as e:
-            logger.warning(f"Failed to send Telegram alert via context.bot: {e}")
+            logger.warning(f"Failed to send Telegram alert via context.bot (Markdown): {e}. Retrying as plain text...")
+            try:
+                await context.bot.send_message(chat_id=target_chat, text=message)
+                logger.info(f"Telegram notification delivered to chat {target_chat} as plain text fallback")
+                return
+            except Exception as e2:
+                logger.warning(f"Failed to send plain text alert via context.bot: {e2}")
 
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if bot_token:
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             payload = {"chat_id": target_chat, "text": message, "parse_mode": "Markdown"}
+            
+            async def _do_post(c: httpx.AsyncClient, p: dict):
+                r = await c.post(url, json=p, timeout=5.0)
+                if r.status_code != 200:
+                    # Retry as plain text if Markdown entity parsing failed
+                    fallback_p = {"chat_id": target_chat, "text": message}
+                    r = await c.post(url, json=fallback_p, timeout=5.0)
+                return r
+
             if client:
-                resp = await client.post(url, json=payload, timeout=5.0)
-                if resp.status_code == 200:
-                    logger.info(f"Telegram notification delivered to chat {target_chat} via async client")
-                else:
-                    logger.warning(f"Telegram API returned status {resp.status_code}: {resp.text}")
+                try:
+                    resp = await _do_post(client, payload)
+                    if resp.status_code == 200:
+                        logger.info(f"Telegram notification delivered to chat {target_chat} via async client")
+                    else:
+                        logger.warning(f"Telegram API returned status {resp.status_code}: {resp.text}")
+                except Exception as e_c:
+                    logger.warning(f"Telegram alert via async client failed ({e_c}), retrying with temp client...")
+                    async with httpx.AsyncClient(timeout=5.0) as temp_client:
+                        resp = await _do_post(temp_client, payload)
+                        if resp.status_code == 200:
+                            logger.info(f"Telegram notification delivered to chat {target_chat}")
+                        else:
+                            logger.warning(f"Telegram API returned status {resp.status_code}: {resp.text}")
             else:
                 async with httpx.AsyncClient(timeout=5.0) as temp_client:
-                    resp = await temp_client.post(url, json=payload)
+                    resp = await _do_post(temp_client, payload)
                     if resp.status_code == 200:
                         logger.info(f"Telegram notification delivered to chat {target_chat}")
+                    else:
+                        logger.warning(f"Telegram API returned status {resp.status_code}: {resp.text}")
         except Exception as e:
             logger.warning(f"Failed to send Telegram alert via async HTTP fallback: {e}")
     else:
         logger.info("Telegram direct alert skipped: No TELEGRAM_TOKEN or TELEGRAM_BOT_TOKEN set in .env")
+
+_ERROR_ALERT_HISTORY: dict[str, float] = {}
+
+async def send_telegram_error_alert(
+    context: ContextTypes.DEFAULT_TYPE | None,
+    chat_id: str | None,
+    error_title: str,
+    error: Exception | str,
+    cycle_number: int | str,
+    cycle_type: str,
+    pair: str,
+    client: httpx.AsyncClient | None = None,
+    extra_info: str | None = None,
+    throttle_seconds: float = 60.0,
+):
+    """Send immediate automated Telegram alert for unhandled errors/exceptions or crashes with error summary, cycle number, and timestamp.
+    
+    Includes intelligent throttling for repeating errors to prevent flood while ensuring the first occurrence and distinct errors alert immediately.
+    """
+    now = time.time()
+    err_cls = type(error).__name__ if isinstance(error, Exception) else "Error"
+    err_str = str(error) if error else "Unknown error"
+    error_key = f"{cycle_type}:{err_cls}:{err_str[:80]}"
+    
+    if throttle_seconds > 0:
+        last_alert_time = _ERROR_ALERT_HISTORY.get(error_key, 0.0)
+        if (now - last_alert_time) < throttle_seconds:
+            logger.info(f"Telegram error alert throttled ({now - last_alert_time:.1f}s < {throttle_seconds:.1f}s): {error_key}")
+            return
+
+    _ERROR_ALERT_HISTORY[error_key] = now
+    timestamp_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    if len(err_str) > 500:
+        err_str = err_str[:497] + "..."
+    clean_err_str = err_str.replace("`", "'")
+
+    error_alert_msg = (
+        f"🚨 *[{error_title}]* 🚨\n"
+        f"*Asset*: `{pair}` | *Time*: `{timestamp_str}`\n"
+        f"*Cycle*: `{cycle_type} #{cycle_number}`\n"
+        f"*Error Type*: `{err_cls}`\n"
+        f"*Error Details*: `{clean_err_str}`\n"
+    )
+    if extra_info:
+        error_alert_msg += f"• *Status*: {extra_info}\n"
+    else:
+        error_alert_msg += "• *Status*: Exception caught; routine remains resilient and continues.\n"
+
+    try:
+        await send_telegram_alert(context, chat_id, error_alert_msg, client)
+    except Exception as ex:
+        logger.error(f"send_telegram_error_alert failed to dispatch: {ex}")
 
 async def fetch_derivatives_monkey_data(symbol: str = "ETH") -> dict:
     """Fetch live market intelligence and strategy signal from derivatives_monkey_extractor.py non-blockingly."""
@@ -733,7 +824,8 @@ async def execute_perp_rebalance(
     subaccount_id: int,
     inst_perp_info: dict,
     size_decimals: int,
-    min_order_size: float
+    min_order_size: float,
+    context: ContextTypes.DEFAULT_TYPE | None = None
 ) -> tuple[float, str, str, bool]:
     """Execute fast perpetual delta rebalance with 50 bps limit price protection."""
     from derive_action_signing import SignedAction, TradeModuleData, utils
@@ -750,6 +842,10 @@ async def execute_perp_rebalance(
     hedge_action_status = f"DELTA NEUTRAL (|Imbalance| {abs(delta_imbalance):.4f} <= {config.hedge_band:.2f})"
     perp_order_summary = "None (Aligned with Options Delta Hedge Cap)"
     rebalanced = False
+
+    if spot_price <= 0.0:
+        logger.warning(f"execute_perp_rebalance: Invalid spot price (${spot_price}); skipping rebalance.")
+        return live_perp_delta, hedge_action_status, perp_order_summary, False
     
     is_overhedged = live_perp_delta > (max_allowed_perp_delta + 0.05) or live_perp_delta < (-max_allowed_perp_delta - 0.05)
     perp_slippage_mult = config.max_perp_slippage_bps / 10000.0
@@ -810,8 +906,21 @@ async def execute_perp_rebalance(
                             live_perp_delta += (-rebalance_size if is_sell else rebalance_size)
                             rebalanced = True
                     except Exception as e:
-                        logger.error(f"Perp rebalance execution error: {e}")
+                        logger.error(f"Perp rebalance execution error: {e}", exc_info=True)
                         perp_order_summary += f" | Error: {e}"
+                        if not config.paper_mode:
+                            await send_telegram_error_alert(
+                                context=context,
+                                chat_id=config.telegram_chat_id,
+                                error_title="PERPETUAL REBALANCE ORDER ERROR",
+                                error=e,
+                                cycle_number="Rebalance Execution",
+                                cycle_type="Perp Order",
+                                pair=config.trading_pair,
+                                client=http_client,
+                                extra_info=f"Perpetual rebalance order failed for {perp_symbol} ({side_str} {rebalance_size} {symbol})",
+                                throttle_seconds=30.0
+                            )
 
     return live_perp_delta, hedge_action_status, perp_order_summary, rebalanced
 
@@ -1070,7 +1179,6 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         except Exception as e:
             logger.warning(f"Error querying live Derive subaccount from private API: {e}")
 
-    # -------------------------------------------------------------
     # 5. Rigorous Mark-to-Market PnL & Take-Profit (60%) / Stop-Loss Engine
     # -------------------------------------------------------------
     prev_state = load_previous_position_state()
@@ -1079,32 +1187,106 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
     
     entry_credit_usd = await resolve_actual_entry_credit(http_client, subaccount_id, auth_headers, eth_opt_legs, theoretical_net_unit_credit)
     current_cost_to_close = 0.0
+    valid_leg_marks = {}
+    missing_or_unreliable_marks = []
+    mark_data_reliable = True
     
     if has_eth_ic_open:
         for p in eth_opt_legs:
             iname = p.get("instrument_name", "")
             amt = float(p.get("amount", 0.0))
-            leg_mark = 0.0
+            strike_k = p.get("strike")
+            opt_t = p.get("opt_type")
+            contract_T = p.get("exact_T")
+            leg_sigma = p.get("sigma") or sigma
+            
+            leg_mark = None
+            mark_source = None
+            
+            # 1. Try live ticker fetch from Derive public API
             try:
                 t_resp = (await http_client.post("https://api.lyra.finance/public/get_ticker", json={"instrument_name": iname}, timeout=3.5)).json().get("result", {})
-                leg_mark = float(t_resp.get("mark_price") or 0.0)
-            except Exception:
-                pass
+                raw_mark = t_resp.get("mark_price")
+                if raw_mark is not None:
+                    val = float(raw_mark)
+                    if val > 0.0:
+                        leg_mark = val
+                        mark_source = "live"
+                        LAST_KNOWN_MARK_PRICES[iname] = val
+            except Exception as e:
+                logger.warning(f"Error fetching live ticker mark price for {iname}: {e}")
+                
+            # 2. Fallback to last known valid mark from cache / previous state
+            if leg_mark is None or leg_mark <= 0.0:
+                mark_data_reliable = False
+                missing_or_unreliable_marks.append(iname)
+                
+                cached_mark = LAST_KNOWN_MARK_PRICES.get(iname) or prev_state.get("leg_marks", {}).get(iname)
+                if cached_mark and float(cached_mark) > 0.0:
+                    leg_mark = float(cached_mark)
+                    mark_source = "cached"
+                    logger.warning(f"Live ticker unavailable for {iname}; falling back safely to last known mark price ${leg_mark:.2f}")
+                else:
+                    # 3. Fallback to Black-Scholes theoretical price for telemetry/display only
+                    if strike_k is not None and contract_T is not None and opt_t and spot_price > 0:
+                        try:
+                            bs_price = bs_call_price(spot_price, strike_k, contract_T, r, leg_sigma) if opt_t == "C" else bs_put_price(spot_price, strike_k, contract_T, r, leg_sigma)
+                            if bs_price > 0:
+                                leg_mark = round(bs_price, 4)
+                                mark_source = "bs_theoretical"
+                                logger.warning(f"Live and cached mark unavailable for {iname}; using Black-Scholes estimate ${leg_mark:.2f}")
+                        except Exception as e_bs:
+                            logger.warning(f"Black-Scholes calculation failed for {iname}: {e_bs}")
+                            
+                    if leg_mark is None or leg_mark <= 0.0:
+                        leg_mark = 0.0
+                        mark_source = "zero_fallback"
+                        logger.warning(f"Failed to resolve mark price for {iname}; defaulted to $0.00")
+
+            valid_leg_marks[iname] = leg_mark
             current_cost_to_close += (-amt) * leg_mark
+
+        # Safety Check: If cost to close computed as ~0 while positions are active, mark as unreliable
+        if current_cost_to_close <= 0.01:
+            mark_data_reliable = False
+            logger.warning(f"Total cost to close is ${current_cost_to_close:.2f} while {len(eth_opt_legs)} option legs are active. Marked as unreliable to prevent false take-profit.")
 
     current_cost_to_close = round(max(0.0, current_cost_to_close), 2)
     unrealized_pnl = round(entry_credit_usd - current_cost_to_close, 2)
     profit_captured_pct = round((unrealized_pnl / entry_credit_usd * 100.0), 2) if entry_credit_usd > 0 else 0.0
     
-    take_profit_triggered = has_eth_ic_open and (profit_captured_pct >= config.target_profit_pct) and (unrealized_pnl >= 0.60 * entry_credit_usd) and (unrealized_pnl > 3.0)
-    stop_loss_triggered = has_eth_ic_open and (unrealized_pnl <= -(config.stop_loss_pct / 100.0 * entry_credit_usd))
+    # Strict TP/SL Evaluation: ONLY evaluated if mark data is verified reliable
+    if has_eth_ic_open and mark_data_reliable:
+        take_profit_triggered = (
+            (profit_captured_pct >= config.target_profit_pct)
+            and (unrealized_pnl >= (config.target_profit_pct / 100.0) * entry_credit_usd)
+            and (unrealized_pnl > 3.0)
+        )
+        stop_loss_triggered = (
+            unrealized_pnl <= -(config.stop_loss_pct / 100.0 * entry_credit_usd)
+        )
+    else:
+        take_profit_triggered = False
+        stop_loss_triggered = False
+        if has_eth_ic_open and not mark_data_reliable:
+            logger.warning(
+                f"Skipping TP/SL evaluation for this tick: Mark price data is missing or unreliable "
+                f"(unreliable legs: {missing_or_unreliable_marks or 'N/A'}, cost_to_close: ${current_cost_to_close:.2f}). "
+                f"Holding positions without executing orders."
+            )
     
     if not config.enable_options_entry:
-        options_execution_status = f"HEDGE-ONLY MODE: HOLDING POSITION (PnL: +${unrealized_pnl:,.2f} | {profit_captured_pct:.1f}% | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "HEDGE-ONLY MODE: NEW ENTRY DISABLED (STANDBY)"
+        if has_eth_ic_open and not mark_data_reliable:
+            options_execution_status = f"HEDGE-ONLY MODE: HOLDING POSITION (MARK DATA UNRELIABLE - TP/SL SKIPPED | Est PnL: ${unrealized_pnl:,.2f})"
+        else:
+            options_execution_status = f"HEDGE-ONLY MODE: HOLDING POSITION (PnL: +${unrealized_pnl:,.2f} | {profit_captured_pct:.1f}% | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "HEDGE-ONLY MODE: NEW ENTRY DISABLED (STANDBY)"
     elif signal_conflict and not has_eth_ic_open:
         options_execution_status = f"ENTRY BLOCKED (Derivatives Monkey Conflict: {conflict_reason})"
     else:
-        options_execution_status = f"HOLDING POSITION (PnL: +${unrealized_pnl:,.2f} | {profit_captured_pct:.1f}% of ${entry_credit_usd:.2f} credit | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "NO ACTIVE OPTIONS (MONITORING ENTRY)"
+        if has_eth_ic_open and not mark_data_reliable:
+            options_execution_status = f"HOLDING POSITION (MARK DATA UNRELIABLE - TP/SL SKIPPED | Est PnL: ${unrealized_pnl:,.2f})"
+        else:
+            options_execution_status = f"HOLDING POSITION (PnL: +${unrealized_pnl:,.2f} | {profit_captured_pct:.1f}% of ${entry_credit_usd:.2f} credit | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "NO ACTIVE OPTIONS (MONITORING ENTRY)"
         
     position_change_occurred = False
     change_event_details = []
@@ -1112,11 +1294,18 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
     # Slippage multiplier calculation based on config.max_perp_slippage_bps (default 50 bps = 0.50%)
     perp_slippage_mult = config.max_perp_slippage_bps / 10000.0
 
+    # Default initialization for perp action & hedge status to prevent UnboundLocalError across all code paths
+    target_perp_delta = - live_options_delta
+    max_allowed_perp_delta = max(min_order_size, abs(live_options_delta) * config.max_perp_delta_hedge_ratio)
+    delta_imbalance_init = target_perp_delta - live_perp_delta
+    hedge_action_status = f"DELTA NEUTRAL (|Imbalance| {abs(delta_imbalance_init):.4f} <= {config.hedge_band:.2f})"
+    perp_order_summary = "None (Aligned with Options Delta Hedge Cap)"
+
     # -------------------------------------------------------------
     # 6. Automated Take-Profit (>=60%) or Stop-Loss Unwind Execution with Multi-Tick Best Quote Selection
     # -------------------------------------------------------------
-    if (take_profit_triggered or stop_loss_triggered) and not config.paper_mode and session_key_wallet and smart_contract_wallet and subaccount_id:
-        trigger_name = "TAKE-PROFIT (>=60% Captured)" if take_profit_triggered else "STOP-LOSS"
+    if (take_profit_triggered or stop_loss_triggered) and mark_data_reliable and not config.paper_mode and session_key_wallet and smart_contract_wallet and subaccount_id:
+        trigger_name = f"TAKE-PROFIT (>={config.target_profit_pct:.0f}% Captured)" if take_profit_triggered else "STOP-LOSS"
         logger.info(f"Triggering automated exit: {trigger_name} | Profit: {profit_captured_pct:.1f}% | PnL: ${unrealized_pnl:,.2f}")
         try:
             close_legs = []
@@ -1184,10 +1373,46 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
                 if order_resp.json().get("result", {}).get("order", {}).get("order_status") == "filled":
                     live_perp_delta = 0.0
                     change_event_details.append(f"Perpetual Hedge Flattened to 0.00 {symbol}")
+                    perp_order_summary = f"{execution_mode_str} Flattened Perpetual Hedge to 0.00 {symbol} ({trigger_name})"
+                    hedge_action_status = f"PERP FLATTENED ({trigger_name})"
+                else:
+                    err_msg = order_resp.json().get("error", {}).get("message", "Order not filled")
+                    perp_order_summary = f"{execution_mode_str} Flatten Perp: {err_msg}"
+                    hedge_action_status = f"FLATTEN FAILED ({trigger_name})"
+            else:
+                perp_order_summary = f"None (Perp already flat on {trigger_name})"
+                hedge_action_status = f"FLAT ({trigger_name})"
 
         except Exception as e:
-            logger.error(f"Error during automated exit execution: {e}")
+            logger.error(f"Error during automated exit execution: {e}", exc_info=True)
             options_execution_status = f"EXIT TRIGGER FAILED: {e}"
+            await send_telegram_error_alert(
+                context=context,
+                chat_id=config.telegram_chat_id,
+                error_title="CRITICAL: AUTOMATED EXIT EXECUTION FAILED",
+                error=e,
+                cycle_number=timestamp_str,
+                cycle_type="Exit Order Execution",
+                pair=config.trading_pair,
+                client=http_client,
+                extra_info=f"Automated exit failed ({trigger_name}). Please check account status immediately!",
+                throttle_seconds=0.0
+            )
+
+    elif (take_profit_triggered or stop_loss_triggered) and mark_data_reliable and config.paper_mode:
+        trigger_name = f"TAKE-PROFIT (>={config.target_profit_pct:.0f}% Captured)" if take_profit_triggered else "STOP-LOSS"
+        logger.info(f"[PAPER MODE] Simulated Exit: {trigger_name} | Profit: {profit_captured_pct:.1f}% | PnL: ${unrealized_pnl:,.2f}")
+        options_execution_status = f"[PAPER] SIMULATED EXIT VIA {trigger_name} (+${unrealized_pnl:,.2f} | {profit_captured_pct:.1f}%)"
+        position_change_occurred = True
+        change_event_details.append(f"[PAPER] Options Package Simulated Exit via {trigger_name} (+${unrealized_pnl:,.2f})")
+        if live_perp_delta != 0.0:
+            live_perp_delta = 0.0
+            change_event_details.append(f"[PAPER] Perpetual Hedge Simulated Flatten to 0.00 {symbol}")
+            perp_order_summary = f"[PAPER MODE] Simulated Flatten Perpetual Hedge to 0.00 {symbol} ({trigger_name})"
+            hedge_action_status = f"PERP FLATTENED ({trigger_name})"
+        else:
+            perp_order_summary = f"None (Perp already flat on {trigger_name})"
+            hedge_action_status = f"FLAT ({trigger_name})"
 
     # -------------------------------------------------------------
     # 7. Dynamic Volatility Scale-In with Derivatives Monkey Consensus Cross-Check
@@ -1199,6 +1424,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         and (margin_utilization_pct < config.max_margin_utilization_pct)
         and (margin_headroom_usd >= 25.0)
         and not (take_profit_triggered or stop_loss_triggered)
+        and (mark_data_reliable or not has_eth_ic_open)
     )
     
     if can_scale_in:
@@ -1281,7 +1507,20 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
                     if not package_filled and has_eth_ic_open:
                         options_execution_status = f"HOLDING POSITION (PnL: +${unrealized_pnl:,.2f} | Margin Util: {margin_utilization_pct:.1f}% | Headroom: ${margin_headroom_usd:,.2f})"
                 except Exception as e:
-                    logger.error(f"Scale-in RFQ error: {e}")
+                    logger.error(f"Scale-in RFQ error: {e}", exc_info=True)
+                    options_execution_status = f"SCALE-IN RFQ ERROR: {e}"
+                    await send_telegram_error_alert(
+                        context=context,
+                        chat_id=config.telegram_chat_id,
+                        error_title="OPTIONS SCALE-IN RFQ ERROR",
+                        error=e,
+                        cycle_number=timestamp_str,
+                        cycle_type="Scale-In RFQ",
+                        pair=config.trading_pair,
+                        client=http_client,
+                        extra_info="RFQ scale-in order encountered an error. Strategy continuing.",
+                        throttle_seconds=60.0
+                    )
 
     # -------------------------------------------------------------
     # 8. Strict Perpetual Delta Hedge Execution
@@ -1300,14 +1539,12 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             subaccount_id=subaccount_id,
             inst_perp_info=inst_perp_info,
             size_decimals=size_decimals,
-            min_order_size=min_order_size
+            min_order_size=min_order_size,
+            context=context
         )
         if rebalanced:
             position_change_occurred = True
             change_event_details.append(f"Perpetual Delta Rebalance: {perp_order_summary}")
-
-    target_perp_delta = - live_options_delta
-    max_allowed_perp_delta = max(min_order_size, abs(live_options_delta) * config.max_perp_delta_hedge_ratio)
 
     # -------------------------------------------------------------
     # 9. Robust Position Change Detection (With Float Tolerance) & Telegram Notification
@@ -1324,6 +1561,8 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             "unrealized_pnl": unrealized_pnl,
             "profit_captured_pct": profit_captured_pct,
             "cost_to_close": current_cost_to_close,
+            "leg_marks": valid_leg_marks,
+            "mark_data_reliable": mark_data_reliable,
             "timestamp": timestamp_str
         })
         
@@ -1399,6 +1638,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         "unrealized_pnl": unrealized_pnl,
         "profit_captured_pct": profit_captured_pct,
         "cost_to_close": current_cost_to_close,
+        "mark_data_reliable": mark_data_reliable,
         "options_status": options_execution_status,
         "perp_action": perp_order_summary,
         "subaccount_id": subaccount_id,
@@ -1483,7 +1723,8 @@ async def execute_fast_perp_hedge_cycle(
     cached_legs: list,
     cached_metrics: dict,
     display_table: list,
-    alerts_log: list
+    alerts_log: list,
+    sub_cycle_count: int = 0
 ) -> tuple[dict, list, list, bool]:
     """Fast 30-second sub-loop that fetches live spot, recalculates option Greeks, and rebalances perpetual delta hedge if drift exceeds hedge_band."""
     symbol = config.trading_pair.upper().split("-")[0]
@@ -1495,6 +1736,18 @@ async def execute_fast_perp_hedge_cycle(
         spot_price = await fetch_robust_spot_price(http_client, symbol)
     except Exception as e:
         logger.warning(f"Fast hedge cycle spot fetch failed: {e}")
+        await send_telegram_error_alert(
+            context=context,
+            chat_id=config.telegram_chat_id,
+            error_title="FAST HEDGE SPOT PRICE FETCH FAILED",
+            error=e,
+            cycle_number=sub_cycle_count,
+            cycle_type="Fast Hedge Sub-Cycle",
+            pair=config.trading_pair,
+            client=http_client,
+            extra_info="Unable to fetch live spot price across all venues; fast rehedge skipped for this tick.",
+            throttle_seconds=120.0
+        )
         return cached_metrics, display_table, alerts_log, False
         
     from web3 import Web3
@@ -1572,11 +1825,23 @@ async def execute_fast_perp_hedge_cycle(
         subaccount_id=subaccount_id,
         inst_perp_info=inst_perp_info,
         size_decimals=size_decimals,
-        min_order_size=min_order_size
+        min_order_size=min_order_size,
+        context=context
     )
 
     if rebalanced:
         logger.info(f"Fast 30s Perpetual Rehedge Executed: {perp_order_summary}")
+        # Save position state immediately on fast rehedge
+        prev_st = load_previous_position_state()
+        pos_dict = prev_st.get("positions", {}).copy()
+        pos_dict[perp_symbol] = live_perp_delta
+        save_position_state({
+            **prev_st,
+            "positions": pos_dict,
+            "perp_delta": live_perp_delta,
+            "options_delta": updated_options_delta,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        })
         # Send Telegram notification for the rehedge event
         alert_msg = (
             f"⚡ *[FAST 30S PERPETUAL REHEDGE EXECUTED]* ⚡\n"
@@ -1621,6 +1886,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     )
 
     macro_cycle_count = 0
+    fast_sub_cycle_count = 0
     last_macro_time = 0.0
     cached_metrics = {}
     cached_display_table = []
@@ -1645,9 +1911,42 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         cached_legs = active_legs
                         last_macro_time = time.time()
                     except Exception as e:
-                        logger.error(f"Error in macro volatility cycle #{macro_cycle_count}: {e}")
+                        logger.error(f"Error in macro volatility cycle #{macro_cycle_count}: {e}", exc_info=True)
+                        err_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                        # 1. Dispatch automated Telegram error alert
+                        await send_telegram_error_alert(
+                            context=context,
+                            chat_id=config.telegram_chat_id,
+                            error_title="MACRO VOLATILITY CYCLE ERROR",
+                            error=e,
+                            cycle_number=macro_cycle_count,
+                            cycle_type="Macro Cycle",
+                            pair=config.trading_pair,
+                            client=http_client,
+                            extra_info=f"Macro cycle #{macro_cycle_count} failed. Routine remains resilient and will retry next cycle."
+                        )
+                        # 2. Append to alerts log for UI audit trail
+                        cached_alerts_log.append({
+                            "Event": f"Macro Cycle #{macro_cycle_count} Error",
+                            "Asset": config.trading_pair,
+                            "Margin Utilization": cached_metrics.get("section_01", {}).get("Margin Utilization", "-"),
+                            "Options Delta": cached_metrics.get("section_03", {}).get("Aggregate Options Delta", "-"),
+                            "Perp Delta": cached_metrics.get("section_03", {}).get("Current Perpetual Delta", "-"),
+                            "Status": f"ERROR: {type(e).__name__} ({str(e)[:40]}...)"
+                        })
+                        # 3. Update heartbeat with degraded status
+                        save_heartbeat({
+                            "trading_pair": config.trading_pair,
+                            "status": "degraded",
+                            "macro_cycle": macro_cycle_count,
+                            "last_error": f"{type(e).__name__}: {str(e)}",
+                            "last_error_time": err_timestamp
+                        })
+                        # Advance macro timer so we do not busy-spin on failure
+                        last_macro_time = time.time()
                 else:
                     # Execute fast 30s perpetual delta rebalance sub-cycle
+                    fast_sub_cycle_count += 1
                     try:
                         cached_metrics, cached_display_table, cached_alerts_log, rebalanced = await execute_fast_perp_hedge_cycle(
                             config=config,
@@ -1656,10 +1955,42 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                             cached_legs=cached_legs,
                             cached_metrics=cached_metrics,
                             display_table=cached_display_table,
-                            alerts_log=cached_alerts_log
+                            alerts_log=cached_alerts_log,
+                            sub_cycle_count=fast_sub_cycle_count
                         )
                     except Exception as e:
-                        logger.error(f"Error in fast 30s perpetual hedge sub-cycle: {e}")
+                        logger.error(f"Error in fast 30s perpetual hedge sub-cycle #{fast_sub_cycle_count}: {e}", exc_info=True)
+                        err_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                        # 1. Dispatch automated Telegram error alert
+                        await send_telegram_error_alert(
+                            context=context,
+                            chat_id=config.telegram_chat_id,
+                            error_title="FAST PERPETUAL HEDGE CYCLE ERROR",
+                            error=e,
+                            cycle_number=fast_sub_cycle_count,
+                            cycle_type="Fast Hedge Sub-Cycle",
+                            pair=config.trading_pair,
+                            client=http_client,
+                            extra_info=f"Fast hedge #{fast_sub_cycle_count} failed. Sub-loop continuing on next 30s cadence.",
+                            throttle_seconds=60.0
+                        )
+                        # 2. Append to alerts log
+                        cached_alerts_log.append({
+                            "Event": f"Fast Hedge #{fast_sub_cycle_count} Error",
+                            "Asset": config.trading_pair,
+                            "Margin Utilization": cached_metrics.get("section_01", {}).get("Margin Utilization", "-"),
+                            "Options Delta": cached_metrics.get("section_03", {}).get("Aggregate Options Delta", "-"),
+                            "Perp Delta": cached_metrics.get("section_03", {}).get("Current Perpetual Delta", "-"),
+                            "Status": f"ERROR: {type(e).__name__} ({str(e)[:40]}...)"
+                        })
+                        # 3. Update heartbeat
+                        save_heartbeat({
+                            "trading_pair": config.trading_pair,
+                            "status": "degraded",
+                            "fast_hedge_cycle": fast_sub_cycle_count,
+                            "last_error": f"{type(e).__name__}: {str(e)}",
+                            "last_error_time": err_timestamp
+                        })
 
                 # Update LiveReport dashboard every 30s
                 if cached_metrics:
@@ -1667,7 +1998,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         report.clear()
                         report.builder.manual_order()
                         
-                        report.builder.section("01 / DYNAMIC AUTONOMOUS STATUS", f"Real-Time Risk & Margin Assessment (Macro: {config.poll_interval_seconds}s | Sub-Loop: {config.perp_hedge_interval_seconds}s | Cycle #{macro_cycle_count})")
+                        report.builder.section("01 / DYNAMIC AUTONOMOUS STATUS", f"Real-Time Risk & Margin Assessment (Macro: {config.poll_interval_seconds}s | Sub-Loop: {config.perp_hedge_interval_seconds}s | Macro Cycle #{macro_cycle_count} | Fast Hedge #{fast_sub_cycle_count})")
                         for k, v in cached_metrics.get("section_01", {}).items():
                             report.builder.kpi(k, v)
                             
@@ -1699,3 +2030,46 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
             report.builder.section("MONITOR STOPPED", "Autonomous Trader Stopped")
             await report.update()
         return f"Derive Volatility Loop Trader stopped after {macro_cycle_count} macro cycles."
+    except Exception as fatal_e:
+        logger.critical(f"FATAL: Unhandled crash in Derive Volatility Loop Trader: {fatal_e}", exc_info=True)
+        crash_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        save_heartbeat({
+            "trading_pair": config.trading_pair,
+            "status": "crashed",
+            "fatal_error": f"{type(fatal_e).__name__}: {str(fatal_e)}",
+            "fatal_cycle": f"Macro #{macro_cycle_count}",
+            "crash_time": crash_timestamp
+        })
+        try:
+            await send_telegram_error_alert(
+                context=context,
+                chat_id=config.telegram_chat_id,
+                error_title="FATAL ROUTINE CRASH",
+                error=fatal_e,
+                cycle_number=macro_cycle_count,
+                cycle_type="Fatal Crash",
+                pair=config.trading_pair,
+                extra_info="CRITICAL: Routine crashed with unhandled fatal exception and has terminated!",
+                throttle_seconds=0.0
+            )
+        except Exception as tel_e:
+            logger.error(f"Failed to dispatch fatal crash Telegram alert: {tel_e}")
+        raise fatal_e
+
+if __name__ == "__main__":
+    import argparse
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    parser = argparse.ArgumentParser(description="Derive Autonomous Volatility Loop Trader")
+    parser.add_argument("--pair", type=str, default="ETH-USDT", help="Trading pair (e.g. ETH-USDT)")
+    parser.add_argument("--paper", action="store_true", help="Run in paper mode")
+    parser.add_argument("--hedge-only", action="store_true", help="Run in hedge-only mode (disable new entries)")
+    parser.add_argument("--chat-id", type=str, default=None, help="Telegram Chat ID for notifications")
+    args = parser.parse_args()
+
+    cfg = Config(
+        trading_pair=args.pair,
+        paper_mode=args.paper,
+        enable_options_entry=not args.hedge_only,
+        telegram_chat_id=args.chat_id,
+    )
+    asyncio.run(run(cfg, None))
