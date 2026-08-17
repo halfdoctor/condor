@@ -7,6 +7,7 @@ import sys
 import time
 import asyncio
 import httpx
+from typing import Any
 from pathlib import Path
 from decimal import Decimal
 from dotenv import load_dotenv
@@ -364,66 +365,139 @@ def resolve_derive_credentials(config: Config) -> tuple[str, str, int | None]:
 
     return wallet, priv, sub_id
 
-async def send_telegram_alert(context: ContextTypes.DEFAULT_TYPE | None, chat_id: str | None, message: str, client: httpx.AsyncClient | None = None):
-    target_chat = chat_id or os.environ.get("ADMIN_USER_ID") or os.environ.get("TELEGRAM_CHAT_ID")
-    if not target_chat:
-        logger.info("Telegram alert skipped: No chat_id provided and ADMIN_USER_ID/TELEGRAM_CHAT_ID not set in .env")
-        return
+def sanitize_telegram_chat_id(raw_chat_id: Any) -> str | None:
+    """Validate and sanitize Telegram chat ID.
+    
+    Rejects strings containing ':' (e.g. bot tokens mistakenly passed as chat ID),
+    and validates numeric chat IDs or @usernames.
+    """
+    if not raw_chat_id:
+        return None
+    val = str(raw_chat_id).strip().strip("\"'")
+    if ":" in val:
+        logger.warning(f"Rejecting invalid chat_id format '{val[:10]}...' (detected bot token instead of numeric chat ID)")
+        return None
+    try:
+        int(val)
+        return val
+    except ValueError:
+        if val.startswith("@") and len(val) > 1:
+            return val
+        return None
 
+def resolve_target_telegram_chat_id(chat_id: str | None, context: Any = None) -> str | None:
+    """Resolve destination Telegram chat ID with multi-level fallback:
+    1. Explicit chat_id parameter (sanitized)
+    2. Context runtime _chat_id / chat_id (from Condor user session)
+    3. Environment variables: ADMIN_USER_ID -> TELEGRAM_CHAT_ID -> CONDOR_CHAT_ID
+    """
+    clean = sanitize_telegram_chat_id(chat_id)
+    if clean:
+        return clean
+    
+    if context is not None:
+        for attr in ("_chat_id", "chat_id"):
+            if hasattr(context, attr):
+                clean = sanitize_telegram_chat_id(getattr(context, attr))
+                if clean:
+                    return clean
+                    
+    for env_key in ("ADMIN_USER_ID", "TELEGRAM_CHAT_ID", "CONDOR_CHAT_ID"):
+        clean = sanitize_telegram_chat_id(os.environ.get(env_key))
+        if clean:
+            return clean
+            
+    return None
+
+def resolve_target_telegram_bot_token(raw_candidate: str | None = None) -> str | None:
+    """Resolve Telegram bot token with fallback from mistaken chat_id if applicable."""
+    for env_key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "CONDOR_TELEGRAM_BOT_TOKEN"):
+        token = os.environ.get(env_key)
+        if token and ":" in str(token).strip():
+            return str(token).strip()
+    if raw_candidate and ":" in str(raw_candidate).strip():
+        return str(raw_candidate).strip()
+    return None
+
+async def send_telegram_alert(
+    context: ContextTypes.DEFAULT_TYPE | None,
+    chat_id: str | None,
+    message: str,
+    client: httpx.AsyncClient | None = None
+) -> bool:
+    """Dispatch real-time Telegram alert to the user with multi-channel redundancy and verification."""
+    target_chat = resolve_target_telegram_chat_id(chat_id, context)
+    if not target_chat:
+        logger.info("Telegram alert skipped: No valid chat_id resolved (ADMIN_USER_ID / TELEGRAM_CHAT_ID not set or invalid)")
+        return False
+
+    bot_token = resolve_target_telegram_bot_token(chat_id)
+    
+    # 1. Try context.bot if available
     if context is not None and hasattr(context, "bot") and context.bot:
         try:
-            await context.bot.send_message(chat_id=target_chat, text=message, parse_mode="Markdown")
-            logger.info(f"Telegram notification sent to chat {target_chat} via context.bot")
-            return
+            res = await context.bot.send_message(chat_id=target_chat, text=message, parse_mode="Markdown")
+            if isinstance(res, dict):
+                if res.get("ok"):
+                    logger.info(f"Telegram notification delivered to chat {target_chat} via context.bot")
+                    return True
+                else:
+                    logger.warning(f"context.bot returned error ({res.get('description')}), retrying plain text...")
+            else:
+                logger.info(f"Telegram notification sent to chat {target_chat} via context.bot")
+                return True
         except Exception as e:
-            logger.warning(f"Failed to send Telegram alert via context.bot (Markdown): {e}. Retrying as plain text...")
-            try:
-                await context.bot.send_message(chat_id=target_chat, text=message)
+            logger.warning(f"Failed to send Telegram alert via context.bot (Markdown): {e}. Retrying plain text...")
+            
+        try:
+            res = await context.bot.send_message(chat_id=target_chat, text=message)
+            if isinstance(res, dict):
+                if res.get("ok"):
+                    logger.info(f"Telegram notification delivered to chat {target_chat} as plain text fallback")
+                    return True
+            else:
                 logger.info(f"Telegram notification delivered to chat {target_chat} as plain text fallback")
-                return
-            except Exception as e2:
-                logger.warning(f"Failed to send plain text alert via context.bot: {e2}")
+                return True
+        except Exception as e2:
+            logger.warning(f"Failed to send plain text alert via context.bot: {e2}")
 
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+    # 2. Direct HTTP fallback via Telegram Bot API
     if bot_token:
         try:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {"chat_id": target_chat, "text": message, "parse_mode": "Markdown"}
-            
-            async def _do_post(c: httpx.AsyncClient, p: dict):
-                r = await c.post(url, json=p, timeout=5.0)
-                if r.status_code != 200:
-                    # Retry as plain text if Markdown entity parsing failed
-                    fallback_p = {"chat_id": target_chat, "text": message}
-                    r = await c.post(url, json=fallback_p, timeout=5.0)
-                return r
+            payload_md = {"chat_id": target_chat, "text": message, "parse_mode": "Markdown"}
+            payload_plain = {"chat_id": target_chat, "text": message}
+
+            async def _post_msg(c: httpx.AsyncClient) -> bool:
+                r = await c.post(url, json=payload_md, timeout=5.0)
+                if r.status_code == 200 and r.json().get("ok"):
+                    return True
+                r_plain = await c.post(url, json=payload_plain, timeout=5.0)
+                if r_plain.status_code == 200 and r_plain.json().get("ok"):
+                    return True
+                logger.warning(f"Telegram API direct delivery failed: {r_plain.text}")
+                return False
 
             if client:
                 try:
-                    resp = await _do_post(client, payload)
-                    if resp.status_code == 200:
+                    ok = await _post_msg(client)
+                    if ok:
                         logger.info(f"Telegram notification delivered to chat {target_chat} via async client")
-                    else:
-                        logger.warning(f"Telegram API returned status {resp.status_code}: {resp.text}")
+                        return True
                 except Exception as e_c:
                     logger.warning(f"Telegram alert via async client failed ({e_c}), retrying with temp client...")
-                    async with httpx.AsyncClient(timeout=5.0) as temp_client:
-                        resp = await _do_post(temp_client, payload)
-                        if resp.status_code == 200:
-                            logger.info(f"Telegram notification delivered to chat {target_chat}")
-                        else:
-                            logger.warning(f"Telegram API returned status {resp.status_code}: {resp.text}")
-            else:
-                async with httpx.AsyncClient(timeout=5.0) as temp_client:
-                    resp = await _do_post(temp_client, payload)
-                    if resp.status_code == 200:
-                        logger.info(f"Telegram notification delivered to chat {target_chat}")
-                    else:
-                        logger.warning(f"Telegram API returned status {resp.status_code}: {resp.text}")
+
+            async with httpx.AsyncClient(timeout=5.0) as temp_client:
+                ok = await _post_msg(temp_client)
+                if ok:
+                    logger.info(f"Telegram notification delivered to chat {target_chat} via direct HTTP")
+                    return True
         except Exception as e:
             logger.warning(f"Failed to send Telegram alert via async HTTP fallback: {e}")
     else:
         logger.info("Telegram direct alert skipped: No TELEGRAM_TOKEN or TELEGRAM_BOT_TOKEN set in .env")
+
+    return False
 
 _ERROR_ALERT_HISTORY: dict[str, float] = {}
 
@@ -701,11 +775,12 @@ async def poll_best_rfq_quote(
     rfq_id: str, 
     rfq_legs: list,
     mode: str = "entry", 
-    max_wait_seconds: int = 5
+    max_wait_seconds: int = 5,
+    max_acceptable_cost: float | None = None
 ) -> dict | None:
     """Poll Derive RFQ quotes across multiple ticks over a multi-second window and select the best profit quote:
     - Entry (Selling Spread): Highest Net Credit Received
-    - Exit (Buying Spread to Close): Lowest Cost to Close
+    - Exit (Buying Spread to Close): Lowest Cost to Close (capped at max_acceptable_cost)
     """
     user_dir_map = {}
     for l in rfq_legs:
@@ -753,6 +828,9 @@ async def poll_best_rfq_quote(
                     else:
                         # Lowest cost to close is best (cost = -net_p)
                         cost = -net_p
+                        if max_acceptable_cost is not None and cost > max_acceptable_cost:
+                            logger.info(f"Skipping RFQ exit quote exceeding max cost cap: ${cost:.2f} > ${max_acceptable_cost:.2f}")
+                            continue
                         if cost < best_score:
                             best_score = cost
                             best_quote = q
@@ -765,51 +843,80 @@ async def poll_best_rfq_quote(
 
     return best_quote
 
-async def resolve_actual_entry_credit(client: httpx.AsyncClient, subaccount_id: int, auth_headers: dict, active_legs: list, fallback_spread_unit_credit: float) -> float:
-    """Resolve the true net entry credit received when opening the active Iron Condor position."""
-    if not auth_headers or not subaccount_id or not active_legs:
-        contracts = sum(abs(float(p.get("amount", 0.0))) for p in active_legs if float(p.get("amount", 0.0)) < 0) or 1.0
-        return round(fallback_spread_unit_credit * contracts, 2)
-        
-    try:
-        trades_res = (await client.post(
-            "https://api.lyra.finance/private/get_trade_history",
-            json={"subaccount_id": subaccount_id, "page_size": 20},
-            headers=auth_headers,
-            timeout=5.0
-        )).json().get("result", {}).get("trades", [])
-        
-        active_inames = {p.get("instrument_name") for p in active_legs}
-        
-        by_rfq = {}
-        for t in trades_res:
-            rfq = t.get("rfq_id")
-            if rfq:
-                by_rfq.setdefault(rfq, []).append(t)
+async def resolve_actual_entry_credit(
+    client: httpx.AsyncClient, 
+    subaccount_id: int, 
+    auth_headers: dict, 
+    active_legs: list, 
+    fallback_spread_unit_credit: float
+) -> float:
+    """Resolve the true net entry credit received when opening the active Iron Condor position.
+    
+    1. Primary Source: Exact weighted average_price recorded by Derive clearinghouse for every active leg.
+    2. Secondary Source: Live RFQ package trade history (page_size 100).
+    3. Fallback: Theoretical spread credit multiplied by active short contract size.
+    """
+    if not active_legs:
+        return 0.0
+
+    # 1. Primary Source: Derive Clearinghouse average_price_excl_fees from get_subaccount
+    canonical_credit = 0.0
+    has_avg_prices = False
+    for p in active_legs:
+        amt = float(p.get("amount", 0.0))
+        avg_px = float(p.get("average_price_excl_fees", 0.0) or p.get("average_price", 0.0) or 0.0)
+        if avg_px > 0.0:
+            has_avg_prices = True
+            if amt < 0:
+                canonical_credit += abs(amt) * avg_px  # Short leg credit received
+            elif amt > 0:
+                canonical_credit -= abs(amt) * avg_px  # Long leg debit paid
                 
-        total_open_rfq_credit = 0.0
-        for rfq, tlist in by_rfq.items():
-            package_inames = {t.get("instrument_name") for t in tlist}
-            if package_inames.issubset(active_inames) or active_inames.issubset(package_inames):
-                net_rfq_credit = 0.0
-                for t in tlist:
-                    p = float(t.get("trade_price") or 0.0)
-                    amt = float(t.get("trade_amount") or 0.0)
-                    d = t.get("direction")
-                    if d == "sell":
-                        net_rfq_credit += p * amt
-                    elif d == "buy":
-                        net_rfq_credit -= p * amt
-                if net_rfq_credit > 0.0:
-                    total_open_rfq_credit += net_rfq_credit
+    if has_avg_prices and canonical_credit > 0.0:
+        return round(canonical_credit, 2)
+
+    # 2. Secondary Source: Query live trade history (page_size 100)
+    if auth_headers and subaccount_id:
+        try:
+            trades_res = (await client.post(
+                "https://api.lyra.finance/private/get_trade_history",
+                json={"subaccount_id": subaccount_id, "page_size": 100},
+                headers=auth_headers,
+                timeout=5.0
+            )).json().get("result", {}).get("trades", [])
+            
+            active_inames = {p.get("instrument_name") for p in active_legs}
+            
+            by_rfq = {}
+            for t in trades_res:
+                rfq = t.get("rfq_id")
+                if rfq and "IC-PACKAGE" in t.get("label", ""):
+                    by_rfq.setdefault(rfq, []).append(t)
                     
-        if total_open_rfq_credit > 0.0:
-            return round(total_open_rfq_credit, 2)
-    except Exception as e:
-        logger.warning(f"Error querying live trade history for entry credit: {e}")
-        
-    contracts = sum(abs(float(p.get("amount", 0.0))) for p in active_legs if float(p.get("amount", 0.0)) < 0) or 1.0
-    return round(fallback_spread_unit_credit * contracts, 2)
+            total_open_rfq_credit = 0.0
+            for rfq, tlist in by_rfq.items():
+                package_inames = {t.get("instrument_name") for t in tlist}
+                if package_inames.issubset(active_inames) or active_inames.issubset(package_inames):
+                    net_rfq_credit = 0.0
+                    for t in tlist:
+                        p = float(t.get("trade_price") or 0.0)
+                        amt = float(t.get("trade_amount") or 0.0)
+                        d = t.get("direction")
+                        if d == "sell":
+                            net_rfq_credit += p * amt
+                        elif d == "buy":
+                            net_rfq_credit -= p * amt
+                    if net_rfq_credit > 0.0:
+                        total_open_rfq_credit += net_rfq_credit
+                        
+            if total_open_rfq_credit > 0.0:
+                return round(total_open_rfq_credit, 2)
+        except Exception as e:
+            logger.warning(f"Error querying live trade history for entry credit: {e}")
+
+    # 3. Fallback: Theoretical spread credit * short contract size
+    short_contracts = max(abs(float(p.get("amount", 0.0))) for p in active_legs if float(p.get("amount", 0.0)) < 0) if any(float(p.get("amount", 0.0)) < 0 for p in active_legs) else 1.0
+    return round(fallback_spread_unit_credit * short_contracts, 2)
 
 async def execute_perp_rebalance(
     config: Config,
@@ -827,7 +934,7 @@ async def execute_perp_rebalance(
     min_order_size: float,
     context: ContextTypes.DEFAULT_TYPE | None = None
 ) -> tuple[float, str, str, bool]:
-    """Execute fast perpetual delta rebalance with 50 bps limit price protection."""
+    """Execute fast perpetual delta rebalance using passive Maker limit orders (0.01% offset with Post-Only and 30s cancellation of unfilled orders)."""
     from derive_action_signing import SignedAction, TradeModuleData, utils
     TRADE_MODULE_ADDRESS = "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b"
     DOMAIN_SEPARATOR = "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b"
@@ -847,27 +954,41 @@ async def execute_perp_rebalance(
         logger.warning(f"execute_perp_rebalance: Invalid spot price (${spot_price}); skipping rebalance.")
         return live_perp_delta, hedge_action_status, perp_order_summary, False
     
+    # 0. Clean Cancellation: Cancel any existing open resting orders on perp_symbol before evaluating / placing new maker orders
+    if not config.paper_mode and auth_headers and subaccount_id:
+        try:
+            await http_client.post(
+                "https://api.lyra.finance/private/cancel_all",
+                json={"subaccount_id": subaccount_id, "instrument_name": perp_symbol},
+                headers=auth_headers,
+                timeout=4.0
+            )
+        except Exception as e_can:
+            logger.debug(f"Cancel existing perp open orders failed/skipped: {e_can}")
+    
     is_overhedged = live_perp_delta > (max_allowed_perp_delta + 0.05) or live_perp_delta < (-max_allowed_perp_delta - 0.05)
-    perp_slippage_mult = config.max_perp_slippage_bps / 10000.0
+    maker_offset = 0.0001  # 0.01% (1 basis point offset from mark price for maker posting)
     
     if is_overhedged or abs(delta_imbalance) > config.hedge_band:
         rebalance_size = round(abs(delta_imbalance), size_decimals)
         if rebalance_size >= min_order_size:
             is_sell = delta_imbalance < 0
             side_str = "SELL" if is_sell else "BUY"
-            hedge_action_status = f"PERPETUAL DELTA REBALANCE ({side_str} {rebalance_size:.{size_decimals}f} {perp_symbol})"
-            perp_order_summary = f"{execution_mode_str} Submit {side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} (Target: {target_perp_delta:+.4f} {symbol})"
+            # Maker price: 0.01% above mark for SELL, 0.01% below mark for BUY
+            maker_price = round(spot_price * (1.0 + maker_offset) if is_sell else spot_price * (1.0 - maker_offset), 2)
+            
+            hedge_action_status = f"PERPETUAL MAKER REBALANCE ({side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} @ ${maker_price:,.2f})"
+            perp_order_summary = f"{execution_mode_str} Submit MAKER {side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} @ ${maker_price:,.2f} (Target: {target_perp_delta:+.4f} {symbol})"
             
             if not config.paper_mode:
                 if not (session_key_wallet and smart_contract_wallet and subaccount_id):
                     perp_order_summary += " | Skipped (Credentials missing in .env)"
                 else:
                     try:
-                        dyn_limit_price = Decimal(str(round(spot_price * (1.0 - perp_slippage_mult) if is_sell else spot_price * (1.0 + perp_slippage_mult), 2)))
                         trade_data = TradeModuleData(
                             asset_address=inst_perp_info.get("base_asset_address", "0x0000000000000000000000000000000000000000"),
                             sub_id=int(inst_perp_info.get("base_asset_sub_id", 0)),
-                            limit_price=dyn_limit_price,
+                            limit_price=Decimal(str(maker_price)),
                             amount=Decimal(str(rebalance_size)),
                             max_fee=Decimal("100"),
                             recipient_id=subaccount_id,
@@ -892,33 +1013,50 @@ async def execute_perp_rebalance(
                                 **action.to_json(),
                                 "instrument_name": perp_symbol,
                                 "direction": "sell" if is_sell else "buy",
-                                "order_type": "market",
+                                "order_type": "limit",
+                                "post_only": True,
                                 "reduce_only": is_overhedged,
-                                "time_in_force": "ioc",
-                                "label": "fast-rebalance-perp"
+                                "time_in_force": "gtc",
+                                "label": "fast-rebalance-perp-maker"
                             },
                             headers=auth_headers,
                             timeout=5.0
                         )
-                        res_order = order_resp.json().get("result", {})
-                        if res_order.get("order", {}).get("order_status") == "filled":
-                            perp_order_summary += f" | FILLED @ ${float(res_order['order']['average_price']):,.2f}"
+                        order_json = order_resp.json()
+                        res_order = order_json.get("result", {})
+                        order_obj = res_order.get("order", {})
+                        ord_status = order_obj.get("order_status")
+                        
+                        if ord_status == "filled":
+                            avg_px = float(order_obj.get("average_price") or maker_price)
+                            perp_order_summary += f" | MAKER FILLED @ ${avg_px:,.2f}"
                             live_perp_delta += (-rebalance_size if is_sell else rebalance_size)
                             rebalanced = True
+                        elif ord_status == "open":
+                            perp_order_summary += f" | MAKER POSTED @ ${maker_price:,.2f} (Resting GTC | Post-Only)"
+                            rebalanced = True
+                        elif "error" in order_json:
+                            err_info = order_json.get("error", {})
+                            err_msg = err_info.get("message", str(err_info)) if isinstance(err_info, dict) else str(err_info)
+                            perp_order_summary += f" | Rejected: {err_msg}"
+                            logger.warning(f"Perp maker order rejected by Derive: {err_msg}")
+                        else:
+                            perp_order_summary += f" | Order Status: {ord_status or 'Submitted'}"
+                            rebalanced = True
                     except Exception as e:
-                        logger.error(f"Perp rebalance execution error: {e}", exc_info=True)
+                        logger.error(f"Perp maker rebalance execution error: {e}", exc_info=True)
                         perp_order_summary += f" | Error: {e}"
                         if not config.paper_mode:
                             await send_telegram_error_alert(
                                 context=context,
                                 chat_id=config.telegram_chat_id,
-                                error_title="PERPETUAL REBALANCE ORDER ERROR",
+                                error_title="PERPETUAL MAKER REBALANCE ERROR",
                                 error=e,
-                                cycle_number="Rebalance Execution",
+                                cycle_number="Maker Rebalance Execution",
                                 cycle_type="Perp Order",
                                 pair=config.trading_pair,
                                 client=http_client,
-                                extra_info=f"Perpetual rebalance order failed for {perp_symbol} ({side_str} {rebalance_size} {symbol})",
+                                extra_info=f"Perpetual maker rebalance order failed for {perp_symbol} ({side_str} {rebalance_size} {symbol} @ ${maker_price})",
                                 throttle_seconds=30.0
                             )
 
@@ -1135,6 +1273,13 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
                             active_options_legs_raw.append({
                                 "instrument_name": iname,
                                 "amount": amt,
+                                "average_price": float(pos.get("average_price_excl_fees") or pos.get("average_price") or 0.0),
+                                "average_price_excl_fees": float(pos.get("average_price_excl_fees") or 0.0),
+                                "mark_price": float(pos.get("mark_price") or 0.0),
+                                "mark_value": float(pos.get("mark_value") or 0.0),
+                                "unrealized_pnl": float(pos.get("unrealized_pnl") or 0.0),
+                                "unrealized_pnl_excl_fees": float(pos.get("unrealized_pnl_excl_fees") or 0.0),
+                                "total_fees": float(pos.get("total_fees") or 0.0),
                                 "strike": strike_k,
                                 "opt_type": opt_t,
                                 "exact_dte": contract_dte,
@@ -1179,6 +1324,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         except Exception as e:
             logger.warning(f"Error querying live Derive subaccount from private API: {e}")
 
+    # -------------------------------------------------------------
     # 5. Rigorous Mark-to-Market PnL & Take-Profit (60%) / Stop-Loss Engine
     # -------------------------------------------------------------
     prev_state = load_previous_position_state()
@@ -1191,6 +1337,11 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
     missing_or_unreliable_marks = []
     mark_data_reliable = True
     
+    # 1. Authoritative Clearinghouse Realtime Valuation
+    has_clearinghouse_pnl = False
+    clearinghouse_pnl_excl_fees = 0.0
+    clearinghouse_mark_value_sum = 0.0
+    
     if has_eth_ic_open:
         for p in eth_opt_legs:
             iname = p.get("instrument_name", "")
@@ -1200,23 +1351,38 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             contract_T = p.get("exact_T")
             leg_sigma = p.get("sigma") or sigma
             
+            # Subaccount Clearinghouse Data
+            pos_unrealized_pnl_excl = p.get("unrealized_pnl_excl_fees")
+            pos_mark_val = p.get("mark_value")
+            if pos_unrealized_pnl_excl is not None and pos_mark_val is not None:
+                has_clearinghouse_pnl = True
+                clearinghouse_pnl_excl_fees += float(pos_unrealized_pnl_excl)
+                clearinghouse_mark_value_sum += float(pos_mark_val)
+
             leg_mark = None
             mark_source = None
             
-            # 1. Try live ticker fetch from Derive public API
-            try:
-                t_resp = (await http_client.post("https://api.lyra.finance/public/get_ticker", json={"instrument_name": iname}, timeout=3.5)).json().get("result", {})
-                raw_mark = t_resp.get("mark_price")
-                if raw_mark is not None:
-                    val = float(raw_mark)
-                    if val > 0.0:
-                        leg_mark = val
-                        mark_source = "live"
-                        LAST_KNOWN_MARK_PRICES[iname] = val
-            except Exception as e:
-                logger.warning(f"Error fetching live ticker mark price for {iname}: {e}")
+            # 1. Try subaccount clearinghouse mark_price
+            raw_sub_mark = float(p.get("mark_price") or 0.0)
+            if raw_sub_mark > 0.0:
+                leg_mark = raw_sub_mark
+                mark_source = "subaccount"
+                LAST_KNOWN_MARK_PRICES[iname] = raw_sub_mark
+            else:
+                # 2. Try live ticker fetch from Derive public API
+                try:
+                    t_resp = (await http_client.post("https://api.lyra.finance/public/get_ticker", json={"instrument_name": iname}, timeout=3.5)).json().get("result", {})
+                    raw_mark = t_resp.get("mark_price")
+                    if raw_mark is not None:
+                        val = float(raw_mark)
+                        if val > 0.0:
+                            leg_mark = val
+                            mark_source = "live"
+                            LAST_KNOWN_MARK_PRICES[iname] = val
+                except Exception as e:
+                    logger.warning(f"Error fetching live ticker mark price for {iname}: {e}")
                 
-            # 2. Fallback to last known valid mark from cache / previous state
+            # 3. Fallback to last known valid mark from cache / previous state
             if leg_mark is None or leg_mark <= 0.0:
                 mark_data_reliable = False
                 missing_or_unreliable_marks.append(iname)
@@ -1227,7 +1393,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
                     mark_source = "cached"
                     logger.warning(f"Live ticker unavailable for {iname}; falling back safely to last known mark price ${leg_mark:.2f}")
                 else:
-                    # 3. Fallback to Black-Scholes theoretical price for telemetry/display only
+                    # 4. Fallback to Black-Scholes theoretical price for telemetry/display only
                     if strike_k is not None and contract_T is not None and opt_t and spot_price > 0:
                         try:
                             bs_price = bs_call_price(spot_price, strike_k, contract_T, r, leg_sigma) if opt_t == "C" else bs_put_price(spot_price, strike_k, contract_T, r, leg_sigma)
@@ -1246,24 +1412,37 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             valid_leg_marks[iname] = leg_mark
             current_cost_to_close += (-amt) * leg_mark
 
+        # If clearinghouse mark value is available, use it directly for exact cost to close
+        if has_clearinghouse_pnl and abs(clearinghouse_mark_value_sum) > 0.01:
+            current_cost_to_close = max(0.0, -clearinghouse_mark_value_sum)
+
         # Safety Check: If cost to close computed as ~0 while positions are active, mark as unreliable
         if current_cost_to_close <= 0.01:
             mark_data_reliable = False
             logger.warning(f"Total cost to close is ${current_cost_to_close:.2f} while {len(eth_opt_legs)} option legs are active. Marked as unreliable to prevent false take-profit.")
 
     current_cost_to_close = round(max(0.0, current_cost_to_close), 2)
-    unrealized_pnl = round(entry_credit_usd - current_cost_to_close, 2)
-    profit_captured_pct = round((unrealized_pnl / entry_credit_usd * 100.0), 2) if entry_credit_usd > 0 else 0.0
     
-    # Strict TP/SL Evaluation: ONLY evaluated if mark data is verified reliable
-    if has_eth_ic_open and mark_data_reliable:
+    # Realtime Authoritative Clearinghouse PnL
+    if has_eth_ic_open and has_clearinghouse_pnl:
+        unrealized_pnl = round(clearinghouse_pnl_excl_fees, 2)
+    else:
+        unrealized_pnl = round(entry_credit_usd - current_cost_to_close, 2)
+        
+    profit_captured_pct = round((unrealized_pnl / entry_credit_usd * 100.0), 2) if entry_credit_usd > 0 else 0.0
+    pnl_disp = f"+${unrealized_pnl:,.2f}" if unrealized_pnl >= 0 else f"-${abs(unrealized_pnl):,.2f}"
+    
+    # Strict TP/SL Evaluation: ONLY evaluated if mark data is verified reliable and entry credit is authentic
+    if has_eth_ic_open and mark_data_reliable and entry_credit_usd >= 5.0:
+        min_pnl_threshold = max(3.0, (config.target_profit_pct / 100.0) * entry_credit_usd * 0.95)
         take_profit_triggered = (
             (profit_captured_pct >= config.target_profit_pct)
-            and (unrealized_pnl >= (config.target_profit_pct / 100.0) * entry_credit_usd)
-            and (unrealized_pnl > 3.0)
+            and (unrealized_pnl >= min_pnl_threshold)
+            and (unrealized_pnl > 0.0)
         )
         stop_loss_triggered = (
-            unrealized_pnl <= -(config.stop_loss_pct / 100.0 * entry_credit_usd)
+            (unrealized_pnl <= -(config.stop_loss_pct / 100.0 * entry_credit_usd))
+            and (unrealized_pnl < -5.0)
         )
     else:
         take_profit_triggered = False
@@ -1277,16 +1456,16 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
     
     if not config.enable_options_entry:
         if has_eth_ic_open and not mark_data_reliable:
-            options_execution_status = f"HEDGE-ONLY MODE: HOLDING POSITION (MARK DATA UNRELIABLE - TP/SL SKIPPED | Est PnL: ${unrealized_pnl:,.2f})"
+            options_execution_status = f"HEDGE-ONLY MODE: HOLDING POSITION (MARK DATA UNRELIABLE - TP/SL SKIPPED | Est PnL: {pnl_disp})"
         else:
-            options_execution_status = f"HEDGE-ONLY MODE: HOLDING POSITION (PnL: +${unrealized_pnl:,.2f} | {profit_captured_pct:.1f}% | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "HEDGE-ONLY MODE: NEW ENTRY DISABLED (STANDBY)"
+            options_execution_status = f"HEDGE-ONLY MODE: HOLDING POSITION (PnL: {pnl_disp} | {profit_captured_pct:.1f}% | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "HEDGE-ONLY MODE: NEW ENTRY DISABLED (STANDBY)"
     elif signal_conflict and not has_eth_ic_open:
         options_execution_status = f"ENTRY BLOCKED (Derivatives Monkey Conflict: {conflict_reason})"
     else:
         if has_eth_ic_open and not mark_data_reliable:
-            options_execution_status = f"HOLDING POSITION (MARK DATA UNRELIABLE - TP/SL SKIPPED | Est PnL: ${unrealized_pnl:,.2f})"
+            options_execution_status = f"HOLDING POSITION (MARK DATA UNRELIABLE - TP/SL SKIPPED | Est PnL: {pnl_disp})"
         else:
-            options_execution_status = f"HOLDING POSITION (PnL: +${unrealized_pnl:,.2f} | {profit_captured_pct:.1f}% of ${entry_credit_usd:.2f} credit | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "NO ACTIVE OPTIONS (MONITORING ENTRY)"
+            options_execution_status = f"HOLDING POSITION (PnL: {pnl_disp} | {profit_captured_pct:.1f}% of ${entry_credit_usd:.2f} credit | Target: {config.target_profit_pct:.1f}%)" if has_eth_ic_open else "NO ACTIVE OPTIONS (MONITORING ENTRY)"
         
     position_change_occurred = False
     change_event_details = []
@@ -1337,19 +1516,72 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
                 close_rfq_id = send_rfq_resp.json().get("result", {}).get("rfq_id")
                 
                 if close_rfq_id:
-                    # Multi-tick quote polling: selects lowest cost-to-close among competing market makers
-                    best_quote = await poll_best_rfq_quote(http_client, subaccount_id, auth_headers, close_rfq_id, rfq_close_data.legs, mode="exit", max_wait_seconds=5)
+                    # Maximum acceptable cost to close filter
+                    max_exit_cost = None
+                    if take_profit_triggered:
+                        max_exit_cost = entry_credit_usd * (1.0 - (config.target_profit_pct / 100.0) * 0.85)
+                    elif stop_loss_triggered:
+                        max_exit_cost = entry_credit_usd + (config.stop_loss_pct / 100.0 * entry_credit_usd * 1.25)
+
+                    # Multi-tick quote polling: selects lowest cost-to-close under max_exit_cost
+                    best_quote = await poll_best_rfq_quote(
+                        http_client, 
+                        subaccount_id, 
+                        auth_headers, 
+                        close_rfq_id, 
+                        rfq_close_data.legs, 
+                        mode="exit", 
+                        max_wait_seconds=5,
+                        max_acceptable_cost=max_exit_cost
+                    )
+                    
                     if best_quote:
-                        prices_mapped = map_rfq_quote_prices(rfq_close_data.legs, best_quote.get("legs", []))
-                        if prices_mapped:
-                            action = SignedAction(subaccount_id=subaccount_id, owner=smart_contract_wallet, signer=session_key_wallet.address, signature_expiry_sec=utils.MAX_INT_32, nonce=utils.get_action_nonce(), module_address=RFQ_MODULE_ADDRESS, module_data=rfq_close_data, DOMAIN_SEPARATOR=DOMAIN_SEPARATOR, ACTION_TYPEHASH=ACTION_TYPEHASH)
-                            action.sign(session_key_wallet.key)
-                            
-                            exec_resp = await http_client.post("https://api.lyra.finance/private/execute_quote", json={**action.to_json(), "label": f"{symbol}-IC-CLOSE-TP", "rfq_id": best_quote["rfq_id"], "quote_id": best_quote["quote_id"]}, headers=auth_headers, timeout=5.0)
-                            if exec_resp.json().get("result", {}).get("status") == "filled":
-                                options_execution_status = f"CLOSED VIA {trigger_name} (+${unrealized_pnl:,.2f} Realized PnL | {profit_captured_pct:.1f}% Captured)"
-                                position_change_occurred = True
-                                change_event_details.append(f"Options Package Closed via {trigger_name} (+${unrealized_pnl:,.2f})")
+                        # Verify quoted net execution PnL before signing/submitting order
+                        quote_close_cost = 0.0
+                        for q_leg in best_quote.get("legs", []):
+                            q_iname = q_leg.get("instrument_name")
+                            q_px = float(q_leg.get("price", 0.0))
+                            q_amt = float(q_leg.get("amount", 1.0))
+                            for cl in close_legs:
+                                if cl.instrument_name == q_iname:
+                                    if cl.direction == "buy":
+                                        quote_close_cost += q_px * q_amt
+                                    else:
+                                        quote_close_cost -= q_px * q_amt
+                                    break
+                        
+                        quote_realized_pnl = round(entry_credit_usd - quote_close_cost, 2)
+                        quote_profit_pct = round((quote_realized_pnl / entry_credit_usd * 100.0), 2) if entry_credit_usd > 0 else 0.0
+                        
+                        # HARD SAFETY GATE
+                        can_execute_quote = True
+                        if take_profit_triggered:
+                            min_required_profit = max(2.0, (config.target_profit_pct / 100.0) * entry_credit_usd * 0.85)
+                            if quote_realized_pnl < min_required_profit or quote_profit_pct < (config.target_profit_pct * 0.85):
+                                logger.warning(
+                                    f"Take-Profit Quote REJECTED: Quoted cost ${quote_close_cost:.2f} yields PnL +${quote_realized_pnl:.2f} "
+                                    f"({quote_profit_pct:.1f}% profit vs minimum required ${min_required_profit:.2f}). "
+                                    f"Aborting execution to prevent closing at insufficient profit or loss."
+                                )
+                                can_execute_quote = False
+                        elif stop_loss_triggered:
+                            if max_exit_cost is not None and quote_close_cost > max_exit_cost:
+                                logger.warning(
+                                    f"Stop-Loss Quote REJECTED: Quoted cost ${quote_close_cost:.2f} exceeds allowable cap ${max_exit_cost:.2f}."
+                                )
+                                can_execute_quote = False
+
+                        if can_execute_quote:
+                            prices_mapped = map_rfq_quote_prices(rfq_close_data.legs, best_quote.get("legs", []))
+                            if prices_mapped:
+                                action = SignedAction(subaccount_id=subaccount_id, owner=smart_contract_wallet, signer=session_key_wallet.address, signature_expiry_sec=utils.MAX_INT_32, nonce=utils.get_action_nonce(), module_address=RFQ_MODULE_ADDRESS, module_data=rfq_close_data, DOMAIN_SEPARATOR=DOMAIN_SEPARATOR, ACTION_TYPEHASH=ACTION_TYPEHASH)
+                                action.sign(session_key_wallet.key)
+                                
+                                exec_resp = await http_client.post("https://api.lyra.finance/private/execute_quote", json={**action.to_json(), "label": f"{symbol}-IC-CLOSE-TP", "rfq_id": best_quote["rfq_id"], "quote_id": best_quote["quote_id"]}, headers=auth_headers, timeout=5.0)
+                                if exec_resp.json().get("result", {}).get("status") == "filled":
+                                    options_execution_status = f"CLOSED VIA {trigger_name} (+${quote_realized_pnl:,.2f} Realized PnL | {quote_profit_pct:.1f}% Captured)"
+                                    position_change_occurred = True
+                                    change_event_details.append(f"Options Package Closed via {trigger_name} (+${quote_realized_pnl:,.2f})")
             
             # Flatten Perpetual Hedge Position to 0.00 with 50 bps limit price protection
             if live_perp_delta != 0.0:
@@ -1581,7 +1813,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             f"• *Market GEX*: `${dealer_gex_m:+.3f}M` | *DEX*: `${dealer_dex_m:+.3f}M`\n"
             f"• *25D IV Skew*: `{iv_skew_pts:+.2f} pts` | *Flow Bias*: `{block_rfq_bias}`\n"
             f"• *Net Entry Credit*: `${entry_credit_usd:,.2f}` | *Cost to Close*: `${current_cost_to_close:,.2f}`\n"
-            f"• *Unrealized PnL*: `+${unrealized_pnl:,.2f}` (*{profit_captured_pct:.1f}%* / Target: `{config.target_profit_pct:.1f}%`)\n"
+            f"• *Unrealized PnL*: `{pnl_disp}` (*{profit_captured_pct:.1f}%* / Target: `{config.target_profit_pct:.1f}%`)\n"
             f"• *Margin Utilization*: `{margin_utilization_pct:.2f}%` / *Cap*: `{config.max_margin_utilization_pct:.1f}%` (Headroom: `${margin_headroom_usd:,.2f}`)\n"
             f"• *Buying Power*: `${buying_power:,.2f}` | *Collateral*: `${collateral:,.2f}`\n"
             f"• *Options Delta*: `{live_options_delta:+.4f} {symbol}` ({active_options_count} active legs)\n"
@@ -1682,7 +1914,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             "Signal Consensus": consensus_str,
             "Net Entry Credit": f"${entry_credit_usd:.2f}",
             "Cost to Close ($)": f"${current_cost_to_close:.2f}",
-            "Unrealized PnL": f"+${unrealized_pnl:,.2f}",
+            "Unrealized PnL": pnl_disp,
             "Profit Captured": f"{profit_captured_pct:.1f}% (Target: {config.target_profit_pct:.1f}%)",
             "Options Strategy Status": options_execution_status,
         },
@@ -1703,7 +1935,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         f"- Mode: {execution_mode_str} ({strategy_operating_mode}) | Asset: {config.trading_pair} (${spot_price:,.2f})\n"
         f"- Vol Edge: {net_edge:.2f} pts | DM Strategy: {dm_strategy} ({dm_confidence}% Conf) | Consensus: {consensus_str}\n"
         f"- Real GEX: ${dealer_gex_m:+.3f}M | 25D Skew: {iv_skew_pts:+.2f} pts ({block_rfq_bias})\n"
-        f"- Net Entry Credit: ${entry_credit_usd:.2f} | Cost to Close: ${current_cost_to_close:.2f} | Unrealized PnL: +${unrealized_pnl:,.2f} ({profit_captured_pct:.1f}% captured)\n"
+        f"- Net Entry Credit: ${entry_credit_usd:.2f} | Cost to Close: ${current_cost_to_close:.2f} | Unrealized PnL: {pnl_disp} ({profit_captured_pct:.1f}% captured)\n"
         f"- Subaccount: #{subaccount_id} | Subaccount Value: ${subaccount_value:,.2f} | Collateral: ${collateral:,.2f}\n"
         f"- Margin Utilization: {margin_utilization_pct:.2f}% (Cap: {config.max_margin_utilization_pct:.1f}% | Headroom: ${margin_headroom_usd:,.2f})\n"
         f"- Buying Power: ${buying_power:,.2f} | Positions Margin Used: ${positions_margin_used:,.2f}\n"
@@ -1771,35 +2003,61 @@ async def execute_fast_perp_hedge_cycle(
         except Exception:
             pass
 
-    # 2. Query live perpetual delta from subaccount
-    live_perp_delta = 0.0
+    # 2. Query live perpetual and options delta from subaccount clearinghouse
+    live_perp_delta = None
+    clearinghouse_options_delta = 0.0
+    has_clearinghouse_options_delta = False
+    subaccount_fetch_ok = False
+    
     if auth_headers and subaccount_id:
-        try:
-            sub_resp = await http_client.post("https://api.lyra.finance/private/get_subaccount", json={"subaccount_id": subaccount_id}, headers=auth_headers, timeout=4.0)
-            if sub_resp.status_code == 200:
-                for pos in sub_resp.json().get("result", {}).get("positions", []):
-                    if pos.get("instrument_type") == "perp" and symbol in pos.get("instrument_name", ""):
-                        live_perp_delta += float(pos.get("amount", 0.0))
-        except Exception as e:
-            logger.debug(f"Fast hedge subaccount fetch: {e}")
+        for attempt in range(2):
+            try:
+                sub_resp = await http_client.post(
+                    "https://api.lyra.finance/private/get_subaccount", 
+                    json={"subaccount_id": subaccount_id}, 
+                    headers=auth_headers, 
+                    timeout=8.0
+                )
+                if sub_resp.status_code == 200:
+                    sub_res = sub_resp.json().get("result", {})
+                    live_perp_delta = 0.0
+                    for pos in sub_res.get("positions", []):
+                        pos_amt = float(pos.get("amount", 0.0))
+                        iname = pos.get("instrument_name", "")
+                        itype = pos.get("instrument_type", "")
+                        if symbol in iname:
+                            if itype == "perp":
+                                live_perp_delta += pos_amt
+                            elif itype == "option":
+                                unit_d = float(pos.get("delta") or 0.0)
+                                if unit_d != 0.0:
+                                    has_clearinghouse_options_delta = True
+                                    clearinghouse_options_delta += pos_amt * unit_d
+                    subaccount_fetch_ok = True
+                    break
+            except Exception as e:
+                logger.debug(f"Fast hedge subaccount fetch attempt {attempt+1} failed: {e}")
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
 
-    # 3. Recalculate exact option Greeks on live spot
-    r = 0.03
-    updated_options_delta = 0.0
-    for leg in cached_legs:
-        amt = float(leg.get("amount", 0.0))
-        k = leg.get("strike")
-        opt_t = leg.get("opt_type")
-        T = leg.get("exact_T")
-        sigma = leg.get("sigma", 0.35)
-        if k is not None and T is not None and opt_t:
-            if opt_t == "C":
-                unit_d = bs_call_delta(spot_price, k, T, r, sigma)
-            else:
-                unit_d = bs_put_delta(spot_price, k, T, r, sigma)
-            updated_options_delta += amt * unit_d
+    # Strict Safety Barrier: If we could not verify subaccount positions from Derive, skip fast rehedge
+    if not subaccount_fetch_ok or live_perp_delta is None:
+        logger.warning("Fast hedge cycle skipped: Live subaccount positions unavailable from Derive clearinghouse. Holding hedge.")
+        return cached_metrics, display_table, alerts_log, False
 
-    updated_options_delta = round(updated_options_delta, 4)
+    # 3. Determine live options delta: Authoritative Clearinghouse Delta (with verified cache fallback)
+    if has_clearinghouse_options_delta:
+        updated_options_delta = round(clearinghouse_options_delta, 4)
+    else:
+        # Fallback to last known verified options delta from cached metrics / cached legs
+        cached_d_str = cached_metrics.get("section_03", {}).get("Aggregate Options Delta", "").split()[0] if "section_03" in cached_metrics else ""
+        if cached_d_str and cached_d_str.replace("+", "").replace("-", "").replace(".", "").isdigit():
+            updated_options_delta = float(cached_d_str)
+        elif cached_legs:
+            updated_options_delta = round(sum(float(l.get("amount", 0.0)) * float(l.get("unit_delta", 0.0)) for l in cached_legs), 4)
+        else:
+            updated_options_delta = 0.0
+
     live_perp_delta = round(live_perp_delta, 4)
 
     # 4. Get Instrument specs
