@@ -45,7 +45,8 @@ class MarketRanker:
             sym = res["symbol"]
             sig = res["data"]
             
-            if not sig or sig.get("spot_price", {}).get("value", 0) == 0 or res["error"]:
+            has_options = sig and sig.get("volatility_edge", {}).get("iv_30d") is not None
+            if not sig or not has_options or sig.get("spot_price", {}).get("value", 0) == 0 or res["error"]:
                 market_data.append({
                     "symbol": sym,
                     "status": "UNAVAILABLE / NOT LISTED",
