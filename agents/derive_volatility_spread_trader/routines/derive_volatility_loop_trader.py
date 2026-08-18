@@ -1015,7 +1015,7 @@ async def execute_perp_rebalance(
                                 "direction": "sell" if is_sell else "buy",
                                 "order_type": "limit",
                                 "post_only": True,
-                                "reduce_only": is_overhedged,
+                                "reduce_only": False,
                                 "time_in_force": "gtc",
                                 "label": "fast-rebalance-perp-maker"
                             },

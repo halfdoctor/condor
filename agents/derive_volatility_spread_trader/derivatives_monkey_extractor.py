@@ -87,6 +87,124 @@ class DerivativesMonkeyExtractor:
 
         return None, "Derivatives Monkey"
 
+    def _compute_optimal_dte(
+        self,
+        strategy: str,
+        term_tag: str,
+        term_spread: float,
+        atm_iv_7d: float,
+        atm_iv_14d: float,
+        atm_iv_30d: float,
+        rv_val: float,
+        exp_data: dict
+    ) -> dict:
+        """
+        Derives the quantitative and structural optimal Days to Expiration (DTE)
+        for the recommended options strategy and tradeable Iron Condor structure.
+        
+        Evaluation Factors:
+        1. Theta Decay Acceleration vs Gamma/Pin Risk (dTheta/dt vs dDelta/dS):
+           - < 7 DTE: Explosive gamma, excessive delta drift and hedging churn.
+           - 10–25 DTE (Target ~14 DTE): Sweet spot for short-vol iron condors.
+           - 25–45 DTE (Target ~30 DTE): Sweet spot for long-vol straddles.
+        2. Term Structure Slope & VRP Curve:
+           - Contango rewards selling 14D–28D tenors where IV is elevated and decaying along the curve.
+        3. Real Exchange Open Interest & GEX Concentration:
+           - Matches against live listed expirations from /api/market/expiry-exposure.
+        """
+        now = datetime.now(timezone.utc)
+        rows = exp_data.get("rows", []) if isinstance(exp_data, dict) else []
+
+        # 1. Base Strategy Benchmark Tenor & Range
+        if "SHORT_VOL" in strategy:
+            target_benchmark_dte = 14.0
+            min_dte = 6.0
+            max_dte = 35.0
+            target_range_str = "10–21 DTE (Sweet spot for maximum theta decay rate without <7D pin gamma)"
+            base_rationale = (
+                "Captures optimal theta decay slope ($d\\Theta/dt$) in the 10–21 DTE window while avoiding "
+                "explosive near-term pin gamma (<7 DTE) and excessive vega exposure (>35 DTE)."
+            )
+        elif "LONG_VOL" in strategy:
+            target_benchmark_dte = 30.0
+            min_dte = 14.0
+            max_dte = 60.0
+            target_range_str = "21–45 DTE (Optimal runway for volatility breakout without high daily theta bleed)"
+            base_rationale = (
+                "Provides sufficient runway (21–45 DTE) for volatility expansion and spot breakout "
+                "while minimizing short-dated theta decay drag."
+            )
+        else:  # HOLD_NEUTRAL
+            target_benchmark_dte = 14.0
+            min_dte = 7.0
+            max_dte = 35.0
+            target_range_str = "14–30 DTE"
+            base_rationale = "Benchmark monitoring tenor for conditional entry once Gamma Flip clearance is established."
+
+        # 2. Match against Real Listed Exchange Expiries (if available)
+        best_row = None
+        matched_oi = None
+        matched_gex = None
+
+        if rows:
+            # Filter valid candidate expiries in the strategy window
+            candidates = [r for r in rows if r.get("days_to_expiry") is not None and min_dte <= r["days_to_expiry"] <= max_dte]
+            
+            if not candidates:
+                # Fallback to any future expiry >= min_dte
+                candidates = [r for r in rows if r.get("days_to_expiry") is not None and r["days_to_expiry"] >= min_dte]
+
+            if candidates:
+                # Score candidates based on: proximity to target benchmark DTE + Liquidity (OI)
+                def score_expiry(row):
+                    dte = row.get("days_to_expiry", 0)
+                    oi = (row.get("call", {}).get("oi", 0) or 0) + (row.get("put", {}).get("oi", 0) or 0)
+                    dist_to_benchmark = abs(dte - target_benchmark_dte)
+                    # Normalize: penalty for distance, bonus for high open interest liquidity
+                    oi_bonus = min(oi / 1000.0, 50.0)  # Up to 50 pts bonus for deep OI
+                    return -(dist_to_benchmark * 4.0) + oi_bonus
+
+                candidates.sort(key=score_expiry, reverse=True)
+                best_row = candidates[0]
+
+        if best_row:
+            target_dte = round(float(best_row["days_to_expiry"]), 1)
+            target_expiry_date = best_row["expiry_date"]
+            matched_oi = (best_row.get("call", {}).get("oi", 0) or 0) + (best_row.get("put", {}).get("oi", 0) or 0)
+            matched_gex = best_row.get("net_gex", 0.0)
+            
+            if matched_oi > 0:
+                rationale = f"{base_rationale} Matched to listed tenor {target_expiry_date} ({target_dte:.1f} DTE) with active liquidity ({matched_oi:,} contracts OI)."
+            else:
+                rationale = f"{base_rationale} Matched to listed tenor {target_expiry_date} ({target_dte:.1f} DTE)."
+        else:
+            target_dte = float(target_benchmark_dte)
+            target_ts = now.timestamp() + (target_dte * 86400)
+            target_expiry_date = datetime.fromtimestamp(target_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+            rationale = f"{base_rationale} Standard 14D synthetic cycle (Target Expiry: {target_expiry_date})."
+
+        # VRP at tenor
+        if target_dte <= 10:
+            vrp_at_tenor = (atm_iv_7d - rv_val) if (atm_iv_7d is not None and rv_val is not None) else None
+        elif target_dte <= 21:
+            vrp_at_tenor = (atm_iv_14d - rv_val) if (atm_iv_14d is not None and rv_val is not None) else ((atm_iv_30d - rv_val) if (atm_iv_30d is not None and rv_val is not None) else None)
+        else:
+            vrp_at_tenor = (atm_iv_30d - rv_val) if (atm_iv_30d is not None and rv_val is not None) else None
+
+        vrp_tenor_str = f"{vrp_at_tenor:+.2f} vol pts" if vrp_at_tenor is not None else "N/A"
+
+        return {
+            "target_dte": target_dte,
+            "target_expiry_date": target_expiry_date,
+            "target_range": target_range_str,
+            "tenor_label": f"{target_dte:.1f} DTE ({target_expiry_date})",
+            "vrp_at_tenor": vrp_at_tenor,
+            "vrp_at_tenor_str": vrp_tenor_str,
+            "matched_oi": matched_oi,
+            "matched_gex": matched_gex,
+            "rationale": rationale
+        }
+
     def get_live_signals(self, asset: str = "ETH") -> dict:
         asset_upper = asset.upper()
         
@@ -110,8 +228,9 @@ class DerivativesMonkeyExtractor:
         spot_val = live_spot if (live_spot is not None and live_spot > 0) else gex_snapshot_spot
 
         # --- 1) Volatility Edge / VRP Panel ---
-        atm_iv_7d = ms_data.get("atm_iv_7d", {}).get("value")
-        atm_iv_30d = ms_data.get("atm_iv_30d", {}).get("value")
+        atm_iv_7d = atm_rv_data.get("atm_iv_7d") or ms_data.get("atm_iv_7d", {}).get("value")
+        atm_iv_14d = atm_rv_data.get("atm_iv_14d")
+        atm_iv_30d = atm_rv_data.get("atm_iv_30d") or ms_data.get("atm_iv_30d", {}).get("value")
         rv_val = ms_data.get("rv", {}).get("value")
         
         # 30D VRP (primary driver for 14-30 DTE condors)
@@ -120,6 +239,11 @@ class DerivativesMonkeyExtractor:
             vrp_30d = atm_iv_30d - rv_val
         elif ms_data.get("rv", {}).get("vrp") is not None:
             vrp_30d = ms_data.get("rv", {}).get("vrp")
+
+        # 14D VRP
+        vrp_14d = None
+        if atm_iv_14d is not None and rv_val is not None:
+            vrp_14d = atm_iv_14d - rv_val
 
         # 7D VRP
         vrp_7d = None
@@ -302,7 +426,19 @@ class DerivativesMonkeyExtractor:
             rec_strategy = "HOLD_NEUTRAL"
             confidence = 50
 
-        # --- 6) Standardized Strike Increment Calculation ---
+        # --- 6) Optimal DTE & Expiry Recommendation Engine ---
+        optimal_dte_info = self._compute_optimal_dte(
+            strategy=rec_strategy,
+            term_tag=term_tag,
+            term_spread=term_spread,
+            atm_iv_7d=atm_iv_7d,
+            atm_iv_14d=atm_iv_14d,
+            atm_iv_30d=atm_iv_30d,
+            rv_val=rv_val,
+            exp_data=exp_data
+        )
+
+        # --- 7) Standardized Strike Increment Calculation ---
         # Derive standard strike increment based on asset price scale
         if spot_val > 10000: strike_step = 500
         elif spot_val > 1000: strike_step = 25
@@ -364,10 +500,12 @@ class DerivativesMonkeyExtractor:
             },
             "volatility_edge": {
                 "iv_7d": atm_iv_7d,
+                "iv_14d": atm_iv_14d,
                 "iv_30d": atm_iv_30d,
                 "rv": rv_val,
                 "vrp": vrp_30d,
                 "vrp_30d": vrp_30d,
+                "vrp_14d": vrp_14d,
                 "vrp_7d": vrp_7d,
                 "iv_rank": iv_rank,
                 "iv_percentile": iv_percentile,
@@ -398,13 +536,15 @@ class DerivativesMonkeyExtractor:
             "term_structure": {
                 "term_spread_30d_7d": term_spread,
                 "term_tag": term_tag,
-                "top_expiry": top_expiry
+                "top_expiry": top_expiry,
+                "optimal_dte": optimal_dte_info
             },
             "signal": {
                 "short_vol_iron_condor_allowed": short_vol_allowed,
                 "long_vol_allowed": long_vol_allowed,
                 "recommended_strategy": rec_strategy,
                 "confidence_score": confidence,
+                "optimal_dte": optimal_dte_info,
                 "rule_evaluation": {
                     "volatility_rule_passed": rule_vol_pass,
                     "gamma_regime_rule_passed": rule_gex_pass,
@@ -414,6 +554,9 @@ class DerivativesMonkeyExtractor:
                 },
                 "reasons": reasons,
                 "suggested_strikes": {
+                    "target_dte": optimal_dte_info.get("target_dte"),
+                    "target_expiry": optimal_dte_info.get("target_expiry_date"),
+                    "tenor_desc": optimal_dte_info.get("tenor_label"),
                     "long_put_wing": rec_long_put,
                     "short_put": rec_short_put,
                     "short_call": rec_short_call,
@@ -454,17 +597,20 @@ def render_terminal_dashboard(signals: dict):
     print(f"\n{c.BOLD} SPOT PRICE:{c.ENDC} ${spot:,.2f} [{spot_source}]{c.DIM}{snap_info}{c.ENDC}")
 
     # Panel 1: Vol Edge & Term Structure
-    vrp_30_str = f"{vol['vrp_30d']:+.2f} vol pts" if vol['vrp_30d'] is not None else "N/A"
-    vrp_7_str = f"{vol['vrp_7d']:+.2f} vol pts" if vol['vrp_7d'] is not None else "N/A"
-    iv_rank_str = f"{vol['iv_rank']:.1f}" if vol['iv_rank'] is not None else "N/A"
+    vrp_30_str = f"{vol['vrp_30d']:+.2f} vol pts" if vol.get('vrp_30d') is not None else "N/A"
+    vrp_14_str = f"{vol.get('vrp_14d'):+.2f} vol pts" if vol.get('vrp_14d') is not None else "N/A"
+    vrp_7_str = f"{vol['vrp_7d']:+.2f} vol pts" if vol.get('vrp_7d') is not None else "N/A"
+    iv_rank_str = f"{vol['iv_rank']:.1f}" if vol.get('iv_rank') is not None else "N/A"
     vol_pass = vol['vol_regime'] in ['rich', 'elevated']
     term_sprd = term['term_spread_30d_7d']
     term_sprd_str = f"{term_sprd:+.2f} vol pts" if term_sprd is not None else "N/A"
     term_pass = term['term_tag'] == 'contango'
 
+    iv_14_disp = f"  |  14D IV: {vol['iv_14d']:.2f}%" if vol.get('iv_14d') is not None else ""
+
     print(f"\n{c.BOLD}┌─ 1. VOLATILITY EDGE & TERM STRUCTURE PANEL ───────────────────────────────┐{c.ENDC}")
-    print(f"│ 30D IV: {vol['iv_30d'] or 0:.2f}%  |  7D IV: {vol['iv_7d'] or 0:.2f}%  |  RV: {vol['rv'] or 0:.2f}%")
-    print(f"│ 30D VRP (IV-RV): {vrp_30_str:<10} | 7D VRP: {vrp_7_str:<10} | IV Rank: {iv_rank_str:<6}")
+    print(f"│ 30D IV: {vol['iv_30d'] or 0:.2f}%{iv_14_disp}  |  7D IV: {vol['iv_7d'] or 0:.2f}%  |  RV: {vol['rv'] or 0:.2f}%")
+    print(f"│ 30D VRP (IV-RV): {vrp_30_str:<10} | 14D VRP: {vrp_14_str:<10} | 7D VRP: {vrp_7_str:<10} | IV Rank: {iv_rank_str:<6}")
     print(f"│ Vol Regime: {tag_color(vol['vol_regime'].upper(), vol_pass)}  |  Term Structure: {tag_color(term['term_tag'].upper() + ' (' + term_sprd_str + ')', term_pass)}")
     print(f"└───────────────────────────────────────────────────────────────────────────┘")
 
@@ -498,10 +644,14 @@ def render_terminal_dashboard(signals: dict):
     rec = sig['recommended_strategy']
     is_short_vol = sig['short_vol_iron_condor_allowed']
     rec_color = c.OKGREEN if is_short_vol else (c.WARNING if rec == 'HOLD_NEUTRAL' else c.OKBLUE)
+    opt_dte = sig.get('optimal_dte', {})
     
     print(f"\n{c.BOLD}┌─ 4. SIGNAL & STRATEGY DECISION MATRIX ───────────────────────────────────┐{c.ENDC}")
     print(f"│ RECOMMENDED STRATEGY: {rec_color}{c.BOLD}{rec}{c.ENDC} (Confidence: {sig['confidence_score']}%)")
     print(f"│ Short-Vol Iron Condor Allowed: {tag_color(str(is_short_vol).upper(), is_short_vol)}")
+    if opt_dte:
+        print(f"│ Optimal Tenor / DTE: {c.OKCYAN}{c.BOLD}{opt_dte.get('tenor_label', '14 DTE')}{c.ENDC} (Range: {opt_dte.get('target_range', '10–21 DTE')})")
+        print(f"│ Tenor Selection Rationale: {c.DIM}{opt_dte.get('rationale', '')}{c.ENDC}")
     print(f"│")
     print(f"│ Decision Rule Checklist:")
     for reason in sig['reasons']:
@@ -516,11 +666,14 @@ def render_terminal_dashboard(signals: dict):
     if st.get('short_put') and st.get('short_call'):
         print(f"│")
         print(f"│ Recommended Tradeable 4-Leg Iron Condor Structure:")
-        print(f"│   • Long Put Wing  : ${st['long_put_wing']:,.2f} (Tail protection)")
-        print(f"│   • Short Put Leg  : ${st['short_put']:,.2f} (Below Gamma Flip ${flip_lvl:,.2f})")
-        print(f"│   • Short Call Leg : ${st['short_call']:,.2f} (At Positive GEX Resistance)")
-        print(f"│   • Long Call Wing : ${st['long_call_wing']:,.2f} (Tail protection)")
-        print(f"│   • Wing Structure : {st['wing_note']}")
+        if st.get('target_expiry'):
+            target_dte_str = f"{st.get('target_dte'):.1f} DTE" if st.get('target_dte') is not None else "14 DTE"
+            print(f"│   • Target Expiration : {c.BOLD}{st['target_expiry']}{c.ENDC} ({target_dte_str} | Strict Single-Tenor Expiry)")
+        print(f"│   • Long Put Wing     : ${st['long_put_wing']:,.2f} (Tail protection)")
+        print(f"│   • Short Put Leg     : ${st['short_put']:,.2f} (Below Gamma Flip ${flip_lvl:,.2f})")
+        print(f"│   • Short Call Leg    : ${st['short_call']:,.2f} (At Positive GEX Resistance)")
+        print(f"│   • Long Call Wing    : ${st['long_call_wing']:,.2f} (Tail protection)")
+        print(f"│   • Wing Structure    : {st['wing_note']}")
     print(f"└───────────────────────────────────────────────────────────────────────────┘\n")
 
 

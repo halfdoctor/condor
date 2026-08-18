@@ -103,6 +103,7 @@ class MarketRanker:
             confidence = signal["confidence_score"]
             reasons = signal["reasons"]
             suggested_strikes = signal["suggested_strikes"]
+            optimal_dte = signal.get("optimal_dte", {})
 
             # --- Quantitative Multi-Factor Ranking (0 - 100) ---
             # 1. Vol Edge / VRP Score (Max 30 pts)
@@ -169,7 +170,8 @@ class MarketRanker:
                 "rec": rec,
                 "confidence": confidence,
                 "reasons": reasons,
-                "suggested_strikes": suggested_strikes
+                "suggested_strikes": suggested_strikes,
+                "optimal_dte": optimal_dte
             })
 
         # Sort descending by score
@@ -243,11 +245,16 @@ def render_ranking_cli(ranked_markets: list):
             sp_put = f"${strikes.get('short_put', 0):,.2f}" if strikes.get('short_put') else "N/A"
             sp_call = f"${strikes.get('short_call', 0):,.2f}" if strikes.get('short_call') else "N/A"
             wing_note = strikes.get('wing_note', 'Standard symmetric wings')
+            opt_dte = best.get("optimal_dte", {})
+            exp_date = strikes.get("target_expiry") or opt_dte.get("target_expiry_date", "N/A")
+            target_dte_val = strikes.get("target_dte") or opt_dte.get("target_dte", 14)
+            target_dte_disp = f"{target_dte_val:.1f} DTE" if isinstance(target_dte_val, float) else f"{target_dte_val} DTE"
 
             print(f"│ {c.BOLD}{c.OKGREEN}★ ACTIVE DEPLOYMENT READY: {best['symbol']} (Score: {best['score']}/100 | Confidence: {best['confidence']}%){c.ENDC}")
             print(f"│   • Volatility Edge : 30D IV {best['iv30']:.1f}% vs RV {best['rv']:.1f}% | VRP: {best['vrp']:+.2f} vol pts ({best['vol_reg'].upper()})")
             print(f"│   • GEX & Hedging   : Positive / Dealer Long Gamma | Spot vs Flip: {best['dist_pct']:+.2f}%")
             print(f"│   • Term Structure  : {best['term_tag'].upper()} (+{best['term_spread']:.2f} vol pts theta slope)")
+            print(f"│   • Optimal Tenor   : {c.OKCYAN}{c.BOLD}{target_dte_disp} (Target Expiry: {exp_date}){c.ENDC} — Single-tenor 4-leg match")
             print(f"│   • Execution Setup : Short Put: {sp_put} (Below Flip ${best['flip']:,.2f}) | Short Call: {sp_call}")
             print(f"│   • Delta Hedge Rule: Pair with {best['symbol']}-PERP (Maintain delta band ±0.15 with perpetual futures)")
             print(f"│   • Wing Structure  : {wing_note}")
@@ -256,12 +263,16 @@ def render_ranking_cli(ranked_markets: list):
         strikes = best.get("suggested_strikes", {})
         sp_put = f"${strikes.get('short_put', 0):,.2f}" if strikes.get('short_put') else "N/A"
         sp_call = f"${strikes.get('short_call', 0):,.2f}" if strikes.get('short_call') else "N/A"
-        wing_note = strikes.get('wing_note', 'Standard symmetric wings')
+        opt_dte = best.get("optimal_dte", {})
+        exp_date = strikes.get("target_expiry") or opt_dte.get("target_expiry_date", "N/A")
+        target_dte_val = strikes.get("target_dte") or opt_dte.get("target_dte", 14)
+        target_dte_disp = f"{target_dte_val:.1f} DTE" if isinstance(target_dte_val, float) else f"{target_dte_val} DTE"
 
         print(f"│ {c.BOLD}{c.OKGREEN}★ TOP CANDIDATE (PENDING CLEARANCE): {best['symbol']} (Score: {best['score']}/100){c.ENDC}")
         print(f"│   • Volatility Edge : Rich IV ({best['iv30']:.1f}% vs RV {best['rv']:.1f}%) | VRP: {best['vrp']:+.2f} vol pts")
         print(f"│   • GEX Regime      : Positive / Dealer Long Gamma | Spot vs Flip: {best['dist_pct']:+.2f}%")
         print(f"│   • Term Structure  : {best['term_tag'].upper()} (+{best['term_spread']:.2f} vol pts theta slope)")
+        print(f"│   • Optimal Tenor   : {c.OKCYAN}{c.BOLD}{target_dte_disp} (Target Expiry: {exp_date}){c.ENDC}")
         print(f"│   • Execution Setup : Short Put: {sp_put} (Below Flip ${best['flip']:,.2f}) | Short Call: {sp_call}")
         print(f"│   • Delta Hedge Rule: Pair with {best['symbol']}-PERP (Maintain delta band ±0.15 with perpetual futures)")
     else:
