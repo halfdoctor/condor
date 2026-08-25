@@ -35,6 +35,8 @@ LAST_KNOWN_MARK_PRICES: dict[str, float] = {}
 class Config(BaseModel):
     """Autonomous Decoupled Dual-Cadence Trader: Derivatives Monkey Consensus Cross-Check, Pure Target Delta (30Δ/10Δ), 30s Fast Rehedge, 50 Bps Slippage Protection"""
     trading_pair: str = Field(default="ETH-USDT", description="Underlying asset trading pair (ETH-USDT, BTC-USDT, HYPE-USDT)")
+    perp_connector: str = Field(default="derive_perpetual", description="Hummingbot perpetual connector to execute delta hedges on (e.g. derive_perpetual, hyperliquid_perpetual, binance_perpetual, bybit_perpetual, okx_perpetual)")
+    perp_trading_pair: str | None = Field(default=None, description="Perpetual trading pair on perp_connector (e.g. ETH-USDC on Derive, ETH-USD on Hyperliquid, ETH-USDT on Binance/Bybit; auto-resolved if None)")
     poll_interval_seconds: int = Field(default=300, description="Macro loop interval for options market volatility analysis, surface GEX, and RFQ scale-in/take-profit (default 300s / 5m)")
     perp_hedge_interval_seconds: int = Field(default=30, description="Fast sub-loop interval for perpetual delta rebalancing and spot price tracking to prevent gamma drift (default 30s)")
     paper_mode: bool = Field(default=False, description="Dry-run paper mode (True = Simulated execution & alerts; False = Live exchange orders)")
@@ -218,6 +220,42 @@ def round_derive_strike(strike: float, spot: float, pair: str = "ETH") -> float:
     else:
         increment = 50.0
     return round(strike / increment) * increment
+
+def resolve_perp_trading_pair(symbol: str, connector_name: str = "derive_perpetual", custom_pair: str | None = None) -> str:
+    """Resolve the appropriate perpetual trading pair symbol based on exchange naming convention."""
+    if custom_pair and custom_pair.strip():
+        return custom_pair.strip().upper()
+    sym = symbol.upper().split("-")[0]
+    conn = (connector_name or "derive_perpetual").lower()
+    if "hyperliquid" in conn:
+        return f"{sym}-USD"
+    elif "derive" in conn:
+        return f"{sym}-USDC"
+    elif any(x in conn for x in ["binance", "bybit", "okx", "gate", "kucoin", "bitget"]):
+        return f"{sym}-USDT"
+    else:
+        return f"{sym}-USDT"
+
+async def fetch_external_perp_position(context: Any, connector_name: str, trading_pair: str) -> float | None:
+    """Query open perpetual position for trading_pair on external connector via Hummingbot client."""
+    if not context or "derive" in connector_name.lower():
+        return None
+    try:
+        from config_manager import get_client
+        chat_id = context._chat_id if hasattr(context, "_chat_id") else None
+        client = await get_client(chat_id, context=context)
+        if client:
+            res = await client.trading.get_open_positions()
+            positions_data = res.get("data", []) if isinstance(res, dict) else (res if isinstance(res, list) else [])
+            for p in positions_data:
+                p_conn = str(p.get("connector_name", "")).lower()
+                p_pair = str(p.get("trading_pair", "")).upper()
+                if connector_name.lower() in p_conn and trading_pair.upper() == p_pair:
+                    amt = float(p.get("amount", 0.0))
+                    return amt
+    except Exception as e:
+        logger.debug(f"fetch_external_perp_position error for {connector_name} {trading_pair}: {e}")
+    return None
 
 def save_json_atomic(target_path: Path, data: dict):
     """Atomically write a JSON file using a temporary file and atomic replace to prevent corrupt reads by external watchdog or monitor processes."""
@@ -939,13 +977,14 @@ async def execute_perp_rebalance(
     
     1. 'STRATEGY_EXECUTOR' (Default Hybrid Architecture):
        Calculates net delta imbalance against the options portfolio and emits real-time
-       rebalance signals and telemetry for Hummingbot executors (order_executor on derive_perpetual).
+       rebalance signals and telemetry for Hummingbot executors (order_executor on perp_connector).
        Avoids placing conflicting direct exchange orders.
        
     2. 'DIRECT_ROUTINE':
        Directly signs and submits passive Maker GTC limit orders on Derive (/private/order).
     """
     perp_symbol = f"{symbol}-PERP"
+    target_perp_symbol = resolve_perp_trading_pair(symbol, config.perp_connector, config.perp_trading_pair)
     execution_mode_str = "[PAPER MODE - DRY RUN]" if config.paper_mode else "[LIVE ORDER EXECUTION]"
     target_perp_delta = - live_options_delta
     max_allowed_perp_delta = max(min_order_size, abs(live_options_delta) * config.max_perp_delta_hedge_ratio)
@@ -973,9 +1012,9 @@ async def execute_perp_rebalance(
             urgency_str = "EMERGENCY" if abs(delta_imbalance) > config.emergency_band else "STANDARD"
             
             if config.hedge_execution_mode == "STRATEGY_EXECUTOR":
-                # HYBRID ARCHITECTURE: Emit rebalance signal for Hummingbot manage_executors
-                hedge_action_status = f"SIGNAL: REBALANCE REQUIRED ({side_str} {rebalance_size:.{size_decimals}f} {symbol}-USDC @ ${maker_price:,.2f} | {urgency_str})"
-                perp_order_summary = f"[HYBRID SIGNAL] Target: {target_perp_delta:+.4f} {symbol} | Imbalance: {delta_imbalance:+.4f} | Recommended: {side_str} {rebalance_size:.{size_decimals}f} {symbol}-USDC on derive_perpetual"
+                # HYBRID ARCHITECTURE: Emit rebalance signal for Hummingbot manage_executors across configured perp connector
+                hedge_action_status = f"SIGNAL: REBALANCE REQUIRED ({side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} @ ${maker_price:,.2f} on {config.perp_connector} | {urgency_str})"
+                perp_order_summary = f"[HYBRID SIGNAL] Target: {target_perp_delta:+.4f} {symbol} | Imbalance: {delta_imbalance:+.4f} | Recommended: {side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} on {config.perp_connector}"
                 rebalanced = True
                 return live_perp_delta, hedge_action_status, perp_order_summary, rebalanced
                 
@@ -1344,6 +1383,20 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
                 subaccount_queried_successfully = True
         except Exception as e:
             logger.warning(f"Error querying live Derive subaccount from private API: {e}")
+
+    # Check external perpetual connector position if configured
+    target_perp_symbol = resolve_perp_trading_pair(symbol, config.perp_connector, config.perp_trading_pair)
+    if "derive" not in config.perp_connector.lower():
+        ext_perp_amt = await fetch_external_perp_position(context, config.perp_connector, target_perp_symbol)
+        if ext_perp_amt is not None:
+            live_perp_delta = round(float(ext_perp_amt), 4)
+            live_active_positions_table.append({
+                "Leg": f"Perpetual ({config.perp_connector})",
+                "Contract": target_perp_symbol,
+                "Strike": "-",
+                "Size": f"{live_perp_delta:+.{size_decimals}f}",
+                "Delta": f"{live_perp_delta:+.4f}"
+            })
 
     # -------------------------------------------------------------
     # 5. Rigorous Mark-to-Market PnL & Take-Profit (60%) / Stop-Loss Engine
@@ -1910,8 +1963,8 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             "side": hedge_side_val if rebalance_needed_flag else "NONE",
             "amount": hedge_size_val if rebalance_needed_flag else 0.0,
             "limit_price": round(spot_price * (1.0 + 0.0001) if hedge_side_val == "SELL" else spot_price * (1.0 - 0.0001), 2) if rebalance_needed_flag else 0.0,
-            "connector_name": "derive_perpetual",
-            "trading_pair": f"{symbol}-USDC",
+            "connector_name": config.perp_connector,
+            "trading_pair": target_perp_symbol,
             "options_delta": live_options_delta,
             "perp_delta": live_perp_delta,
             "target_perp_delta": target_perp_delta,
@@ -1966,6 +2019,7 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         },
         "section_03": {
             "Aggregate Options Delta": f"{live_options_delta:+.4f} {symbol}",
+            "Perpetual Hedge Venue": f"{config.perp_connector} ({target_perp_symbol})",
             "Current Perpetual Delta": f"{live_perp_delta:+.4f} {symbol}",
             "Net Delta Imbalance": f"{delta_imbalance_val:+.4f} {symbol}",
             "Target Perpetual Hedge": f"{target_perp_delta:+.4f} {symbol}",
@@ -2089,6 +2143,12 @@ async def execute_fast_perp_hedge_cycle(
                     await asyncio.sleep(0.5)
 
     # Strict Safety Barrier: If we could not verify subaccount positions from Derive, skip fast rehedge
+    target_perp_symbol = resolve_perp_trading_pair(symbol, config.perp_connector, config.perp_trading_pair)
+    if "derive" not in config.perp_connector.lower():
+        ext_perp_amt = await fetch_external_perp_position(context, config.perp_connector, target_perp_symbol)
+        if ext_perp_amt is not None:
+            live_perp_delta = ext_perp_amt
+            
     if not subaccount_fetch_ok or live_perp_delta is None:
         logger.warning("Fast hedge cycle skipped: Live subaccount positions unavailable from Derive clearinghouse. Holding hedge.")
         return cached_metrics, display_table, alerts_log, False
@@ -2175,6 +2235,7 @@ async def execute_fast_perp_hedge_cycle(
     if "section_03" not in cached_metrics:
         cached_metrics["section_03"] = {}
     cached_metrics["section_03"]["Aggregate Options Delta"] = f"{updated_options_delta:+.4f} {symbol}"
+    cached_metrics["section_03"]["Perpetual Hedge Venue"] = f"{config.perp_connector} ({target_perp_symbol})"
     cached_metrics["section_03"]["Current Perpetual Delta"] = f"{live_perp_delta:+.4f} {symbol}"
     cached_metrics["section_03"]["Net Delta Imbalance"] = f"{delta_imb_fast:+.4f} {symbol}"
     cached_metrics["section_03"]["Target Perpetual Hedge"] = f"{-updated_options_delta:+.4f} {symbol}"
@@ -2200,8 +2261,8 @@ async def execute_fast_perp_hedge_cycle(
             "side": "SELL" if delta_imb_fast < 0 else "BUY",
             "amount": round(abs(delta_imb_fast), size_decimals),
             "limit_price": round(spot_price * (1.0 + 0.0001) if delta_imb_fast < 0 else spot_price * (1.0 - 0.0001), 2) if abs(delta_imb_fast) > config.hedge_band else 0.0,
-            "connector_name": "derive_perpetual",
-            "trading_pair": f"{symbol}-USDC",
+            "connector_name": config.perp_connector,
+            "trading_pair": target_perp_symbol,
             "options_delta": updated_options_delta,
             "perp_delta": live_perp_delta,
             "target_perp_delta": round(-updated_options_delta, 4),

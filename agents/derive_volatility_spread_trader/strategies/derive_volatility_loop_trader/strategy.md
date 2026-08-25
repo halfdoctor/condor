@@ -2,8 +2,9 @@
 name: Derive Volatility Loop Trader
 description: Autonomous Hybrid Architecture short-volatility Iron Condor strategy
   combining dedicated Derive EIP-712 Options RFQ package execution (30Δ/10Δ) with
-  Hummingbot API perpetual delta hedging (derive_perpetual), Derivatives Monkey
-  institutional GEX/DEX consensus filtering, 75% margin safety caps, and 50 bps slippage protection.
+  Hummingbot API perpetual delta hedging across derive_perpetual, hyperliquid_perpetual,
+  binance_perpetual or other perpetual connectors, Derivatives Monkey institutional
+  GEX/DEX consensus filtering, 75% margin safety caps, and 50 bps slippage protection.
 agent_key: null
 skills: []
 default_config:
@@ -22,7 +23,9 @@ default_config:
   notify_on_change_only: true
   options_route: RFQ_COMBO_PACKAGE
   paper_mode: false
+  perp_connector: derive_perpetual
   perp_hedge_interval_seconds: 30
+  perp_trading_pair: null
   poll_interval_seconds: 300
   short_delta_target: 0.3
   stop_loss_pct: 100.0
@@ -43,7 +46,7 @@ Autonomous Hybrid Short-Volatility Iron Condor & Perpetual Delta-Hedging Strateg
 
 ## 1. Hybrid Architecture & Division of Responsibilities
 
-Because Hummingbot API natively supports standard Spot & Perpetual orderbooks (via the `derive_perpetual` connector) but does **not** have built-in support for Derive's multi-leg EIP-712 Options RFQ combo contract, the **Hybrid Architecture** strictly decouples Options Execution from Perpetual Delta Hedging.
+Because Hummingbot API natively supports standard Spot & Perpetual orderbooks (across `derive_perpetual`, `hyperliquid_perpetual`, `binance_perpetual`, `bybit_perpetual`, `okx_perpetual`, etc.) but does **not** have built-in support for Derive's multi-leg EIP-712 Options RFQ combo contract, the **Hybrid Architecture** strictly decouples Options Execution from Perpetual Delta Hedging.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
@@ -54,8 +57,8 @@ Because Hummingbot API natively supports standard Spot & Perpetual orderbooks (v
 ├────────────────────────────────────────────┼────────────────────────────────────────────┤
 │ • Volatility Surface & GEX Analysis        │ • Strategy Agent Governance                │
 │ • Pure Delta Strike Matching (30Δ/10Δ)      │ • Delta Imbalance Monitoring (Δ_net)       │
-│ • EIP-712 RFQ Multi-Leg Package Sign       │ • Hummingbot `manage_executors` for        │
-│ • Atomic Multi-Tick Quote & Fills          │   `derive_perpetual` (ETH-USDC / ETH-USDT) │
+│ • EIP-712 RFQ Multi-Leg Package Sign       │ • Hummingbot manage_executors across       │
+│ • Atomic Multi-Tick Quote & Fills          │   derive, hyperliquid, binance, bybit, etc.│
 │ • Options TP (60%) & SL (100%) Management  │ • Native Slippage (50 bps) & Rate-Limiting │
 │ • Net Options Delta Emission (Δ_options)   │ • Strict Rebalancing (|Δ_net| > 0.05)      │
 └────────────────────────────────────────────┴────────────────────────────────────────────┘
@@ -72,18 +75,18 @@ Because Hummingbot API natively supports standard Spot & Perpetual orderbooks (v
   4. Enforces pre-trade margin utilization projections (75% cap, discrete package sizing).
   5. Signs and executes the atomic 4-leg RFQ package on Derive.
   6. Tracks options position lifecycle (Take-Profit at 60%, Stop-Loss at 100%, expiry settlement).
-  7. Reads subaccount clearinghouse positions and **emits exact delta telemetry**:
+  7. Reads clearinghouse positions and **emits exact delta telemetry**:
      - $\Delta_{\text{options}}$ (Aggregate Options Delta)
      - $\Delta_{\text{perp}}^{\text{target}} = - \Delta_{\text{options}}$ (Target Perpetual Position)
      - $\Delta_{\text{net}} = \Delta_{\text{options}} + \Delta_{\text{perp}}$ (Net Delta Imbalance)
-     - Emits structured `hedge_signal` to `.heartbeat.json`, `.position_state.json`, and LiveReport.
+     - Emits structured `hedge_signal` targeting configured `perp_connector` to `.heartbeat.json`, `.position_state.json`, and LiveReport.
 
 #### B. Perpetual Delta Hedging: Strategy Agent & Hummingbot Executors (`manage_executors`)
-* **Why**: Hummingbot API provides battle-tested perpetual futures order management, continuous position tracking, slippage controls, orderbook execution, and retry mechanisms on `derive_perpetual`.
+* **Why**: Hummingbot API provides battle-tested perpetual futures order management, continuous position tracking, slippage controls, orderbook execution, and retry mechanisms across any configured perpetual connector (`derive_perpetual`, `hyperliquid_perpetual`, `binance_perpetual`, `bybit_perpetual`, `okx_perpetual`).
 * **What it does**:
-  1. Reads the routine's output telemetry and heartbeat (`options_delta`, `perp_delta`, `delta_imbalance`).
+  1. Reads the routine's output telemetry and heartbeat (`options_delta`, `perp_delta`, `delta_imbalance`, `hedge_signal`).
   2. Evaluates net delta imbalance against the rebalance threshold ($|\Delta_{\text{net}}| > 0.05\text{ unit}$).
-  3. Triggers `manage_executors` on the `derive_perpetual` connector (`order_executor` with `LIMIT_MAKER`, `LIMIT_CHASER`, or `MARKET`).
+  3. Triggers `manage_executors` on the selected perpetual connector (`order_executor` with `LIMIT_MAKER`, `LIMIT_CHASER`, or `MARKET`).
   4. Maintains strict portfolio delta neutrality ($\Delta_{\text{net}} \approx 0.00$) with tight 50 bps slippage protection.
 
 ---
@@ -147,33 +150,75 @@ $$\text{Projected Margin Utilization} = \frac{\text{Projected Margin Used}}{\tex
 
 ---
 
-## 5. Perpetual Delta Hedging via Hummingbot Executors
+## 5. Multi-Exchange Perpetual Delta Hedging via Hummingbot Executors
 
-In the Hybrid Architecture, perpetual delta hedging is executed by the strategy agent dispatching Hummingbot executors on the `derive_perpetual` connector.
+In the Hybrid Architecture, perpetual delta hedging is executed by the strategy agent dispatching Hummingbot executors across **any supported perpetual exchange** (`derive_perpetual`, `hyperliquid_perpetual`, `binance_perpetual`, `bybit_perpetual`, `okx_perpetual`, etc.).
 
 ### 5.1 Delta Hedging Parameters & Calculations
 - **Aggregate Options Delta**: $\Delta_{\text{options}} = \sum (\text{Leg Amount} \times \Delta_{\text{leg}})$
-- **Current Perpetual Position**: $\Delta_{\text{perp}}$
+- **Current Perpetual Position**: $\Delta_{\text{perp}}$ (queried from clearinghouse or Hummingbot client)
 - **Target Perpetual Hedge**: $\Delta_{\text{perp}}^{\text{target}} = - \Delta_{\text{options}}$
 - **Net Delta Imbalance**: $\Delta_{\text{net}} = \Delta_{\text{perp}}^{\text{target}} - \Delta_{\text{perp}} = - (\Delta_{\text{options}} + \Delta_{\text{perp}})$
 - **Strict Perp Ratio Cap**: Total perpetual delta must NEVER exceed options delta hedge requirement ($\text{Max Perp Delta} = |\Delta_{\text{options}}| \times 1.0$).
 
 ### 5.2 Hedging Triggers & Execution Bands
 - **Neutral Band ($|\Delta_{\text{net}}| \le 0.05$)**: No rebalance required; portfolio is delta neutral.
-- **Standard Rebalance ($|\Delta_{\text{net}}| > 0.05$)**: Spawn `order_executor` on `derive_perpetual` with `LIMIT_MAKER` or `LIMIT_CHASER` (passive maker order with 1 bp offset and 50 bps slippage limit).
-- **Emergency Band ($|\Delta_{\text{net}}| > 0.20$)**: Immediate hedge execution with `MARKET` or aggressive `LIMIT` on `derive_perpetual` to restore delta neutrality.
+- **Standard Rebalance ($|\Delta_{\text{net}}| > 0.05$)**: Spawn `order_executor` on `perp_connector` with `LIMIT_MAKER` or `LIMIT_CHASER` (passive maker order with 1 bp offset and 50 bps slippage limit).
+- **Emergency Band ($|\Delta_{\text{net}}| > 0.20$)**: Immediate hedge execution with `MARKET` or aggressive `LIMIT` on `perp_connector` to restore delta neutrality.
 
-### 5.3 Hummingbot Executor Dispatch Specification
+### 5.3 Multi-Connector Trading Pair Resolution
+| Connector Name | Default Trading Pair | Base Sizing Unit |
+| :--- | :--- | :--- |
+| `derive_perpetual` | `ETH-USDC` / `ETH-USDT` | Base Token (ETH) |
+| `hyperliquid_perpetual` | `ETH-USD` | Base Token (ETH) |
+| `binance_perpetual` | `ETH-USDT` | Base Token (ETH) |
+| `bybit_perpetual` | `ETH-USDT` | Base Token (ETH) |
+| `okx_perpetual` | `ETH-USDT` | Base Token (ETH) |
+
+### 5.4 Hummingbot Executor Dispatch Specification
 ```python
+# Example 1: Hedging on Derive Perpetual (Default)
 manage_executors(
     action="create",
     executor_type="order_executor",
     executor_config={
         "connector_name": "derive_perpetual",
-        "trading_pair": "ETH-USDC",  # or ETH-USDT
+        "trading_pair": "ETH-USDC",
         "side": 1 if delta_imbalance > 0 else 2,  # 1=BUY, 2=SELL
         "amount": round(abs(delta_imbalance), 3),
         "execution_strategy": "LIMIT_MAKER",  # Post-only resting maker
+        "price": maker_price,
+        "leverage": 1,
+        "position_action": "OPEN"
+    }
+)
+
+# Example 2: Hedging on Hyperliquid Perpetual
+manage_executors(
+    action="create",
+    executor_type="order_executor",
+    executor_config={
+        "connector_name": "hyperliquid_perpetual",
+        "trading_pair": "ETH-USD",
+        "side": 1 if delta_imbalance > 0 else 2,
+        "amount": round(abs(delta_imbalance), 3),
+        "execution_strategy": "LIMIT_MAKER",
+        "price": maker_price,
+        "leverage": 1,
+        "position_action": "OPEN"
+    }
+)
+
+# Example 3: Hedging on Binance Perpetual
+manage_executors(
+    action="create",
+    executor_type="order_executor",
+    executor_config={
+        "connector_name": "binance_perpetual",
+        "trading_pair": "ETH-USDT",
+        "side": 1 if delta_imbalance > 0 else 2,
+        "amount": round(abs(delta_imbalance), 3),
+        "execution_strategy": "LIMIT_MAKER",
         "price": maker_price,
         "leverage": 1,
         "position_action": "OPEN"
@@ -209,7 +254,7 @@ manage_executors(
   ├─► Strategy Agent inspects Δ_options vs current Δ_perp
   ├─► Computes Net Delta Imbalance Δ_net = - (Δ_options + Δ_perp)
   ├─► If |Δ_net| > 0.05:
-  │     └─► Calls manage_executors on derive_perpetual (LIMIT_MAKER / LIMIT_CHASER)
+  │     └─► Calls manage_executors on configured perp_connector (LIMIT_MAKER / LIMIT_CHASER)
   ├─► Fills & position updates tracked via Hummingbot API
   └─► Records state, margin utilization %, and delta metrics to Journal
 ```
@@ -240,18 +285,20 @@ $$\Delta_{\text{net}} = - (\Delta_{\text{options}} + \Delta_{\text{perp}})$$
 - If $|\Delta_{\text{net}}| > 0.05$: **Rebalance Required** — proceed to Step 4.
 
 ### Step 4: Execute Perpetual Hedge via Hummingbot
-Dispatch an `order_executor` on `derive_perpetual` to rebalance delta:
+Dispatch an `order_executor` on the target perpetual connector to rebalance delta:
 ```python
 manage_executors(
     action="create",
     executor_type="order_executor",
     executor_config={
-        "connector_name": "derive_perpetual",
-        "trading_pair": "ETH-USDC",
-        "side": 1 if delta_imbalance > 0 else 2,
-        "amount": round(abs(delta_imbalance), 3),
+        "connector_name": hedge_signal["connector_name"],  # e.g. derive_perpetual, hyperliquid_perpetual, binance_perpetual
+        "trading_pair": hedge_signal["trading_pair"],      # e.g. ETH-USDC, ETH-USD, ETH-USDT
+        "side": 1 if hedge_signal["side"] == "BUY" else 2,
+        "amount": hedge_signal["amount"],
         "execution_strategy": "LIMIT_MAKER",
-        "price": maker_price
+        "price": hedge_signal["limit_price"],
+        "leverage": 1,
+        "position_action": "OPEN"
     }
 )
 ```
