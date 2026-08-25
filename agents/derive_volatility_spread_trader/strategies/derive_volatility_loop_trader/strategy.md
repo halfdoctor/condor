@@ -1,11 +1,9 @@
 ---
 name: Derive Volatility Loop Trader
-description: Autonomous decoupled dual-cadence short-volatility Iron Condor strategy
-  on Derive with Black-Scholes continuous delta modeling (30Δ/10Δ), Derivatives Monkey
-  institutional GEX/DEX consensus filtering, multi-source credential resolution, pre-trade
-  projected margin checks (75% cap), discrete complete package sizing (100%, 75%,
-  50%, 25%), 30s fast perpetual delta hedging with 50 bps slippage protection, and atomic
-  state tracking.
+description: Autonomous Hybrid Architecture short-volatility Iron Condor strategy
+  combining dedicated Derive EIP-712 Options RFQ package execution (30Δ/10Δ) with
+  Hummingbot API perpetual delta hedging (derive_perpetual), Derivatives Monkey
+  institutional GEX/DEX consensus filtering, 75% margin safety caps, and 50 bps slippage protection.
 agent_key: null
 skills: []
 default_config:
@@ -16,6 +14,7 @@ default_config:
   enable_options_entry: true
   frequency_sec: 60
   hedge_band: 0.05
+  hedge_execution_mode: STRATEGY_EXECUTOR
   max_margin_utilization_pct: 75.0
   max_perp_delta_hedge_ratio: 1.0
   max_perp_slippage_bps: 50
@@ -36,22 +35,56 @@ created_by: 1934595831
 created_at: '2026-08-14T10:35:34.048157+00:00'
 ---
 
-# Derive Volatility Loop Trader — Strategy Playbook
+# Derive Volatility Loop Trader — Hybrid Architecture Playbook
 
-Autonomous Decoupled Dual-Cadence Short-Volatility Iron Condor & Delta Hedging Strategy on Derive (Lyra Finance).
+Autonomous Hybrid Short-Volatility Iron Condor & Perpetual Delta-Hedging Strategy across Derive Protocol (Lyra Finance) and Hummingbot API.
 
 ---
 
-## 1. Strategy Overview & Architecture
+## 1. Hybrid Architecture & Division of Responsibilities
 
-The strategy monetizes the volatility risk premium between Implied Volatility (IV) and Realized Volatility (RV) by systematically writing defined-risk 4-leg Iron Condors on Derive options while maintaining strict delta neutrality using dynamic perpetual futures hedging.
+Because Hummingbot API natively supports standard Spot & Perpetual orderbooks (via the `derive_perpetual` connector) but does **not** have built-in support for Derive's multi-leg EIP-712 Options RFQ combo contract, the **Hybrid Architecture** strictly decouples Options Execution from Perpetual Delta Hedging.
 
-### Core Architectural Pillars
-- **Decoupled Dual-Cadence Execution**:
-  - **Macro Cycle (`300s` / 5m)**: Volatility surface analysis, 7D RV vs 14D IV Black-Scholes inversion, Derivatives Monkey institutional consensus filtering, discrete package sizing, RFQ entry/scale-in, and lifecycle take-profit evaluation.
-  - **Fast Sub-Loop (`30s`)**: High-frequency perpetual delta rebalancing and spot price tracking to prevent gamma drift between macro option cycles.
-- **Execution Route**: Atomic RFQ Combo Packages via EIP-712 session key signing (`derive_action_signing`) with fallback to sequential orderbook.
-- **Venue & Primary Underlyings**: Derive Protocol (`ETH-USDT`, `BTC-USDT`, `HYPE-USDT`).
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                                   HYBRID ARCHITECTURE                                   │
+├────────────────────────────────────────────┬────────────────────────────────────────────┤
+│         1. OPTIONS DOMAIN (ROUTINE)        │       2. PERPETUAL DOMAIN (STRATEGY)       │
+│             [Derive Native RFQ]            │           [Hummingbot Executors]           │
+├────────────────────────────────────────────┼────────────────────────────────────────────┤
+│ • Volatility Surface & GEX Analysis        │ • Strategy Agent Governance                │
+│ • Pure Delta Strike Matching (30Δ/10Δ)      │ • Delta Imbalance Monitoring (Δ_net)       │
+│ • EIP-712 RFQ Multi-Leg Package Sign       │ • Hummingbot `manage_executors` for        │
+│ • Atomic Multi-Tick Quote & Fills          │   `derive_perpetual` (ETH-USDC / ETH-USDT) │
+│ • Options TP (60%) & SL (100%) Management  │ • Native Slippage (50 bps) & Rate-Limiting │
+│ • Net Options Delta Emission (Δ_options)   │ • Strict Rebalancing (|Δ_net| > 0.05)      │
+└────────────────────────────────────────────┴────────────────────────────────────────────┘
+```
+
+### 1.1 Division of Responsibilities
+
+#### A. Options Side: Dedicated Routine (`derive_volatility_loop_trader.py`)
+* **Why**: Derive Options RFQs require custom EIP-712 typed data hashing (`RFQExecuteModuleData`), signing with session keys against Derive's RFQ contract (`0x9371352CCef6f5b36EfDFE90942fFE622Ab77F1D`), broadcasting RFQ requests to market makers, and polling quotes across multiple ticks to select the highest net credit.
+* **What it does**:
+  1. Scans implied volatility ($14\text{D IV}$), realized volatility ($7\text{D RV}$), surface GEX, and skew.
+  2. Cross-checks Derivatives Monkey institutional consensus (GEX, DEX, Gamma Flip, Term Structure).
+  3. Resolves optimal strikes for the Iron Condor (30Δ short body / 10Δ long wings, single-tenor expiry).
+  4. Enforces pre-trade margin utilization projections (75% cap, discrete package sizing).
+  5. Signs and executes the atomic 4-leg RFQ package on Derive.
+  6. Tracks options position lifecycle (Take-Profit at 60%, Stop-Loss at 100%, expiry settlement).
+  7. Reads subaccount clearinghouse positions and **emits exact delta telemetry**:
+     - $\Delta_{\text{options}}$ (Aggregate Options Delta)
+     - $\Delta_{\text{perp}}^{\text{target}} = - \Delta_{\text{options}}$ (Target Perpetual Position)
+     - $\Delta_{\text{net}} = \Delta_{\text{options}} + \Delta_{\text{perp}}$ (Net Delta Imbalance)
+     - Emits structured `hedge_signal` to `.heartbeat.json`, `.position_state.json`, and LiveReport.
+
+#### B. Perpetual Delta Hedging: Strategy Agent & Hummingbot Executors (`manage_executors`)
+* **Why**: Hummingbot API provides battle-tested perpetual futures order management, continuous position tracking, slippage controls, orderbook execution, and retry mechanisms on `derive_perpetual`.
+* **What it does**:
+  1. Reads the routine's output telemetry and heartbeat (`options_delta`, `perp_delta`, `delta_imbalance`).
+  2. Evaluates net delta imbalance against the rebalance threshold ($|\Delta_{\text{net}}| > 0.05\text{ unit}$).
+  3. Triggers `manage_executors` on the `derive_perpetual` connector (`order_executor` with `LIMIT_MAKER`, `LIMIT_CHASER`, or `MARKET`).
+  4. Maintains strict portfolio delta neutrality ($\Delta_{\text{net}} \approx 0.00$) with tight 50 bps slippage protection.
 
 ---
 
@@ -92,7 +125,7 @@ Strikes are selected via continuous Black-Scholes inversion using the Abramowitz
 4. **Long Put Wing**: Target $-0.10\Delta$ ($\approx -10\text{ Delta}$ outer wing protection)
 
 ### Strict Structural Constraints:
-- **Strict Single-Tenor Expiry Rule**: All 4 legs of the Iron Condor must belong strictly to the **same single expiration timestamp** (default `14 DTE`, e.g., `Aug 28, 2026 08:00 UTC`).
+- **Strict Single-Tenor Expiry Rule**: All 4 legs of the Iron Condor must belong strictly to the **same single expiration timestamp** (default `14 DTE`, e.g., `Sep 04, 2026 08:00 UTC`).
 - **Asset Precision & Min Sizes**: Automatically scales size precision and order minimums per underlying (e.g. BTC: 4 decimals, 0.01 min; ETH: 3 decimals, 0.10 min; HYPE: 1 decimal, 1.0 min).
 
 ---
@@ -114,77 +147,115 @@ $$\text{Projected Margin Utilization} = \frac{\text{Projected Margin Used}}{\tex
 
 ---
 
-## 5. Decoupled Fast Perpetual Delta Hedging
+## 5. Perpetual Delta Hedging via Hummingbot Executors
 
+In the Hybrid Architecture, perpetual delta hedging is executed by the strategy agent dispatching Hummingbot executors on the `derive_perpetual` connector.
+
+### 5.1 Delta Hedging Parameters & Calculations
 - **Aggregate Options Delta**: $\Delta_{\text{options}} = \sum (\text{Leg Amount} \times \Delta_{\text{leg}})$
-- **Target Perp Hedge**: $\Delta_{\text{perp}}^{\text{target}} = - \Delta_{\text{options}}$
+- **Current Perpetual Position**: $\Delta_{\text{perp}}$
+- **Target Perpetual Hedge**: $\Delta_{\text{perp}}^{\text{target}} = - \Delta_{\text{options}}$
+- **Net Delta Imbalance**: $\Delta_{\text{net}} = \Delta_{\text{perp}}^{\text{target}} - \Delta_{\text{perp}} = - (\Delta_{\text{options}} + \Delta_{\text{perp}})$
 - **Strict Perp Ratio Cap**: Total perpetual delta must NEVER exceed options delta hedge requirement ($\text{Max Perp Delta} = |\Delta_{\text{options}}| \times 1.0$).
-- **Rebalance Triggers**:
-  - **Standard Rebalance**: $|\Delta_{\text{options}} + \Delta_{\text{perp}}| > 0.05\text{ unit}$ (30s sub-loop check)
-  - **Emergency Market Hedge**: $|\Delta_{\text{options}} + \Delta_{\text{perp}}| > 0.20\text{ unit}$
-- **Limit Price Protection**: Perpetual hedge orders use tight limit price protection capped at **50 bps slippage tolerance** (`max_perp_slippage_bps: 50`).
+
+### 5.2 Hedging Triggers & Execution Bands
+- **Neutral Band ($|\Delta_{\text{net}}| \le 0.05$)**: No rebalance required; portfolio is delta neutral.
+- **Standard Rebalance ($|\Delta_{\text{net}}| > 0.05$)**: Spawn `order_executor` on `derive_perpetual` with `LIMIT_MAKER` or `LIMIT_CHASER` (passive maker order with 1 bp offset and 50 bps slippage limit).
+- **Emergency Band ($|\Delta_{\text{net}}| > 0.20$)**: Immediate hedge execution with `MARKET` or aggressive `LIMIT` on `derive_perpetual` to restore delta neutrality.
+
+### 5.3 Hummingbot Executor Dispatch Specification
+```python
+manage_executors(
+    action="create",
+    executor_type="order_executor",
+    executor_config={
+        "connector_name": "derive_perpetual",
+        "trading_pair": "ETH-USDC",  # or ETH-USDT
+        "side": 1 if delta_imbalance > 0 else 2,  # 1=BUY, 2=SELL
+        "amount": round(abs(delta_imbalance), 3),
+        "execution_strategy": "LIMIT_MAKER",  # Post-only resting maker
+        "price": maker_price,
+        "leverage": 1,
+        "position_action": "OPEN"
+    }
+)
+```
 
 ---
 
-## 6. Multi-Source Credential & Operational Security
-
-- **Credential Resolution Priority**:
-  1. Primary: Ingests `derive_perpetual.yml` or `derive.yml` encrypted connector files from `hummingbot-api` using `GATEWAY_PASSPHRASE` / `CONFIG_PASSWORD`.
-  2. Secondary: Fallback to root `.env` / environment variables (`DERIVE_SMART_CONTRACT_WALLET`, `DERIVE_SESSION_KEY_PRIV`, `DERIVE_SUBACCOUNT_ID`).
-- **Atomic State Persistence**: Writes `.position_state.json` and `.heartbeat.json` atomically via temp files and `os.replace` to eliminate race conditions.
-- **Change-Only Notifications**: Telegram notifications dispatch only on material position or order changes, with a $10^{-4}$ floating-point tolerance filter to eliminate jitter noise.
-
----
-
-## 7. Lifecycle & Profit-Taking Endpoints
+## 6. Options Lifecycle & Profit-Taking Endpoints
 
 1. **Take-Profit (TP)**: Close short body legs when mark value decays by **`60.0%`** of initial collected net credit.
 2. **Stop-Loss (SL)**: Close/derisk structure if position mark loss reaches **`100.0%`** of net collected premium.
 3. **Expiration Target**: Full cash settlement at expiration date (**`14 DTE`**).
 4. **Emergency De-Risking**: Unwinds or hedge-locks positions if volatility regime flips or margin limits are breached.
+5. **Flatten Hedge on Exit**: When options close via TP/SL, perpetual positions are flattened to $0.00$.
 
 ---
 
-## 8. Each Tick Execution & Supervision Instructions
+## 7. Dual-Cadence Supervisory Workflow
 
-On every loop tick (e.g. 60-second supervisory cadence):
+```
+[Macro Cadence: 300s / 5m]
+  │
+  ├─► Options Routine executes surface analysis & GEX cross-check
+  ├─► Strikes matched (30Δ/10Δ single-tenor expiry)
+  ├─► EIP-712 RFQ Multi-Leg Package signed & executed on Derive
+  ├─► TP (60%) / SL (100%) lifecycle checked
+  └─► Emits live Δ_options & hedge_signal to Heartbeat & LiveReport
 
-### Step 1: Run Domain Routine
-Invoke the quantitative execution engine with full dual-cadence parameters:
+[Strategy / Hedging Cadence: Fast 30s / Event-Driven]
+  │
+  ├─► Strategy Agent inspects Δ_options vs current Δ_perp
+  ├─► Computes Net Delta Imbalance Δ_net = - (Δ_options + Δ_perp)
+  ├─► If |Δ_net| > 0.05:
+  │     └─► Calls manage_executors on derive_perpetual (LIMIT_MAKER / LIMIT_CHASER)
+  ├─► Fills & position updates tracked via Hummingbot API
+  └─► Records state, margin utilization %, and delta metrics to Journal
 ```
-manage_routines(
-  action="run",
-  name="derive_volatility_loop_trader",
-  agent="derive_volatility_spread_trader",
-  config={
-    "trading_pair": "ETH-USDT",
-    "poll_interval_seconds": 300,
-    "perp_hedge_interval_seconds": 30,
-    "paper_mode": false,
-    "enable_options_entry": true,
-    "short_delta_target": 0.30,
-    "wing_delta_target": 0.10,
-    "dte": 14,
-    "min_edge": 5.0,
-    "hedge_band": 0.05,
-    "emergency_band": 0.20,
-    "max_margin_utilization_pct": 75.0,
-    "max_perp_delta_hedge_ratio": 1.0,
-    "max_perp_slippage_bps": 50,
-    "target_profit_pct": 60.0,
-    "stop_loss_pct": 100.0,
-    "contract_size": 1.0,
-    "notify_on_change_only": true,
-    "options_route": "RFQ_COMBO_PACKAGE"
-  }
-)
+
+---
+
+## 8. Tick Supervision & Execution Instructions
+
+On every supervisory cycle:
+
+### Step 1: Verify Options Routine & Read Delta Telemetry
+Check the active continuous routine and read the latest heartbeat / LiveReport telemetry:
+```python
+manage_routines(action="list_instances")
 ```
+Read the emitted `options_delta`, `perp_delta`, `delta_imbalance`, and `hedge_signal`.
 
 ### Step 2: Live Portfolio Verification
-Verify subaccount state and positions:
-```
+Verify subaccount balances and perpetual positions from Hummingbot:
+```python
 get_portfolio_overview()
 ```
 
-### Step 3: Journal Reasoning & State
-Record the tick's Margin Utilization %, Net Delta, Derivatives Monkey Consensus status, execution events, and risk metrics into the session journal.
+### Step 3: Delta Imbalance & Hedge Evaluation
+Evaluate the net delta imbalance:
+$$\Delta_{\text{net}} = - (\Delta_{\text{options}} + \Delta_{\text{perp}})$$
+- If $|\Delta_{\text{net}}| \le 0.05$: **Delta Neutral** — no order required.
+- If $|\Delta_{\text{net}}| > 0.05$: **Rebalance Required** — proceed to Step 4.
+
+### Step 4: Execute Perpetual Hedge via Hummingbot
+Dispatch an `order_executor` on `derive_perpetual` to rebalance delta:
+```python
+manage_executors(
+    action="create",
+    executor_type="order_executor",
+    executor_config={
+        "connector_name": "derive_perpetual",
+        "trading_pair": "ETH-USDC",
+        "side": 1 if delta_imbalance > 0 else 2,
+        "amount": round(abs(delta_imbalance), 3),
+        "execution_strategy": "LIMIT_MAKER",
+        "price": maker_price
+    }
+)
+```
+
+### Step 5: Journal State & Risk Metrics
+Record Margin Utilization %, Net Delta ($\Delta_{\text{net}}$), Derivatives Monkey consensus status, options PnL, and executor execution status into the trading session journal via `trading_agent_journal_write`.
+

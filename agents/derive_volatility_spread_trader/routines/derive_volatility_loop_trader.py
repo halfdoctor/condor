@@ -55,6 +55,7 @@ class Config(BaseModel):
     telegram_chat_id: str | None = Field(default=None, description="Telegram Chat ID for real-time vol edge alerts (falls back to ADMIN_USER_ID or TELEGRAM_CHAT_ID in .env)")
     notify_on_change_only: bool = Field(default=True, description="Only dispatch Telegram notification when a position changes or order executes")
     options_route: str = Field(default="RFQ_COMBO_PACKAGE", description="Primary options execution route (RFQ_COMBO_PACKAGE or ORDERBOOK_SEQUENTIAL)")
+    hedge_execution_mode: str = Field(default="STRATEGY_EXECUTOR", description="Perpetual hedge routing mode: 'STRATEGY_EXECUTOR' (Hybrid Architecture: emits real-time delta signals for Hummingbot manage_executors) or 'DIRECT_ROUTINE' (direct resting maker limit orders via Derive API)")
     smart_contract_wallet: str | None = Field(default=None, description="Derive Smart Contract Wallet address (falls back to DERIVE_SMART_CONTRACT_WALLET in .env)")
     session_key_priv: str | None = Field(default=None, description="Derive Session Key private key (falls back to DERIVE_SESSION_KEY_PRIV in .env)")
     subaccount_id: int | None = Field(default=None, description="Derive Subaccount ID (falls back to DERIVE_SUBACCOUNT_ID in .env)")
@@ -934,12 +935,16 @@ async def execute_perp_rebalance(
     min_order_size: float,
     context: ContextTypes.DEFAULT_TYPE | None = None
 ) -> tuple[float, str, str, bool]:
-    """Execute fast perpetual delta rebalance using passive Maker limit orders (0.01% offset with Post-Only and 30s cancellation of unfilled orders)."""
-    from derive_action_signing import SignedAction, TradeModuleData, utils
-    TRADE_MODULE_ADDRESS = "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b"
-    DOMAIN_SEPARATOR = "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b"
-    ACTION_TYPEHASH = "0x4d7a9f27c403ff9c0f19bce61d76d82f9aa29f8d6d4b0c5474607d9770d1af17"
+    """Execute perpetual delta rebalance according to configured hedge_execution_mode:
     
+    1. 'STRATEGY_EXECUTOR' (Default Hybrid Architecture):
+       Calculates net delta imbalance against the options portfolio and emits real-time
+       rebalance signals and telemetry for Hummingbot executors (order_executor on derive_perpetual).
+       Avoids placing conflicting direct exchange orders.
+       
+    2. 'DIRECT_ROUTINE':
+       Directly signs and submits passive Maker GTC limit orders on Derive (/private/order).
+    """
     perp_symbol = f"{symbol}-PERP"
     execution_mode_str = "[PAPER MODE - DRY RUN]" if config.paper_mode else "[LIVE ORDER EXECUTION]"
     target_perp_delta = - live_options_delta
@@ -947,118 +952,134 @@ async def execute_perp_rebalance(
     
     delta_imbalance = target_perp_delta - live_perp_delta
     hedge_action_status = f"DELTA NEUTRAL (|Imbalance| {abs(delta_imbalance):.4f} <= {config.hedge_band:.2f})"
-    perp_order_summary = "None (Aligned with Options Delta Hedge Cap)"
+    perp_order_summary = f"None (Delta Neutral | Imbalance: {delta_imbalance:+.4f} {symbol})"
     rebalanced = False
 
     if spot_price <= 0.0:
         logger.warning(f"execute_perp_rebalance: Invalid spot price (${spot_price}); skipping rebalance.")
         return live_perp_delta, hedge_action_status, perp_order_summary, False
     
-    # 0. Clean Cancellation: Cancel any existing open resting orders on perp_symbol before evaluating / placing new maker orders
-    if not config.paper_mode and auth_headers and subaccount_id:
-        try:
-            await http_client.post(
-                "https://api.lyra.finance/private/cancel_all",
-                json={"subaccount_id": subaccount_id, "instrument_name": perp_symbol},
-                headers=auth_headers,
-                timeout=4.0
-            )
-        except Exception as e_can:
-            logger.debug(f"Cancel existing perp open orders failed/skipped: {e_can}")
-    
     is_overhedged = live_perp_delta > (max_allowed_perp_delta + 0.05) or live_perp_delta < (-max_allowed_perp_delta - 0.05)
     maker_offset = 0.0001  # 0.01% (1 basis point offset from mark price for maker posting)
     
-    if is_overhedged or abs(delta_imbalance) > config.hedge_band:
+    rebalance_needed = is_overhedged or abs(delta_imbalance) > config.hedge_band
+    
+    if rebalance_needed:
         rebalance_size = round(abs(delta_imbalance), size_decimals)
         if rebalance_size >= min_order_size:
             is_sell = delta_imbalance < 0
             side_str = "SELL" if is_sell else "BUY"
-            # Maker price: 0.01% above mark for SELL, 0.01% below mark for BUY
             maker_price = round(spot_price * (1.0 + maker_offset) if is_sell else spot_price * (1.0 - maker_offset), 2)
+            urgency_str = "EMERGENCY" if abs(delta_imbalance) > config.emergency_band else "STANDARD"
             
-            hedge_action_status = f"PERPETUAL MAKER REBALANCE ({side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} @ ${maker_price:,.2f})"
-            perp_order_summary = f"{execution_mode_str} Submit MAKER {side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} @ ${maker_price:,.2f} (Target: {target_perp_delta:+.4f} {symbol})"
-            
-            if not config.paper_mode:
-                if not (session_key_wallet and smart_contract_wallet and subaccount_id):
-                    perp_order_summary += " | Skipped (Credentials missing in .env)"
-                else:
+            if config.hedge_execution_mode == "STRATEGY_EXECUTOR":
+                # HYBRID ARCHITECTURE: Emit rebalance signal for Hummingbot manage_executors
+                hedge_action_status = f"SIGNAL: REBALANCE REQUIRED ({side_str} {rebalance_size:.{size_decimals}f} {symbol}-USDC @ ${maker_price:,.2f} | {urgency_str})"
+                perp_order_summary = f"[HYBRID SIGNAL] Target: {target_perp_delta:+.4f} {symbol} | Imbalance: {delta_imbalance:+.4f} | Recommended: {side_str} {rebalance_size:.{size_decimals}f} {symbol}-USDC on derive_perpetual"
+                rebalanced = True
+                return live_perp_delta, hedge_action_status, perp_order_summary, rebalanced
+                
+            else:
+                # DIRECT ROUTINE MODE: Direct REST order placement on Derive
+                # 0. Clean Cancellation: Cancel existing open resting orders on perp_symbol before placing new maker orders
+                if not config.paper_mode and auth_headers and subaccount_id:
                     try:
-                        trade_data = TradeModuleData(
-                            asset_address=inst_perp_info.get("base_asset_address", "0x0000000000000000000000000000000000000000"),
-                            sub_id=int(inst_perp_info.get("base_asset_sub_id", 0)),
-                            limit_price=Decimal(str(maker_price)),
-                            amount=Decimal(str(rebalance_size)),
-                            max_fee=Decimal("100"),
-                            recipient_id=subaccount_id,
-                            is_bid=not is_sell
-                        )
-                        action = SignedAction(
-                            subaccount_id=subaccount_id,
-                            owner=smart_contract_wallet,
-                            signer=session_key_wallet.address,
-                            signature_expiry_sec=utils.MAX_INT_32,
-                            nonce=utils.get_action_nonce(),
-                            module_address=TRADE_MODULE_ADDRESS,
-                            module_data=trade_data,
-                            DOMAIN_SEPARATOR=DOMAIN_SEPARATOR,
-                            ACTION_TYPEHASH=ACTION_TYPEHASH,
-                        )
-                        action.sign(session_key_wallet.key)
-                        
-                        order_resp = await http_client.post(
-                            "https://api.lyra.finance/private/order",
-                            json={
-                                **action.to_json(),
-                                "instrument_name": perp_symbol,
-                                "direction": "sell" if is_sell else "buy",
-                                "order_type": "limit",
-                                "post_only": True,
-                                "reduce_only": False,
-                                "time_in_force": "gtc",
-                                "label": "fast-rebalance-perp-maker"
-                            },
+                        await http_client.post(
+                            "https://api.lyra.finance/private/cancel_all",
+                            json={"subaccount_id": subaccount_id, "instrument_name": perp_symbol},
                             headers=auth_headers,
-                            timeout=5.0
+                            timeout=4.0
                         )
-                        order_json = order_resp.json()
-                        res_order = order_json.get("result", {})
-                        order_obj = res_order.get("order", {})
-                        ord_status = order_obj.get("order_status")
-                        
-                        if ord_status == "filled":
-                            avg_px = float(order_obj.get("average_price") or maker_price)
-                            perp_order_summary += f" | MAKER FILLED @ ${avg_px:,.2f}"
-                            live_perp_delta += (-rebalance_size if is_sell else rebalance_size)
-                            rebalanced = True
-                        elif ord_status == "open":
-                            perp_order_summary += f" | MAKER POSTED @ ${maker_price:,.2f} (Resting GTC | Post-Only)"
-                            rebalanced = True
-                        elif "error" in order_json:
-                            err_info = order_json.get("error", {})
-                            err_msg = err_info.get("message", str(err_info)) if isinstance(err_info, dict) else str(err_info)
-                            perp_order_summary += f" | Rejected: {err_msg}"
-                            logger.warning(f"Perp maker order rejected by Derive: {err_msg}")
-                        else:
-                            perp_order_summary += f" | Order Status: {ord_status or 'Submitted'}"
-                            rebalanced = True
-                    except Exception as e:
-                        logger.error(f"Perp maker rebalance execution error: {e}", exc_info=True)
-                        perp_order_summary += f" | Error: {e}"
-                        if not config.paper_mode:
-                            await send_telegram_error_alert(
-                                context=context,
-                                chat_id=config.telegram_chat_id,
-                                error_title="PERPETUAL MAKER REBALANCE ERROR",
-                                error=e,
-                                cycle_number="Maker Rebalance Execution",
-                                cycle_type="Perp Order",
-                                pair=config.trading_pair,
-                                client=http_client,
-                                extra_info=f"Perpetual maker rebalance order failed for {perp_symbol} ({side_str} {rebalance_size} {symbol} @ ${maker_price})",
-                                throttle_seconds=30.0
+                    except Exception as e_can:
+                        logger.debug(f"Cancel existing perp open orders failed/skipped: {e_can}")
+
+                hedge_action_status = f"PERPETUAL MAKER REBALANCE ({side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} @ ${maker_price:,.2f})"
+                perp_order_summary = f"{execution_mode_str} Submit MAKER {side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} @ ${maker_price:,.2f} (Target: {target_perp_delta:+.4f} {symbol})"
+                
+                if not config.paper_mode:
+                    if not (session_key_wallet and smart_contract_wallet and subaccount_id):
+                        perp_order_summary += " | Skipped (Credentials missing in .env)"
+                    else:
+                        from derive_action_signing import SignedAction, TradeModuleData, utils
+                        TRADE_MODULE_ADDRESS = "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b"
+                        DOMAIN_SEPARATOR = "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b"
+                        ACTION_TYPEHASH = "0x4d7a9f27c403ff9c0f19bce61d76d82f9aa29f8d6d4b0c5474607d9770d1af17"
+
+                        try:
+                            trade_data = TradeModuleData(
+                                asset_address=inst_perp_info.get("base_asset_address", "0x0000000000000000000000000000000000000000"),
+                                sub_id=int(inst_perp_info.get("base_asset_sub_id", 0)),
+                                limit_price=Decimal(str(maker_price)),
+                                amount=Decimal(str(rebalance_size)),
+                                max_fee=Decimal("100"),
+                                recipient_id=subaccount_id,
+                                is_bid=not is_sell
                             )
+                            action = SignedAction(
+                                subaccount_id=subaccount_id,
+                                owner=smart_contract_wallet,
+                                signer=session_key_wallet.address,
+                                signature_expiry_sec=utils.MAX_INT_32,
+                                nonce=utils.get_action_nonce(),
+                                module_address=TRADE_MODULE_ADDRESS,
+                                module_data=trade_data,
+                                DOMAIN_SEPARATOR=DOMAIN_SEPARATOR,
+                                ACTION_TYPEHASH=ACTION_TYPEHASH,
+                            )
+                            action.sign(session_key_wallet.key)
+                            
+                            order_resp = await http_client.post(
+                                "https://api.lyra.finance/private/order",
+                                json={
+                                    **action.to_json(),
+                                    "instrument_name": perp_symbol,
+                                    "direction": "sell" if is_sell else "buy",
+                                    "order_type": "limit",
+                                    "post_only": True,
+                                    "reduce_only": False,
+                                    "time_in_force": "gtc",
+                                    "label": "fast-rebalance-perp-maker"
+                                },
+                                headers=auth_headers,
+                                timeout=5.0
+                            )
+                            order_json = order_resp.json()
+                            res_order = order_json.get("result", {})
+                            order_obj = res_order.get("order", {})
+                            ord_status = order_obj.get("order_status")
+                            
+                            if ord_status == "filled":
+                                avg_px = float(order_obj.get("average_price") or maker_price)
+                                perp_order_summary += f" | MAKER FILLED @ ${avg_px:,.2f}"
+                                live_perp_delta += (-rebalance_size if is_sell else rebalance_size)
+                                rebalanced = True
+                            elif ord_status == "open":
+                                perp_order_summary += f" | MAKER POSTED @ ${maker_price:,.2f} (Resting GTC | Post-Only)"
+                                rebalanced = True
+                            elif "error" in order_json:
+                                err_info = order_json.get("error", {})
+                                err_msg = err_info.get("message", str(err_info)) if isinstance(err_info, dict) else str(err_info)
+                                perp_order_summary += f" | Rejected: {err_msg}"
+                                logger.warning(f"Perp maker order rejected by Derive: {err_msg}")
+                            else:
+                                perp_order_summary += f" | Order Status: {ord_status or 'Submitted'}"
+                                rebalanced = True
+                        except Exception as e:
+                            logger.error(f"Perp maker rebalance execution error: {e}", exc_info=True)
+                            perp_order_summary += f" | Error: {e}"
+                            if not config.paper_mode:
+                                await send_telegram_error_alert(
+                                    context=context,
+                                    chat_id=config.telegram_chat_id,
+                                    error_title="PERPETUAL MAKER REBALANCE ERROR",
+                                    error=e,
+                                    cycle_number="Maker Rebalance Execution",
+                                    cycle_type="Perp Order",
+                                    pair=config.trading_pair,
+                                    client=http_client,
+                                    extra_info=f"Perpetual maker rebalance order failed for {perp_symbol} ({side_str} {rebalance_size} {symbol} @ ${maker_price})",
+                                    throttle_seconds=30.0
+                                )
 
     return live_perp_delta, hedge_action_status, perp_order_summary, rebalanced
 
@@ -1844,11 +1865,19 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
             "Status": "IDLE (TELEGRAM SKIPPED)"
         })
 
-    # Save Heartbeat for external Watchdog Monitor
+    # Save Heartbeat for external Watchdog Monitor & Strategy Agent
+    delta_imbalance_val = round(target_perp_delta - live_perp_delta, 4)
+    is_overhedged = live_perp_delta > (max_allowed_perp_delta + 0.05) or live_perp_delta < (-max_allowed_perp_delta - 0.05)
+    rebalance_needed_flag = is_overhedged or abs(delta_imbalance_val) > config.hedge_band
+    hedge_urgency_val = "EMERGENCY" if abs(delta_imbalance_val) > config.emergency_band else ("STANDARD" if rebalance_needed_flag else "NONE")
+    hedge_side_val = "SELL" if delta_imbalance_val < 0 else "BUY"
+    hedge_size_val = round(abs(delta_imbalance_val), size_decimals)
+    
     save_heartbeat({
         "trading_pair": config.trading_pair,
         "operating_mode": strategy_operating_mode,
         "enable_options_entry": config.enable_options_entry,
+        "hedge_execution_mode": config.hedge_execution_mode,
         "derivatives_monkey_strategy": dm_strategy,
         "derivatives_monkey_confidence": dm_confidence,
         "derivatives_monkey_allowed": dm_short_vol_allowed,
@@ -1866,6 +1895,8 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         "collateral": collateral,
         "options_delta": live_options_delta,
         "perp_delta": live_perp_delta,
+        "delta_imbalance": delta_imbalance_val,
+        "target_perp_delta": target_perp_delta,
         "entry_credit_usd": entry_credit_usd,
         "unrealized_pnl": unrealized_pnl,
         "profit_captured_pct": profit_captured_pct,
@@ -1873,6 +1904,21 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         "mark_data_reliable": mark_data_reliable,
         "options_status": options_execution_status,
         "perp_action": perp_order_summary,
+        "hedge_signal": {
+            "rebalance_required": rebalance_needed_flag,
+            "urgency": hedge_urgency_val,
+            "side": hedge_side_val if rebalance_needed_flag else "NONE",
+            "amount": hedge_size_val if rebalance_needed_flag else 0.0,
+            "limit_price": round(spot_price * (1.0 + 0.0001) if hedge_side_val == "SELL" else spot_price * (1.0 - 0.0001), 2) if rebalance_needed_flag else 0.0,
+            "connector_name": "derive_perpetual",
+            "trading_pair": f"{symbol}-USDC",
+            "options_delta": live_options_delta,
+            "perp_delta": live_perp_delta,
+            "target_perp_delta": target_perp_delta,
+            "delta_imbalance": delta_imbalance_val,
+            "hedge_band": config.hedge_band,
+            "emergency_band": config.emergency_band
+        },
         "subaccount_id": subaccount_id,
         "status": "healthy"
     })
@@ -1921,11 +1967,13 @@ async def execute_cycle(config: Config, context: ContextTypes.DEFAULT_TYPE, http
         "section_03": {
             "Aggregate Options Delta": f"{live_options_delta:+.4f} {symbol}",
             "Current Perpetual Delta": f"{live_perp_delta:+.4f} {symbol}",
+            "Net Delta Imbalance": f"{delta_imbalance_val:+.4f} {symbol}",
             "Target Perpetual Hedge": f"{target_perp_delta:+.4f} {symbol}",
             "Max Allowed Perp Cap": f"{max_allowed_perp_delta:+.4f} {symbol}",
+            "Hybrid Architecture Mode": f"{config.hedge_execution_mode}",
             "Perp Slippage Cap": f"{config.max_perp_slippage_bps} bps (0.50%)",
-            "Rehedge Sub-Loop": f"{config.perp_hedge_interval_seconds}s Fast Cadence",
-            "Delta Rebalance Order": perp_order_summary,
+            "Sub-Loop Telemetry": f"{config.perp_hedge_interval_seconds}s Fast Greek Telemetry",
+            "Delta Rebalance Action": perp_order_summary,
             "Hedge Compliance Status": hedge_action_status,
         }
     }
@@ -2116,18 +2164,54 @@ async def execute_fast_perp_hedge_cycle(
             "Margin Utilization": cached_metrics.get("section_01", {}).get("Margin Utilization", "-"),
             "Options Delta": f"{updated_options_delta:+.4f} {symbol}",
             "Perp Delta": f"{live_perp_delta:+.4f} {symbol}",
-            "Status": "FILLED & DELIVERED"
+            "Status": "SIGNAL EMITTED" if config.hedge_execution_mode == "STRATEGY_EXECUTOR" else "FILLED & DELIVERED"
         })
 
-    # Update cached metrics
+    # Update cached metrics & Heartbeat
+    delta_imb_fast = round((-updated_options_delta) - live_perp_delta, 4)
     if "section_02" in cached_metrics:
         cached_metrics["section_02"][f"{symbol} Spot Price"] = f"${spot_price:,.2f}"
-    if "section_03" in cached_metrics:
-        cached_metrics["section_03"]["Aggregate Options Delta"] = f"{updated_options_delta:+.4f} {symbol}"
-        cached_metrics["section_03"]["Current Perpetual Delta"] = f"{live_perp_delta:+.4f} {symbol}"
-        cached_metrics["section_03"]["Target Perpetual Hedge"] = f"{-updated_options_delta:+.4f} {symbol}"
-        cached_metrics["section_03"]["Delta Rebalance Order"] = perp_order_summary
-        cached_metrics["section_03"]["Hedge Compliance Status"] = hedge_action_status
+    
+    if "section_03" not in cached_metrics:
+        cached_metrics["section_03"] = {}
+    cached_metrics["section_03"]["Aggregate Options Delta"] = f"{updated_options_delta:+.4f} {symbol}"
+    cached_metrics["section_03"]["Current Perpetual Delta"] = f"{live_perp_delta:+.4f} {symbol}"
+    cached_metrics["section_03"]["Net Delta Imbalance"] = f"{delta_imb_fast:+.4f} {symbol}"
+    cached_metrics["section_03"]["Target Perpetual Hedge"] = f"{-updated_options_delta:+.4f} {symbol}"
+    cached_metrics["section_03"]["Hybrid Architecture Mode"] = f"{config.hedge_execution_mode}"
+    cached_metrics["section_03"]["Delta Rebalance Action"] = perp_order_summary
+    cached_metrics["section_03"]["Hedge Compliance Status"] = hedge_action_status
+
+    # Fast heartbeat emission
+    save_heartbeat({
+        "trading_pair": config.trading_pair,
+        "operating_mode": "AUTONOMOUS (ENTRY + HEDGE)" if config.enable_options_entry else "HEDGE-ONLY",
+        "enable_options_entry": config.enable_options_entry,
+        "hedge_execution_mode": config.hedge_execution_mode,
+        "spot_price": spot_price,
+        "options_delta": updated_options_delta,
+        "perp_delta": live_perp_delta,
+        "delta_imbalance": delta_imb_fast,
+        "target_perp_delta": round(-updated_options_delta, 4),
+        "perp_action": perp_order_summary,
+        "hedge_signal": {
+            "rebalance_required": abs(delta_imb_fast) > config.hedge_band,
+            "urgency": "EMERGENCY" if abs(delta_imb_fast) > config.emergency_band else ("STANDARD" if abs(delta_imb_fast) > config.hedge_band else "NONE"),
+            "side": "SELL" if delta_imb_fast < 0 else "BUY",
+            "amount": round(abs(delta_imb_fast), size_decimals),
+            "limit_price": round(spot_price * (1.0 + 0.0001) if delta_imb_fast < 0 else spot_price * (1.0 - 0.0001), 2) if abs(delta_imb_fast) > config.hedge_band else 0.0,
+            "connector_name": "derive_perpetual",
+            "trading_pair": f"{symbol}-USDC",
+            "options_delta": updated_options_delta,
+            "perp_delta": live_perp_delta,
+            "target_perp_delta": round(-updated_options_delta, 4),
+            "delta_imbalance": delta_imb_fast,
+            "hedge_band": config.hedge_band,
+            "emergency_band": config.emergency_band
+        },
+        "subaccount_id": subaccount_id,
+        "status": "healthy"
+    })
 
     return cached_metrics, display_table, alerts_log, rebalanced
 
@@ -2139,7 +2223,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
     report = LiveReport(
         "Derive Autonomous Volatility Loop Trader",
         source_name="derive_volatility_loop_trader",
-        tags=["derive", "options", "continuous", "derivatives_monkey_consensus", "target_delta_selection", "dual_cadence_30s_hedge", "hedge_only_mode", "tight_slippage_50bps", "multi_tick_rfq", "non_blocking_async", "atomic_writes", "delta_cap", "take_profit", "telegram"],
+        tags=["derive", "options", "continuous", "hybrid_architecture", "derivatives_monkey_consensus", "target_delta_selection", "dual_cadence_30s_hedge", "hedge_only_mode", "tight_slippage_50bps", "multi_tick_rfq", "non_blocking_async", "atomic_writes", "delta_cap", "take_profit", "telegram"],
         auto_refresh_seconds=30,
     )
 
@@ -2264,7 +2348,7 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
                         for k, v in cached_metrics.get("section_02", {}).items():
                             report.builder.kpi(k, v)
 
-                        report.builder.section("03 / DECOUPLED PERPETUAL DELTA HEDGE (30S SUB-LOOP)", "Continuous Rebalancing Against Gamma Drift")
+                        report.builder.section("03 / HYBRID ARCHITECTURE — OPTIONS DELTA & HEDGE TELEMETRY", "Continuous Greek Emission & Perpetual Rebalance Signals for Hummingbot Executors")
                         for k, v in cached_metrics.get("section_03", {}).items():
                             report.builder.kpi(k, v)
 
