@@ -24,8 +24,8 @@ async def call_main_api(
     """
     from condor.runtime.timeouts import TIMEOUTS
     from condor.web.auth import create_jwt
-    from utils.config import WEB_PORT
     from config_manager import get_config_manager
+    from utils.config import WEB_PORT
 
     if timeout is None:
         timeout = TIMEOUTS.mcp_call
