@@ -24,10 +24,12 @@ from condor.acp.client import (
     ToolCallEvent,
     ToolCallUpdate,
     fold_tool_call_event,
-    resolve_acp,
 )
-from condor.acp.pydantic_ai_client import PydanticAIClient, is_pydantic_ai_model
+from condor.acp.pydantic_ai_client import PydanticAIClient
+from condor.runtime import toolsets
 from condor.runtime.registry_file import LoopState
+from condor.runtime.timeouts import resolve_tick_timeout
+from condor.telemetry import taps as telemetry_taps
 
 from .agent import Agent
 from .journal import JournalManager, next_experiment_number, next_session_number
@@ -106,10 +108,12 @@ class TickEngine:
     _last_tick_at: float = field(default=0.0, init=False)
     _last_error: str = field(default="", init=False)
     _last_skill_data: dict[str, Any] = field(default_factory=dict, init=False)
-    _pending_directives: list[str] = field(default_factory=list, init=False)
     _cached_routines_section: str | None = field(default=None, init=False, repr=False)
     _adoption_done: bool = field(default=False, init=False, repr=False)
     _mode_mismatch_noted: bool = field(default=False, init=False, repr=False)
+    # Why the loop ended, for the strategy_run telemetry event: "user" unless
+    # something in the loop set it first.
+    _last_stop_reason: str = field(default="user", init=False, repr=False)
     # Session canvas + live report (FEAT-036). Both None for experiments, which
     # keep no journal and therefore no narrative to render.
     _session_report: "SessionReport | None" = field(
@@ -168,8 +172,6 @@ class TickEngine:
 
             self.journal = JournalManager(
                 self.agent_id,
-                strategy_name=self.strategy.name,
-                strategy_description=self.strategy.description,
                 session_dir=self.session_dir,
                 agent_dir=strategy_dir,
             )
@@ -202,6 +204,7 @@ class TickEngine:
                 self.strategy.slug,
                 self.session_num,
                 frequency_sec=self.config.get("frequency_sec", 60),
+                owner_id=self.user_id,
             )
 
         risk_limits = RiskLimits.from_dict(self.config.get("risk_limits", {}))
@@ -261,6 +264,13 @@ class TickEngine:
         # from there; the gap in between belongs to no session, which is the truth.
         if self.ledger is not None:
             self.ledger.release()
+        # Shape of the session for telemetry (FEAT-023): mode, cadence and tick
+        # count. Never the playbook, the journal, the pairs or the positions.
+        telemetry_taps.strategy_run(
+            self.config,
+            ticks=getattr(self.journal, "tick_count", 0) or 0,
+            stopped_by=self._last_stop_reason,
+        )
         if self.journal:
             self.journal.close()
         _supervisor().unregister(self.agent_id, LoopState.STOPPED)
@@ -282,6 +292,7 @@ class TickEngine:
         if self._shutting_down:
             return
         self._shutting_down = True
+        self._last_stop_reason = "shutdown"
         # Halt the loop so no next/concurrent tick fights the winddown.
         self._running = False
         self._paused = True
@@ -338,18 +349,9 @@ class TickEngine:
         self._paused = False
         _supervisor().record(self, LoopState.RUNNING)
 
-    def inject_directive(self, text: str) -> None:
-        """Queue a user directive to be included in the next tick's prompt."""
-        self._pending_directives.append(text)
-        log.info("TickEngine %s: directive queued: %s", self.agent_id, text[:80])
-
     @property
     def is_running(self) -> bool:
         return self._running and self._task is not None and not self._task.done()
-
-    @property
-    def is_paused(self) -> bool:
-        return self._paused
 
     @property
     def status(self) -> str:
@@ -380,6 +382,16 @@ class TickEngine:
                         self.journal.append_error(str(e))
                     await self._notify(f"Agent {self.agent_id} tick error: {e}")
 
+                # A shutdown that started *inside* the tick (the hard risk
+                # kill-switch) already ran its winddown, wrote the terminal
+                # state and unregistered this run — it only returns here
+                # because it must not cancel its own task. Recording a tick
+                # now would rewrite state=running over that STOPPED, and the
+                # next boot would read a live run to reconcile and possibly
+                # restart the very strategy the risk engine just wound down.
+                if self._shutting_down or not self._running:
+                    return
+
                 # Record the tick we just finished. A tiny atomic write, so if
                 # the process dies mid-sleep the boot pass can say which tick
                 # this run reached instead of guessing.
@@ -394,6 +406,7 @@ class TickEngine:
                         label,
                     )
                     await self._notify(f"Agent {self.agent_id}: {label} complete.")
+                    self._last_stop_reason = "complete"
                     self._running = False
                     _supervisor().unregister(self.agent_id, LoopState.COMPLETED)
                     return
@@ -409,6 +422,7 @@ class TickEngine:
                     await self._notify(
                         f"Agent {self.agent_id}: completed {max_ticks} ticks (max_ticks limit)."
                     )
+                    self._last_stop_reason = "max_ticks"
                     self._running = False
                     self.journal.close()
                     _supervisor().unregister(self.agent_id, LoopState.COMPLETED)
@@ -490,12 +504,13 @@ class TickEngine:
             return
 
         if risk_state.is_blocked and not self.is_experiment:
-            self.journal.append_action(
-                self.journal.tick_count + 1,
-                "tick_blocked",
-                risk_state.block_reason,
-            )
-            self.journal.record_tick("blocked: " + risk_state.block_reason)
+            with self.journal.batch():
+                self.journal.append_action(
+                    self.journal.tick_count + 1,
+                    "tick_blocked",
+                    risk_state.block_reason,
+                )
+                self.journal.record_tick("blocked: " + risk_state.block_reason)
             await self._notify(
                 f"Agent {self.agent_id} blocked: {risk_state.block_reason}"
             )
@@ -571,14 +586,8 @@ class TickEngine:
             canvas_nudge=canvas_nudge,
         )
 
-        # Inject pending user directives
-        if self._pending_directives:
-            directives = "\n".join(f"- {d}" for d in self._pending_directives)
-            prompt += f"\n\nUSER DIRECTIVES (apply these on this tick):\n{directives}"
-            self._pending_directives.clear()
-
         # 6. Create a fresh agent client per tick (clean context window)
-        acp_client = await self._create_client(risk_state)
+        acp_client = await self._create_client(risk_state, client)
         self._active_client = acp_client
 
         response_chunks: list[str] = []
@@ -586,8 +595,15 @@ class TickEngine:
         tool_call_map: dict[str, dict[str, Any]] = {}
 
         await acp_client.start()
+        # Wall-clock budget for this tick's agent session. Comes from the shared
+        # policy (10 min default, CONDOR_TIMEOUT_TICK_DEFAULT) unless the run
+        # config sets ``tick_timeout_sec`` -- a slower model or a tick that does
+        # real research needs more room than a quoting loop does.
+        tick_timeout = resolve_tick_timeout(
+            execution_mode=mode, strategy=self.config.get("tick_timeout_sec")
+        )
         try:
-            async with asyncio.timeout(300):
+            async with asyncio.timeout(tick_timeout):
                 async for event in self._collect_stream(acp_client, prompt):
                     if isinstance(event, TextChunk):
                         response_chunks.append(event.text)
@@ -596,7 +612,11 @@ class TickEngine:
                         if new_tc is not None:
                             tool_calls.append(new_tc)
         except asyncio.TimeoutError:
-            log.warning("TickEngine %s: ACP prompt timed out", self.agent_id)
+            log.warning(
+                "TickEngine %s: ACP prompt timed out after %ds",
+                self.agent_id,
+                tick_timeout,
+            )
             response_chunks.append("(timed out)")
         finally:
             await acp_client.stop()
@@ -635,24 +655,40 @@ class TickEngine:
                 len(response_text),
             )
         else:
-            # Sessions: full journal tracking
-            tick_num = self.journal.record_tick(
-                response_summary=response_text[:500],
-            )
+            # Sessions: full journal tracking. Every journal.md update of this
+            # tick goes into one batch, so the file is rewritten once instead of
+            # three-to-five times (PERF-136).
+            with self.journal.batch():
+                tick_num = self.journal.record_tick(
+                    response_summary=response_text[:500],
+                )
 
-            self._journal_ownership_violations(tick_num)
-            self._journal_mode_mismatch(tick_num)
+                self._journal_ownership_violations(tick_num)
+                self._journal_mode_mismatch(tick_num)
 
-            skill_pnl = self._last_skill_data.get("total_pnl", 0.0)
-            skill_volume = self._last_skill_data.get("total_volume", 0.0)
-            skill_executors = len(self._last_skill_data.get("executors", []))
-            skill_exposure = self._last_skill_data.get("total_exposure", 0.0)
-            self.journal.record_snapshot(
-                total_pnl=skill_pnl,
-                total_volume=skill_volume,
-                open_count=skill_executors,
-                position_size=skill_exposure,
-            )
+                skill_pnl = self._last_skill_data.get("total_pnl", 0.0)
+                skill_volume = self._last_skill_data.get("total_volume", 0.0)
+                skill_executors = len(self._last_skill_data.get("executors", []))
+                skill_exposure = self._last_skill_data.get("total_exposure", 0.0)
+                self.journal.record_snapshot(
+                    total_pnl=skill_pnl,
+                    total_volume=skill_volume,
+                    open_count=skill_executors,
+                    position_size=skill_exposure,
+                )
+
+                action_brief = (
+                    response_text[:100].replace("\n", " ")
+                    if response_text
+                    else "No response"
+                )
+                self.journal.write_summary(
+                    tick=tick_num,
+                    status="Running",
+                    pnl=skill_pnl,
+                    open_count=skill_executors,
+                    last_action=action_brief,
+                )
 
             self.journal.save_full_snapshot(
                 tick=tick_num,
@@ -663,19 +699,6 @@ class TickEngine:
                 executors_data=executors_summary,
                 risk_state=risk_state.to_dict(),
                 duration=tick_duration,
-            )
-
-            action_brief = (
-                response_text[:100].replace("\n", " ")
-                if response_text
-                else "No response"
-            )
-            self.journal.write_summary(
-                tick=tick_num,
-                status="Running",
-                pnl=skill_pnl,
-                open_count=skill_executors,
-                last_action=action_brief,
             )
 
             # Live session report (FEAT-036). Deterministic render over data we
@@ -835,7 +858,7 @@ class TickEngine:
     # ------------------------------------------------------------------
 
     async def _create_client(
-        self, risk_state: RiskState
+        self, risk_state: RiskState, price_client: Any
     ) -> "ACPClient | PydanticAIClient":
         """Build an ACP or PydanticAI client (does NOT start it).
 
@@ -843,15 +866,10 @@ class TickEngine:
         (it only feeds the auto-approve callback and cannot change between the
         two points), avoiding a redundant per-tick journal re-parse.
         """
-        from handlers.agents._shared import (
-            build_mcp_servers_for_session,
-            get_project_dir,
-        )
-
         mode = self.config.get("execution_mode", "loop")
 
         # A configured server pins the toolset; None falls back to the chat's.
-        mcp_servers = build_mcp_servers_for_session(
+        mcp_servers = toolsets.build_mcp_servers_for_session(
             self.user_id,
             self.chat_id,
             server_name=self.config.get("server_name"),
@@ -863,49 +881,24 @@ class TickEngine:
             execution_mode=mode,
             ledger=self.ledger,
             agent_id=self.agent_id,
+            price_client=price_client,
         )
 
-        agent_key = self._agent_key()
-        use_pydantic_ai = is_pydantic_ai_model(agent_key)
+        # Shared factory (ARCH-192). Engine specifics: an explicit model_base_url
+        # in the run config still wins over the owner's saved custom endpoint,
+        # and the run config's tool_filter_mode beats the env fallback. Same
+        # allowlist the agent gets on consult; empty => unrestricted.
+        from condor.runtime.llm_client import build_llm_client
 
-        if use_pydantic_ai:
-            import os
-
-            from condor.preferences import resolve_custom_endpoint
-
-            # A custom endpoint's URL/key come from the owner's saved endpoints;
-            # an explicit model_base_url in the run config still wins.
-            custom_url, api_key = resolve_custom_endpoint(
-                agent_key, user_id=self.user_id
-            )
-            base_url = self.config.get("model_base_url") or custom_url or None
-            tool_filter_mode = (
-                self.config.get("tool_filter_mode")
-                or os.environ.get("PYDANTIC_AI_TOOL_FILTER")
-                or None
-            )
-            return PydanticAIClient(
-                model=agent_key,
-                mcp_servers=mcp_servers,
-                permission_callback=permission_cb,
-                base_url=base_url,
-                api_key=api_key,
-                tool_filter_mode=tool_filter_mode,
-                # Same allowlist the agent gets on consult; empty => unrestricted.
-                allowed_tools=self.agent.tools or None,
-            )
-        else:
-            # Supports a Claude model suffix, e.g. "claude-acp:opus" — selected via
-            # session/set_model after handshake (the bridge ignores ANTHROPIC_MODEL).
-            agent_cmd, model_env, model_pref = resolve_acp(agent_key)
-            return ACPClient(
-                command=agent_cmd,
-                working_dir=get_project_dir(),
-                mcp_servers=mcp_servers,
-                permission_callback=permission_cb,
-                extra_env=model_env or None,
-                model=model_pref or None,
-            )
+        return build_llm_client(
+            self._agent_key(),
+            mcp_servers=mcp_servers,
+            permission_callback=permission_cb,
+            allowed_tools=self.agent.tools or None,
+            user_id=self.user_id,
+            base_url_override=self.config.get("model_base_url") or None,
+            tool_filter_mode=self.config.get("tool_filter_mode"),
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -920,15 +913,42 @@ class TickEngine:
         )
 
     def _resolve_server(self) -> tuple[str | None, dict | None]:
-        """Resolve the server for this agent."""
+        """Resolve the server for this run, keyed on ``user_id`` (SEC-164).
+
+        Every candidate — the configured name, the subject's own default, the
+        accessible list — is held to the same bar here: the server must exist
+        *and* ``user_id`` must be able to reach it. Two properties fall out of
+        checking it at resolution rather than only at start:
+
+        * the run never inherits identity it was handed. ``chat_id`` arrives
+          from the request body, so resolving through ``get_effective_server``
+          on *it* let a caller name a chat they do not own and pick up that
+          chat's default server, with no server name for the start gate
+          (SEC-149) to check. The subject's own default is keyed by user id
+          anyway, both on the web (``set_chat_default_server(user.id, ...)``)
+          and in a private Telegram chat, where chat id == user id.
+        * a name that matched nothing at start stays unusable. The loop is
+          long-running, so a configured ``server_name`` that resolved to
+          nothing — the ``"local"`` ``AgentConfig`` fills in, typically — must
+          not silently bind to whatever another user creates under that name
+          later.
+
+        Falls back to the subject's accessible servers, as before, so a run
+        with no server configured still works.
+        """
         from config_manager import get_config_manager, get_effective_server
 
         cm = get_config_manager()
-        server_name = self.config.get("server_name")
 
-        if not server_name:
-            server_name = get_effective_server(self.chat_id)
-        if not server_name:
+        def usable(name: str | None) -> bool:
+            return bool(name and cm.get_server(name)) and cm.has_server_access(
+                self.user_id, name
+            )
+
+        server_name = self.config.get("server_name")
+        if not usable(server_name):
+            server_name = get_effective_server(self.user_id)
+        if not usable(server_name):
             accessible = cm.get_accessible_servers(self.user_id)
             server_name = accessible[0] if accessible else None
         if not server_name:
@@ -942,10 +962,18 @@ class TickEngine:
         try:
             server_name, server = self._resolve_server()
             if not server:
-                from handlers.bots._shared import get_bots_client
-
-                client, _ = await get_bots_client(self.chat_id)
-                return client
+                # Nothing to fall back to: ``_resolve_server`` already tried
+                # every server this run's subject may use, so the only servers
+                # left are other people's. ``get_bots_client(self.chat_id)``
+                # used to stand here — it ignores the chat id for server
+                # selection and, with no ``user_data`` to scope it, picks the
+                # first *globally* enabled server instead (SEC-164).
+                log.warning(
+                    "Agent %s: no accessible server for user %s, no API client",
+                    self.agent_id,
+                    self.user_id,
+                )
+                return None
 
             from config_manager import get_config_manager
 
@@ -1002,6 +1030,10 @@ class TickEngine:
             "close_type_counts": sd.get("close_type_counts", {}),
             "fees_known": sd.get("fees_known", True),
             "frequency_sec": self.config.get("frequency_sec", 60),
+            "tick_timeout_sec": resolve_tick_timeout(
+                execution_mode=self.config.get("execution_mode", "loop"),
+                strategy=self.config.get("tick_timeout_sec"),
+            ),
             "server_name": self.config.get("server_name", ""),
             "total_amount_quote": self.config.get("total_amount_quote", 100),
             "trading_context": self.config.get("trading_context", ""),

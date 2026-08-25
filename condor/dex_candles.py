@@ -32,14 +32,10 @@ logger = logging.getLogger(__name__)
 # apart from a plain ticker like "BTC".
 ADDRESS_RE = re.compile(r"^(0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})$")
 
-# GeckoTerminal answers are shared across users, so one process-wide dict backs the
-# OHLCV cache for every dashboard viewer.
-_ohlcv_cache: dict = {}
-
 
 def uses_gecko_candles(connector: str) -> bool:
     """Whether this connector's candles come from GeckoTerminal, not the API."""
-    from handlers.dex.pool_data import NETWORK_TO_GECKO
+    from condor.pool_data import NETWORK_TO_GECKO
 
     return connector in NETWORK_TO_GECKO
 
@@ -62,7 +58,7 @@ async def _pool_ohlcv(
     use_cache: bool = True,
 ) -> list:
     """Raw OHLCV rows for one pool, or [] on any miss. Never raises."""
-    from handlers.dex.pool_data import fetch_ohlcv
+    from condor.pool_data import fetch_ohlcv
 
     try:
         rows, err = await fetch_ohlcv(
@@ -72,9 +68,10 @@ async def _pool_ohlcv(
             # Prices in the quote token, matching the scale of the entry and range
             # prices the executor overlays draw on the same chart.
             currency="token",
-            # A live poll wants the newest candle, and the shared cache holds a
-            # pool for five minutes — long enough to freeze a streaming chart.
-            user_data=_ohlcv_cache if use_cache else None,
+            # A live poll wants the newest candle, and pool_data's shared cache
+            # holds a pool for five minutes — long enough to freeze a streaming
+            # chart — so use_cache=False bypasses the cached copy.
+            use_cache=use_cache,
             limit=limit,
             before_timestamp=before_timestamp,
             token=token,
@@ -98,7 +95,7 @@ async def _resolve_pool(connector: str, trading_pair: str) -> tuple[str, str]:
     ticker pair on a network whose bases are addresses, for instance, where a
     lookup would only spend a request to fail.
     """
-    from handlers.dex.pool_data import (
+    from condor.pool_data import (
         fetch_pair_top_pool,
         fetch_token_top_pool,
         uses_symbol_pairs,
@@ -141,11 +138,7 @@ async def fetch_dex_candles(
     Returns candle dicts (``timestamp``/``open``/``high``/``low``/``close``/
     ``volume``), ascending.
     """
-    from handlers.dex.pool_data import (
-        candles_needed,
-        normalize_timeframe,
-        timeframe_seconds,
-    )
+    from condor.pool_data import candles_needed, normalize_timeframe, timeframe_seconds
 
     timeframe = normalize_timeframe(interval)
     tf_seconds = timeframe_seconds(timeframe)

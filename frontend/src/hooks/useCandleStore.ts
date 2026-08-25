@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { CandleData } from "@/lib/api";
-import { candleStore } from "@/lib/candle-store";
+import { candleChannelKey, candleStore } from "@/lib/candle-store";
 
 /** Staleness thresholds by interval category */
 const STALE_THRESHOLD_SUB_1H_MS = 30_000; // 30s for intervals < 1h
@@ -25,15 +25,20 @@ export function useCandleStore(
   connector: string,
   pair: string,
   interval: string,
+  /**
+   * Pin the stream to one DEX pool. A gateway pair like `SOL-USDC` exists in
+   * dozens of pools, and without this the backend charts whichever one it judges
+   * deepest — which is exactly the guess the DEX page exists to overturn. Omitted
+   * (every CLOB chart) the channel keeps its five segments, byte for byte.
+   */
+  poolAddress?: string,
 ): {
   candles: CandleData[];
   isStale: boolean;
   mergeCandles: (c: CandleData[]) => void;
   setDuration: (seconds: number) => void;
 } {
-  const key = server
-    ? `candles:${server}:${connector}:${pair}:${interval}`
-    : "";
+  const key = server ? candleChannelKey(server, connector, pair, interval, poolAddress) : "";
 
   const [candles, setCandles] = useState<CandleData[]>([]);
   const [isStale, setIsStale] = useState(false);

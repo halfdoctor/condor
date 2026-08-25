@@ -544,11 +544,11 @@ def _run_create_session(monkeypatch, *, chat_id, user_id):
     from condor.runtime import sessions as session_module
 
     monkeypatch.setattr(session_module, "_sessions", {})
-    monkeypatch.setattr(session_module, "ACPClient", _FakeACPClient)
+    monkeypatch.setattr("condor.acp.client.ACPClient", _FakeACPClient)
     monkeypatch.setattr(session_module, "build_initial_context", lambda *a, **k: "")
     # Resolved through condor.runtime.binding now, so patch it at the source.
     monkeypatch.setattr(
-        "handlers.agents._shared.build_mcp_servers_for_session", lambda *a, **k: []
+        "condor.runtime.toolsets.build_mcp_servers_for_session", lambda *a, **k: []
     )
     _FakeACPClient.last_extra_env = None
     spec = SessionSpec(
@@ -649,8 +649,7 @@ def test_consult_denies_server_without_access(monkeypatch):
 
     monkeypatch.setattr(consult_module, "run_consult", _fail_run_consult)
     monkeypatch.setattr(
-        config_manager,
-        "get_config_manager",
+        "condor.web.auth.get_config_manager",
         lambda: SimpleNamespace(has_server_access=lambda uid, name: False),
     )
 
@@ -679,8 +678,7 @@ def test_consult_forces_caller_user_id(monkeypatch):
 
     monkeypatch.setattr(consult_module, "run_consult", _capture_run_consult)
     monkeypatch.setattr(
-        config_manager,
-        "get_config_manager",
+        "condor.web.auth.get_config_manager",
         lambda: SimpleNamespace(has_server_access=lambda uid, name: True),
     )
 
@@ -745,6 +743,11 @@ def test_numeric_credentials_reach_the_subprocess_as_strings(monkeypatch):
                 "username": 999,
                 "password": 123,
             }
+
+        def has_server_access(self, user_id, server_name, *args, **kwargs):
+            # SEC-178: the resolver holds every candidate to reach, not just
+            # existence. This double owns the server it hands out.
+            return True
 
     monkeypatch.setattr(
         config_manager, "get_config_manager", lambda: _NumericPasswordServer()

@@ -15,13 +15,24 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 from condor.persistence import SafePicklePersistence
+from condor.telemetry import taps as telemetry_taps
 from handlers import cancel_command, clear_all_input_states
 from utils.auth import restricted
-from utils.config import TELEGRAM_TOKEN, WEB_PORT, WEB_URL
+from utils.config import (
+    LOCAL_MODE,
+    TELEGRAM_TOKEN,
+    WEB_HOST,
+    WEB_PORT,
+    WEB_URL,
+    ConfigError,
+    check_local_user,
+    check_startup_config,
+)
 
 # Enable logging
 logging.basicConfig(
@@ -301,6 +312,13 @@ def register_handlers(application: Application) -> None:
     # Clear existing handlers
     application.handlers.clear()
 
+    # Usage telemetry observer (FEAT-023). PTB dispatches every update to every
+    # group, so one handler in group -1 sees every command and every callback
+    # without touching a single handler below. It only reads — it must never
+    # call into @restricted, or observing would become an authorization side
+    # effect — and it is a no-op unless the admin opted in.
+    application.add_handler(TypeHandler(Update, telemetry_taps.telegram_tap), group=-1)
+
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("portfolio", portfolio_command))
@@ -376,6 +394,16 @@ def register_handlers(application: Application) -> None:
 
     application.add_handler(
         CallbackQueryHandler(admin_callback_handler, pattern="^admin:")
+    )
+
+    # Telemetry consent prompt (FEAT-023): three buttons, admin only
+    from condor.telemetry import prompt as telemetry_prompt
+
+    application.add_handler(
+        CallbackQueryHandler(
+            telemetry_prompt.callback_handler,
+            pattern=f"^{telemetry_prompt.CALLBACK_PREFIX}:",
+        )
     )
 
     # Add callback query handler for portfolio settings
@@ -497,6 +525,8 @@ async def _notify_interrupted_runs(bot, report) -> None:
     One summary per chat rather than a message per run: a crash with several
     live loops would otherwise spam the user at the worst possible moment.
     """
+    from condor.notifications import NotifyBot
+
     by_chat: dict[int, list] = {}
     for run in report.interrupted:
         status = None
@@ -515,10 +545,42 @@ async def _notify_interrupted_runs(bot, report) -> None:
         for run in runs:
             suffix = " — restarted" if run.restarted else ""
             lines.append(f"• {run.label} (last tick {run.last_tick}){suffix}")
+        text = "\n".join(lines)
         try:
-            await bot.send_message(chat_id=chat_id, text="\n".join(lines))
+            await bot.send_message(chat_id=chat_id, text=text)
         except Exception:
             logger.warning("Could not notify chat %s about interrupted runs", chat_id)
+        # And on the bell (FEAT-048). A private chat id is the owner's user id;
+        # ``record`` ignores anything that is not one, so a group summary is
+        # simply not filed anywhere. Skipped when the sender above *is* the bell
+        # (local mode, FEAT-049): it already filed exactly this text.
+        if isinstance(bot, NotifyBot):
+            continue
+        try:
+            from condor.notifications import record, user_for_chat
+
+            owner = user_for_chat(chat_id)
+            if owner:
+                await record(owner, text, kind="system")
+        except Exception:
+            logger.debug("Could not record interrupted-run notice", exc_info=True)
+
+
+def _outbound_bot(application: Application):
+    """The object this process sends user-facing messages through.
+
+    Telegram mode: the real PTB bot, exactly as before. Local mode: there is no
+    Telegram behind the placeholder token, so outbound messages go to the
+    dashboard bell instead (:class:`condor.notifications.NotifyBot`, FEAT-048).
+    Everything downstream — the routine store, the session health monitor, the
+    interrupted-run summaries — keeps calling ``send_message`` and neither knows
+    nor cares which surface it reached.
+    """
+    if not LOCAL_MODE:
+        return application.bot
+    from condor.notifications import NotifyBot
+
+    return NotifyBot()
 
 
 async def startup(application: Application) -> None:
@@ -541,8 +603,16 @@ async def startup(application: Application) -> None:
 
     asyncio.get_event_loop().run_in_executor(None, _get_model, DEFAULT_MODEL)
 
-    # Register command menus (public + admin overlay)
-    await register_bot_commands(application)
+    # Whatever this process pushes at users from here on. In local mode there is
+    # no Telegram to push to, so it is the dashboard bell (FEAT-048) instead —
+    # which is what keeps the documented "context.bot is never None" contract
+    # true for routines with no bot behind them.
+    outbound_bot = _outbound_bot(application)
+
+    # Register command menus (public + admin overlay). Pure Telegram: there is
+    # no command menu to publish when nothing polls.
+    if not LOCAL_MODE:
+        await register_bot_commands(application)
 
     # Restore scheduled routine jobs from persistence
     from handlers.routines import restore_scheduled_jobs
@@ -552,7 +622,7 @@ async def startup(application: Application) -> None:
     # Inject Telegram bot into routine store so web-triggered routines can send messages
     from condor.routine_store import get_routine_store
 
-    get_routine_store().set_bot(application.bot)
+    get_routine_store().set_bot(outbound_bot)
 
     # Start ServerDataService (unified server-centric cache)
     from condor.server_data_service import get_server_data_service
@@ -569,7 +639,7 @@ async def startup(application: Application) -> None:
     from condor.runtime import sessions as runtime_sessions
     from condor.runtime.confirmations import get_registry
 
-    await runtime_sessions.start_health_monitor(application.bot)
+    await runtime_sessions.start_health_monitor(outbound_bot)
     # Sweeps expired approvals so a request nobody answers is denied, not leaked.
     await get_registry().start()
 
@@ -585,7 +655,7 @@ async def startup(application: Application) -> None:
                 report.total,
                 len(report.restarted),
             )
-            await _notify_interrupted_runs(application.bot, report)
+            await _notify_interrupted_runs(outbound_bot, report)
     except Exception:
         logger.exception("Boot reconciliation failed; continuing startup")
 
@@ -593,6 +663,20 @@ async def startup(application: Application) -> None:
     from handlers.admin.update import schedule_update_checks
 
     schedule_update_checks(application)
+
+    # Usage telemetry (FEAT-023). init() resolves the consent level once so the
+    # taps never read the disk on a hot path, and only materializes the
+    # install's random ids when telemetry is actually on. The jobs are
+    # registered either way and return immediately while consent is absent, so
+    # opting in mid-run works without a restart.
+    from condor import telemetry
+
+    try:
+        level = telemetry.init(hosted=True)
+        telemetry_taps.register_jobs(application)
+        logger.info("Telemetry level: %s", level)
+    except Exception:
+        logger.exception("Telemetry init failed (continuing without it)")
 
     # Start file watcher
     asyncio.create_task(watch_and_reload(application))
@@ -646,6 +730,16 @@ async def teardown(application: Application) -> None:
     from mcp_servers.hummingbot_api.hummingbot_client import hummingbot_client
 
     await hummingbot_client.close()
+
+    # Record the clean exit and give the outbox one last chance. Both are no-ops
+    # unless the admin opted in, and neither can fail the shutdown.
+    try:
+        from condor import telemetry
+
+        telemetry.shutdown("signal")
+        await telemetry.flush("teardown")
+    except Exception:
+        logger.debug("Telemetry teardown failed", exc_info=True)
 
 
 async def watch_and_reload(application: Application) -> None:
@@ -716,9 +810,14 @@ def get_persistence() -> SafePicklePersistence:
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors gracefully."""
     if isinstance(context.error, NetworkError):
+        # Expected and self-healing; reported as an upstream blip, not a bug.
+        telemetry_taps.on_upstream_error("telegram", "poll", "network")
         logger.warning(f"Network error (will retry): {context.error}")
         return
 
+    # Type, a hash of the message, and our own stack frames. Never the message
+    # itself — that is where balances, hostnames and keys leak.
+    telemetry_taps.on_error(context.error, where="telegram", surface="telegram")
     logger.exception("Exception while handling an update:", exc_info=context.error)
 
 
@@ -742,6 +841,19 @@ async def send_to_all(self, message: str, parse_mode: str = "Markdown"):
 
 def main() -> None:
     """Run the bot."""
+    # Refuse to start on a configuration that cannot mean what it says: telegram
+    # mode (the default) with no token used to surface as an InvalidToken
+    # traceback from inside PTB, and must never be quietly read as "local mode".
+    # check_local_user() is the same idea one layer in — local mode logs in with
+    # no password, so who it logs in as is settled here, at boot, and not as a
+    # 500 from /auth/local-login with the browser already open.
+    try:
+        check_startup_config()
+        check_local_user()
+    except ConfigError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(1)
+
     # Reap any ACP/MCP subprocess trees orphaned by a prior hard kill (kill -9,
     # OOM, power loss) before we spawn our own — those bypass teardown().
     try:
@@ -760,9 +872,12 @@ def main() -> None:
     # Create the Application with persistence enabled. No post_init/post_shutdown
     # hooks: they only fire from run_polling/run_webhook, and _run_dual owns the
     # lifecycle — startup() and teardown() are called there, explicitly.
+    # In local mode there is no token and nothing polls; the placeholder exists
+    # only so the Application (and with it job_queue, CallbackContext and the
+    # handler registry) can be built at all. Nothing ever calls Telegram with it.
     application = (
         Application.builder()
-        .token(TELEGRAM_TOKEN)
+        .token(TELEGRAM_TOKEN or "0:local")
         .persistence(persistence)
         .concurrent_updates(True)
         .build()
@@ -789,6 +904,25 @@ def main() -> None:
             exec_restart()  # never returns
 
 
+def _web_server_config(web_app):
+    """uvicorn's config for the dashboard, isolated so the bind address is testable.
+
+    ``WEB_HOST`` is ``0.0.0.0`` in telegram mode (unchanged) and loopback in
+    local mode, where the dashboard has no login at all — see
+    :func:`utils.config.resolve_web_host` for why that is not negotiable by
+    accident.
+    """
+    import uvicorn
+
+    return uvicorn.Config(
+        web_app,
+        host=WEB_HOST,
+        port=WEB_PORT,
+        log_level="info",
+        access_log=False,
+    )
+
+
 async def _run_dual(application: Application) -> None:
     """Run the Telegram bot and FastAPI web server concurrently."""
     import signal
@@ -802,21 +936,24 @@ async def _run_dual(application: Application) -> None:
     # initialize() and start_polling() — the same slot PTB gives post_init — so
     # commands, caches and boot reconciliation are settled before the first
     # update is dispatched.
-    await application.initialize()
-    await startup(application)
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await application.start()
+    #
+    # Local mode skips that lifecycle rather than faking it (FEAT-049): the
+    # Application is built but never initialized, so nothing polls and no handler
+    # can dispatch — the Telegram surface is inert, not mocked. The job queue is
+    # started directly, which is all scheduled routines, update checks and
+    # signals actually need.
+    if LOCAL_MODE:
+        await startup(application)
+        await application.job_queue.start()
+    else:
+        await application.initialize()
+        await startup(application)
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await application.start()
 
     # Create and start the web server
     web_app = create_app()
-    config = uvicorn.Config(
-        web_app,
-        host="0.0.0.0",
-        port=WEB_PORT,
-        log_level="info",
-        access_log=False,
-    )
-    server = uvicorn.Server(config)
+    server = uvicorn.Server(_web_server_config(web_app))
 
     # Start WebSocket manager
     get_ws_manager().start()
@@ -834,14 +971,42 @@ async def _run_dual(application: Application) -> None:
                 get_current_branch(), get_local_commit()
             )
             version = f" ({branch} @ {commit})" if commit else ""
-            await application.bot.send_message(
-                chat_id=int(ADMIN_USER_ID),
-                text=f"Condor is online and ready.{version}",
-            )
+            boot_text = f"Condor is online and ready.{version}"
+            if not LOCAL_MODE:
+                await application.bot.send_message(
+                    chat_id=int(ADMIN_USER_ID),
+                    text=boot_text,
+                )
+            # The same notice on the dashboard bell (FEAT-048), so an admin who
+            # only has the browser open still sees which commit came up.
+            from condor.notifications import record
+
+            await record(int(ADMIN_USER_ID), boot_text, kind="system")
         except Exception as e:
             logger.warning(f"Failed to send startup notification to admin: {e}")
 
-    logger.info("Starting Condor: Telegram bot + web dashboard on port %s", WEB_PORT)
+        # Ask, once, whether this install wants to be counted (FEAT-023). Sent
+        # next to the boot notification because that is the one moment the admin
+        # is already looking. Until it is answered, nothing is collected. The
+        # prompt is a Telegram message with inline buttons, so local mode is
+        # skipped here and asked in the dashboard instead (the consent card in
+        # Settings → Privacy). Either way the install is already counted:
+        # `telemetry.init()` does that at the ping floor, without an answer.
+        if not LOCAL_MODE:
+            from condor.telemetry.prompt import maybe_prompt_admin
+
+            await maybe_prompt_admin(application.bot)
+
+    if LOCAL_MODE:
+        logger.info(
+            "Starting Condor in local mode (no Telegram): dashboard on http://%s:%s",
+            WEB_HOST,
+            WEB_PORT,
+        )
+    else:
+        logger.info(
+            "Starting Condor: Telegram bot + web dashboard on port %s", WEB_PORT
+        )
 
     # Handle shutdown signals
     shutdown_event = asyncio.Event()
@@ -872,12 +1037,22 @@ async def _run_dual(application: Application) -> None:
             logger.exception("Web server crashed during shutdown")
         # Run each step independently so one failure can't skip the rest.
         # teardown() runs last, mirroring where post_shutdown would have sat.
-        for name, step in (
-            ("updater.stop", application.updater.stop),
-            ("application.stop", application.stop),
-            ("application.shutdown", application.shutdown),
-            ("teardown", partial(teardown, application)),
-        ):
+        # Local mode never initialized or started the Application, so the PTB
+        # stop steps would only raise "not running" — it has a job queue to stop
+        # and nothing else.
+        if LOCAL_MODE:
+            steps = (
+                ("job_queue.stop", application.job_queue.stop),
+                ("teardown", partial(teardown, application)),
+            )
+        else:
+            steps = (
+                ("updater.stop", application.updater.stop),
+                ("application.stop", application.stop),
+                ("application.shutdown", application.shutdown),
+                ("teardown", partial(teardown, application)),
+            )
+        for name, step in steps:
             try:
                 await step()
             except Exception:

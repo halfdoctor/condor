@@ -83,6 +83,11 @@ class FakeConfigManager:
     def has_server_access(self, user_id, server_name, *a, **k):
         return server_name in {"local", "prod"}
 
+    # Resolution holds every candidate to existence *and* reach (SEC-178), so
+    # the stub has to answer both halves of the predicate.
+    def get_server(self, name):
+        return {"host": "h", "port": 8000} if name in {"local", "prod"} else None
+
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
@@ -93,10 +98,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(conversations, "_root", lambda: tmp_path / "conversations")
     monkeypatch.setattr(conversations, "_live_recorders", set())
     monkeypatch.setattr(session_module, "_sessions", {})
-    monkeypatch.setattr(session_module, "ACPClient", _Client)
+    monkeypatch.setattr("condor.acp.client.ACPClient", _Client)
     monkeypatch.setattr(session_module, "build_initial_context", lambda *a, **k: "")
     monkeypatch.setattr(
-        "handlers.agents._shared.build_mcp_servers_for_session", lambda *a, **k: []
+        "condor.runtime.toolsets.build_mcp_servers_for_session", lambda *a, **k: []
     )
     monkeypatch.setattr(
         "condor.runtime.binding.agent_identity_context", lambda *a, **k: ""
@@ -106,7 +111,8 @@ def env(tmp_path, monkeypatch):
         "config_manager.get_config_manager", lambda: FakeConfigManager()
     )
     monkeypatch.setattr(session_routes, "get_config_manager", FakeConfigManager)
-    monkeypatch.setattr("handlers.agents._shared.DEFAULT_AGENT", FALLBACK)
+    monkeypatch.setattr("condor.web.auth.get_config_manager", FakeConfigManager)
+    monkeypatch.setattr("condor.llm.options.DEFAULT_AGENT", FALLBACK)
     monkeypatch.setattr("condor.web.routes.chat_ws.DEFAULT_AGENT", FALLBACK)
 
     AgentStore().create(

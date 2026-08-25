@@ -1,8 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   Activity,
   Bot,
   Brain,
+  Bug,
+  Droplets,
   Eye,
   Moon,
   Settings,
@@ -15,18 +17,22 @@ import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import { ConnectKeysOverlay } from "@/components/ConnectKeysOverlay";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { ReportIssueDialog } from "@/components/ReportIssueDialog";
+import { TelemetryConsentBanner } from "@/components/TelemetryConsentBanner";
 import { ChatProvider } from "@/hooks/useChat";
 import { useCredentials } from "@/hooks/useCredentials";
 import { usePrefetchData } from "@/hooks/usePrefetchData";
 import { useServer } from "@/hooks/useServer";
 import { useTheme } from "@/hooks/useTheme";
 import { CurrencySelector } from "./CurrencySelector";
+import { NotificationBell } from "./NotificationBell";
 import { ServerSelector } from "./ServerSelector";
 
 const NAV_ITEMS = [
   { to: "/", icon: Brain, label: "Agents" },
   { to: "/portfolio", icon: Wallet, label: "Portfolio" },
   { to: "/trade", icon: Swords, label: "Trade" },
+  { to: "/dex", icon: Droplets, label: "DEX" },
   { to: "/bots", icon: Bot, label: "Bots" },
   { to: "/executors", icon: Activity, label: "Executors" },
   { to: "/routines", icon: Zap, label: "Routines" },
@@ -54,6 +60,7 @@ function AppShellBody() {
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
   const { hasKeys, isLoading: keysLoading } = useCredentials();
+  const [reportOpen, setReportOpen] = useState(false);
 
   // The chat workspace takes the full height and owns its own scrolling, so
   // the shell drops `main`'s padding for it. It lives at `/` — the entry point
@@ -123,6 +130,20 @@ function AppShellBody() {
           <CurrencySelector />
 
           <div className="flex items-center gap-1">
+            {/* Inside the ChatProvider on purpose: the bell reads the same
+                react-query cache the chat socket pushes live notifications
+                into, and that socket is what makes it update without a
+                reload (FEAT-048). */}
+            <NotificationBell />
+
+            <button
+              onClick={() => setReportOpen(true)}
+              className="rounded p-1.5 text-[var(--color-text-muted)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-accent)]"
+              title="Report an issue"
+            >
+              <Bug className="h-4 w-4" />
+            </button>
+
             <NavLink
               to="/settings"
               className={({ isActive }) =>
@@ -155,6 +176,11 @@ function AppShellBody() {
         </div>
       </header>
 
+      {/* Asks once, for an install that has never answered (FEAT-023). Renders
+          nothing for everyone else, including on the chat workspace, which owns
+          its own scrolling — hence outside `main` rather than inside it. */}
+      <TelemetryConsentBanner />
+
       {/* Main content */}
       <main
         className={`relative flex-1 ${
@@ -166,6 +192,8 @@ function AppShellBody() {
         </ErrorBoundary>
         {showKeysOverlay && <ConnectKeysOverlay />}
       </main>
+
+      <ReportIssueDialog open={reportOpen} onClose={() => setReportOpen(false)} />
     </div>
   );
 }

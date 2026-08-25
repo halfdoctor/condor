@@ -29,10 +29,6 @@ directional/short side this composite needs.)
 **Entry threshold (DEMO MODE):** `|flow_score| >= 0.05`, ANY regime — direction is
 the sign of the flow. If no asset clears 0.05, open the largest-|flow| asset anyway
 (unless all |flow| < 0.02).
-**Options confirmation:** always cross-check the `options_flow` composite before
-sizing — full size when options agree with the flow direction, half size when they
-strongly disagree (|composite| ≥ 0.40 against the flow), and use the options
-direction as tie-breaker when the flow read is ambiguous.
 
 ## Decision matrix (Derive perps)
 

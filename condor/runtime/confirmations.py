@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
+from condor.runtime import danger
 from condor.runtime.timeouts import TIMEOUTS
+from condor.telemetry import taps as telemetry_taps
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +44,12 @@ class ConfirmationStatus(str, Enum):
     APPROVED = "approved"
     DENIED = "denied"
     TIMEOUT = "timeout"
+
+
+def _tool_of(pending: "PendingConfirmation") -> str:
+    """The tool name out of a tool_call payload, for telemetry only."""
+    call = pending.tool_call or {}
+    return str(call.get("name") or call.get("kind") or "unknown")
 
 
 @dataclass
@@ -184,6 +192,9 @@ class ConfirmationRegistry:
         )
         pending.selected_option_id = option_id
         pending._event.set()
+        # Which tool was asked about and what was decided (FEAT-023). Never the
+        # summary, the arguments or who decided.
+        telemetry_taps.confirmation(_tool_of(pending), "allow" if approved else "deny")
         return True
 
     def get(self, confirmation_id: str) -> PendingConfirmation | None:
@@ -236,6 +247,7 @@ class ConfirmationRegistry:
             ):
                 pending.status = ConfirmationStatus.TIMEOUT
                 pending._event.set()  # wake any waiter immediately
+                telemetry_taps.confirmation(_tool_of(pending), "timeout")
             elif pending.status is not ConfirmationStatus.PENDING:
                 # Give the waiter a grace period to read the outcome first.
                 if now - pending.expires_at > CLEANUP_INTERVAL:
@@ -341,21 +353,19 @@ def build_permission_callback(
     async def permission_callback(
         tool_call: dict[str, Any], options: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        from handlers.agents._shared import BLOCKED_TOOLS, is_dangerous_tool_call
-        from handlers.agents.confirmation import format_tool_summary
-
         tool_name = tool_call.get("tool", "") or tool_call.get("title", "")
-        if tool_name in BLOCKED_TOOLS:
+        # Read through the module so a monkeypatched BLOCKED_TOOLS is honored.
+        if tool_name in danger.BLOCKED_TOOLS:
             log.warning("Blocked tool %s for session %s", tool_name, session_key)
             return CANCELLED
 
-        if not is_dangerous_tool_call(tool_call):
+        if not danger.is_dangerous_tool_call(tool_call):
             return _select_allow(options)
 
         pending = _registry.register(
             session_key=session_key,
             user_id=user_id,
-            summary=format_tool_summary(tool_call),
+            summary=danger.format_tool_summary(tool_call),
             origin=describe_origin(session_key),
             tool_call=tool_call,
             options=options,

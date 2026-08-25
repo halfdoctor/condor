@@ -194,14 +194,17 @@ def test_atomic_write_uses_unique_tmp_per_writer(memory_root, monkeypatch):
     target = s.memories_dir / "one.md"
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    orig = Path.write_text
+    # Observed at the rename, not at the write call, so the assertion survives
+    # any change of write mechanism inside condor.fsutil (ARCH-148).
+    import os
 
-    def spy(self, text, *args, **kwargs):
-        if self.name.endswith(".tmp"):
-            seen.append(self.name)
-        return orig(self, text, *args, **kwargs)
+    orig = os.replace
 
-    monkeypatch.setattr(Path, "write_text", spy)
+    def spy(src, dst):
+        seen.append(os.path.basename(src))
+        return orig(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
     _atomic_write(target, "a")
     _atomic_write(target, "b")
 
@@ -215,7 +218,7 @@ def test_concurrent_writers_never_leave_a_torn_file(memory_root):
     # always parse cleanly (frontmatter + body), never a torn/interleaved one.
     import threading
 
-    from condor.memory.store import _parse_frontmatter
+    from condor.frontmatter import parse_frontmatter
 
     s = MemoryStore(user_id=42)
     target = s.memories_dir / "shared.md"
@@ -237,7 +240,7 @@ def test_concurrent_writers_never_leave_a_torn_file(memory_root):
     for t in threads:
         t.join()
 
-    meta, body = _parse_frontmatter(target.read_text())
+    meta, body = parse_frontmatter(target.read_text())
     # The surviving file is exactly one writer's payload, not a blend.
     assert meta.get("name") == "shared"
     assert body == "x" * 5000

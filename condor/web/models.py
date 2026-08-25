@@ -7,16 +7,6 @@ from pydantic import BaseModel
 # ── Auth ──
 
 
-class LoginRequest(BaseModel):
-    id: int
-    first_name: str
-    last_name: str = ""
-    username: str = ""
-    photo_url: str = ""
-    auth_date: int
-    hash: str
-
-
 class LoginResponse(BaseModel):
     token: str
     user: WebUser
@@ -38,6 +28,9 @@ class ServerInfo(BaseModel):
     port: int
     online: bool = False
     permission: str = "trader"
+    # The server this user's commands land on when none is named — the same
+    # `chat_defaults` entry Telegram reads, so both surfaces agree on it.
+    is_default: bool = False
 
 
 # ── Portfolio ──
@@ -468,6 +461,9 @@ class ReportSummary(BaseModel):
     source_name: str = ""
     tags: list[str] = []
     agent: str = ""  # producing assistant/expert (e.g. "condor", "executor_manager")
+    # Authenticated owner stamped at save time (SEC-196); None = legacy/ownerless,
+    # visible to admins only.
+    user_id: int | None = None
 
 
 class ReportsListResponse(BaseModel):
@@ -496,7 +492,7 @@ class UpdateServerRequest(BaseModel):
 class GatewayStartRequest(BaseModel):
     # The Hummingbot API always runs the Gateway secured (TLS + mTLS) and manages the
     # certificates/passphrase itself (hummingbot-api SEC-048), so only image/port are sent.
-    image: str = "hummingbot/gateway:latest"
+    image: str = "hummingbot/gateway:development"
     port: int = 15888
 
 
@@ -506,7 +502,24 @@ class CredentialInfo(BaseModel):
 
 
 class GatewayPullRequest(BaseModel):
-    image: str = "hummingbot/gateway:latest"
+    image: str = "hummingbot/gateway:development"
+
+
+class GatewayNetworkUpdateRequest(BaseModel):
+    # Partial network config (snake_case keys, e.g. {"node_url": "https://..."}).
+    # The Gateway validates values against its own JSON schema.
+    config: dict[str, Any]
+
+
+class GatewayWalletAddRequest(BaseModel):
+    chain: str
+    private_key: str
+    set_default: bool = False
+
+
+class GatewayWalletDefaultRequest(BaseModel):
+    chain: str
+    address: str
 
 
 class AddCredentialRequest(BaseModel):

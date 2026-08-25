@@ -1,29 +1,14 @@
-"""One answer to "can Condor actually run this model right now?".
+"""Moved to :mod:`condor.llm.readiness` (ARCH-190).
 
-Every surface that offers a model — the ``get_available_models`` MCP tool behind
-the agent_builder skill, and the setup wizard (``condor/setup_llm.py``) — asks
-this module, so they can never disagree about what a machine can run. The probes
-source their commands from :data:`condor.acp.ACP_COMMANDS` and their base URLs
-from :data:`condor.acp.pydantic_ai_client.DEFAULT_BASE_URLS`, so adding a
-provider there lights it up here for free.
-
-Three states, never two: a CLI bridge that is installed but whose login cannot be
-proven is ``UNVERIFIED``, not ready and not missing. The login markers below are
-undocumented paths that upstream CLIs may move, so they only ever downgrade a row
-from *ready* to *unverified* — never to *missing*, and never enough to refuse a
-pick.
-
-Read-only and side-effect-free. Never returns a key value, and an unreachable
-local server is a normal state (the user simply isn't running it), reported as
-``MISSING`` with the command that starts it, never raised.
+This alias keeps ``handlers.agents.readiness`` imports (and monkeypatches on
+the module's attributes) pointing at the one real module object.
 """
 
-from __future__ import annotations
-
-import os
-import shutil
-import subprocess
 import sys
+
+from condor.llm import readiness as _impl
+
+sys.modules[__name__] = _impl
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
