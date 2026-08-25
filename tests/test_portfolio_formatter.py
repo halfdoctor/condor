@@ -1,6 +1,7 @@
 """
 Test for format_portfolio_as_table formatting with options contract symbols.
 """
+
 from mcp_servers.hummingbot_api.formatters.portfolio import format_portfolio_as_table
 
 

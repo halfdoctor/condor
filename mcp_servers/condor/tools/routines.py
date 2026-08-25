@@ -279,6 +279,7 @@ def _resolve_active_server() -> str | None:
         return settings.active_server
     try:
         from config_manager import get_config_manager
+
         cm = get_config_manager()
         server = cm.get_chat_default_server(settings.chat_id)
         if server:

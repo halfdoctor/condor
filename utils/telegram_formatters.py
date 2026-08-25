@@ -775,7 +775,11 @@ def format_portfolio_overview(
 
                 # Sort tokens by absolute value descending
                 sorted_tokens = sorted(
-                    [b for b in connector_balances if abs(b.get("value", 0)) >= 0.01 or b.get("units", 0) != 0],
+                    [
+                        b
+                        for b in connector_balances
+                        if abs(b.get("value", 0)) >= 0.01 or b.get("units", 0) != 0
+                    ],
                     key=lambda x: abs(x.get("value", 0)),
                     reverse=True,
                 )

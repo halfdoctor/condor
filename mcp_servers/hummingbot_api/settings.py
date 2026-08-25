@@ -51,9 +51,16 @@ def _load_server_config() -> ServerConfig:
             if local_server:
                 return ServerConfig(
                     name="local",
-                    url=os.getenv("HUMMINGBOT_API_URL", f"http://{local_server.get('host', 'localhost')}:{local_server.get('port', 8000)}"),
-                    username=os.getenv("HUMMINGBOT_USERNAME", local_server.get("username", "admin")),
-                    password=os.getenv("HUMMINGBOT_PASSWORD", local_server.get("password", "admin")),
+                    url=os.getenv(
+                        "HUMMINGBOT_API_URL",
+                        f"http://{local_server.get('host', 'localhost')}:{local_server.get('port', 8000)}",
+                    ),
+                    username=os.getenv(
+                        "HUMMINGBOT_USERNAME", local_server.get("username", "admin")
+                    ),
+                    password=os.getenv(
+                        "HUMMINGBOT_PASSWORD", local_server.get("password", "admin")
+                    ),
                 )
         except Exception:
             pass

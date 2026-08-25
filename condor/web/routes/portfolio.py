@@ -113,7 +113,9 @@ async def get_portfolio(
                     connector_total += usd_val
 
                 # Filter out zero-value tokens and sort by absolute value descending
-                balances = [b for b in balances if abs(b.usd_value) >= 0.01 or abs(b.total) > 0]
+                balances = [
+                    b for b in balances if abs(b.usd_value) >= 0.01 or abs(b.total) > 0
+                ]
                 balances.sort(key=lambda b: abs(b.usd_value), reverse=True)
 
                 connectors.append(
@@ -188,8 +190,12 @@ def _dedupe_derive_unified(connectors: list[ConnectorBalance]) -> None:
         spot_b = spot_by_token.get(b.token)
         if spot_b is not None:
             # Check if units or USD values match within 1% (or float precision delta)
-            units_match = abs(b.total - spot_b.total) <= max(1e-4, 0.01 * abs(spot_b.total))
-            usd_match = abs(b.usd_value - spot_b.usd_value) <= max(0.1, 0.01 * max(abs(spot_b.usd_value), abs(b.usd_value)))
+            units_match = abs(b.total - spot_b.total) <= max(
+                1e-4, 0.01 * abs(spot_b.total)
+            )
+            usd_match = abs(b.usd_value - spot_b.usd_value) <= max(
+                0.1, 0.01 * max(abs(spot_b.usd_value), abs(b.usd_value))
+            )
             if units_match or usd_match:
                 dropped_any = True
                 continue
@@ -198,9 +204,7 @@ def _dedupe_derive_unified(connectors: list[ConnectorBalance]) -> None:
     if dropped_any:
         perp.balances = deduped_balances
         perp.total_usd = sum(b.usd_value for b in perp.balances)
-        perp.note = (
-            "Unified account — balance is reflected in the derive balance."
-        )
+        perp.note = "Unified account — balance is reflected in the derive balance."
 
 
 @router.get(
@@ -415,10 +419,16 @@ def _dedupe_snapshot_connectors(account_data: dict[str, Any]) -> dict[str, Any]:
                     spot_item = spot_by_token.get(token)
                     if spot_item is not None:
                         u1 = float(item.get("units", item.get("total_balance", 0)))
-                        u2 = float(spot_item.get("units", spot_item.get("total_balance", 0)))
+                        u2 = float(
+                            spot_item.get("units", spot_item.get("total_balance", 0))
+                        )
                         v1 = float(item.get("value", item.get("usd_value", 0)))
-                        v2 = float(spot_item.get("value", spot_item.get("usd_value", 0)))
-                        if abs(u1 - u2) <= max(1e-4, 0.01 * abs(u2)) or abs(v1 - v2) <= max(0.1, 0.01 * max(abs(v1), abs(v2))):
+                        v2 = float(
+                            spot_item.get("value", spot_item.get("usd_value", 0))
+                        )
+                        if abs(u1 - u2) <= max(1e-4, 0.01 * abs(u2)) or abs(
+                            v1 - v2
+                        ) <= max(0.1, 0.01 * max(abs(v1), abs(v2))):
                             continue
                 cleaned_perp.append(item)
             connectors["derive_perpetual"] = cleaned_perp
@@ -431,17 +441,25 @@ def _dedupe_snapshot_connectors(account_data: dict[str, Any]) -> dict[str, Any]:
             spot_stables = sum(
                 float(item.get("value", item.get("usd_value", 0)))
                 for item in spot_list
-                if isinstance(item, dict) and item.get("token", item.get("asset", "")) in _HL_STABLES
+                if isinstance(item, dict)
+                and item.get("token", item.get("asset", "")) in _HL_STABLES
             )
             perp_stables = sum(
                 float(item.get("value", item.get("usd_value", 0)))
                 for item in perp_list
-                if isinstance(item, dict) and item.get("token", item.get("asset", "")) in _HL_STABLES
+                if isinstance(item, dict)
+                and item.get("token", item.get("asset", "")) in _HL_STABLES
             )
-            if spot_stables > 0 and perp_stables > 0 and abs(perp_stables - spot_stables) <= max(0.01, 0.01 * spot_stables):
+            if (
+                spot_stables > 0
+                and perp_stables > 0
+                and abs(perp_stables - spot_stables) <= max(0.01, 0.01 * spot_stables)
+            ):
                 connectors["hyperliquid_perpetual"] = [
-                    item for item in perp_list
-                    if isinstance(item, dict) and item.get("token", item.get("asset", "")) not in _HL_STABLES
+                    item
+                    for item in perp_list
+                    if isinstance(item, dict)
+                    and item.get("token", item.get("asset", "")) not in _HL_STABLES
                 ]
 
     return connectors
@@ -461,7 +479,13 @@ def _extract_token_values(data: object) -> dict[str, float]:
                         if isinstance(item, dict):
                             token = item.get("token", item.get("asset", ""))
                             usd = float(item.get("value", item.get("usd_value", 0)))
-                            if token and (usd != 0 or float(item.get("units", item.get("total_balance", 0))) != 0):
+                            if token and (
+                                usd != 0
+                                or float(
+                                    item.get("units", item.get("total_balance", 0))
+                                )
+                                != 0
+                            ):
                                 tokens[token] = tokens.get(token, 0) + usd
     return tokens
 

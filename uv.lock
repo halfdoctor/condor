@@ -640,7 +640,6 @@ requires-dist = [
     { name = "faster-whisper" },
     { name = "geckoterminal-py" },
     { name = "hummingbot-api-client", specifier = "==1.5.7" },
-    { name = "isort", marker = "extra == 'dev'" },
     { name = "kaleido" },
     { name = "markdown", specifier = ">=3.10.2" },
     { name = "matplotlib", specifier = ">=3.10.8" },

@@ -273,6 +273,7 @@ def resolve_acp(agent_key: str) -> tuple[str, dict[str, str], str]:
         model_pref = model
     elif base == "gemini":
         from pathlib import Path
+
         home = Path.home()
         paths = []
         bun_bin = home / ".bun" / "bin"
@@ -284,11 +285,19 @@ def resolve_acp(agent_key: str) -> tuple[str, dict[str, str], str]:
             env["AGY_BIN"] = str(local_bin / "agy")
         if paths:
             existing_path = os.environ.get("PATH", "")
-            env["PATH"] = os.pathsep.join(paths + [existing_path]) if existing_path else os.pathsep.join(paths)
+            env["PATH"] = (
+                os.pathsep.join(paths + [existing_path])
+                if existing_path
+                else os.pathsep.join(paths)
+            )
         # Add the workspace root to PYTHONPATH so that the agent's scratch scripts can import mcp_servers
         workspace_root = str(Path.cwd().resolve())
         existing_pythonpath = os.environ.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = os.pathsep.join([workspace_root, existing_pythonpath]) if existing_pythonpath else workspace_root
+        env["PYTHONPATH"] = (
+            os.pathsep.join([workspace_root, existing_pythonpath])
+            if existing_pythonpath
+            else workspace_root
+        )
     return command, env, model_pref
 
 
@@ -538,9 +547,14 @@ class ACPClient:
                     },
                     self._process.stdin,
                 )
-                log.info("ACP session %s permission mode configured to bypassPermissions", self._session_id)
+                log.info(
+                    "ACP session %s permission mode configured to bypassPermissions",
+                    self._session_id,
+                )
             except Exception:
-                log.exception("ACP session/set_config_option failed to set permissionMode")
+                log.exception(
+                    "ACP session/set_config_option failed to set permissionMode"
+                )
 
     async def _select_model(self, model_state: dict) -> None:
         """Resolve ``self.model`` against advertised models and set it via ACP.
@@ -913,7 +927,12 @@ class ACPClient:
         **kw: Any,
     ) -> dict[str, Any]:
         options = options or []
-        log.warning("ACP REQUEST PERMISSION: sessionId=%s, toolCall=%s, options=%s", sessionId, toolCall, options)
+        log.warning(
+            "ACP REQUEST PERMISSION: sessionId=%s, toolCall=%s, options=%s",
+            sessionId,
+            toolCall,
+            options,
+        )
 
         # If we have a permission callback, delegate to it. The wire shape is
         # translated first (SEC-093) so the gate sees the arguments it decides
