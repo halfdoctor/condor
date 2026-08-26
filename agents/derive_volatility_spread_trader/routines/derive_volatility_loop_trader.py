@@ -372,13 +372,16 @@ def resolve_perp_trading_pair(
 async def fetch_external_perp_position(
     context: Any, connector_name: str, trading_pair: str
 ) -> float | None:
-    """Query open perpetual position for trading_pair on external connector via Hummingbot client."""
-    if not context or "derive" in connector_name.lower():
-        return None
+    """Query open perpetual position for trading_pair on connector via Hummingbot client."""
     try:
         from config_manager import get_client
 
-        chat_id = context._chat_id if hasattr(context, "_chat_id") else None
+        chat_id = (
+            getattr(context, "_chat_id", None)
+            or getattr(context, "chat_id", None)
+            if context
+            else None
+        )
         client = await get_client(chat_id, context=context)
         if client:
             res = await client.trading.get_open_positions()
@@ -390,7 +393,11 @@ async def fetch_external_perp_position(
             for p in positions_data:
                 p_conn = str(p.get("connector_name", "")).lower()
                 p_pair = str(p.get("trading_pair", "")).upper()
-                if connector_name.lower() in p_conn and trading_pair.upper() == p_pair:
+                c_norm = connector_name.lower().replace("_", "").replace("-", "")
+                pc_norm = p_conn.replace("_", "").replace("-", "")
+                if (
+                    c_norm in pc_norm or pc_norm in c_norm
+                ) and trading_pair.upper() == p_pair:
                     amt = float(p.get("amount", 0.0))
                     return amt
     except Exception as e:
@@ -1400,13 +1407,14 @@ async def execute_perp_rebalance(
 ) -> tuple[float, str, str, bool]:
     """Execute perpetual delta rebalance according to configured hedge_execution_mode:
 
-    1. 'STRATEGY_EXECUTOR' (Default Hybrid Architecture):
-       Calculates net delta imbalance against the options portfolio and emits real-time
-       rebalance signals and telemetry for Hummingbot executors (order_executor on perp_connector).
-       Avoids placing conflicting direct exchange orders.
+    1. 'STRATEGY_EXECUTOR' / 'HUMMINGBOT_API' / 'EXECUTOR' (Default Hybrid Architecture):
+       Calculates net delta imbalance against the options portfolio and dispatches an automated
+       Hummingbot order_executor across configured perp_connector (derive_perpetual, hyperliquid_perpetual,
+       binance_perpetual, bybit_perpetual, okx_perpetual, etc.).
+       Falls back to direct Derive REST API if Hummingbot client is unavailable.
 
     2. 'DIRECT_ROUTINE':
-       Directly signs and submits passive Maker GTC limit orders on Derive (/private/order).
+       Directly signs and submits resting Maker GTC limit orders on Derive (/private/order).
     """
     perp_symbol = f"{symbol}-PERP"
     target_perp_symbol = resolve_perp_trading_pair(
@@ -1443,10 +1451,13 @@ async def execute_perp_rebalance(
     rebalance_needed = is_overhedged or abs(delta_imbalance) > config.hedge_band
 
     if rebalance_needed:
-        rebalance_size = round(abs(delta_imbalance), size_decimals)
+        # Ensure executable lot size by rounding to max(min_order_size, amount)
+        raw_rebalance_size = round(abs(delta_imbalance), size_decimals)
+        rebalance_size = max(min_order_size, raw_rebalance_size)
         if rebalance_size >= min_order_size:
             is_sell = delta_imbalance < 0
             side_str = "SELL" if is_sell else "BUY"
+            side_int = 2 if is_sell else 1
             maker_price = round(
                 (
                     spot_price * (1.0 + maker_offset)
@@ -1461,10 +1472,11 @@ async def execute_perp_rebalance(
                 else "STANDARD"
             )
 
-            if config.hedge_execution_mode == "STRATEGY_EXECUTOR":
-                # HYBRID ARCHITECTURE: Emit rebalance signal for Hummingbot manage_executors across configured perp connector
-                hedge_action_status = f"SIGNAL: REBALANCE REQUIRED ({side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} @ ${maker_price:,.2f} on {config.perp_connector} | {urgency_str})"
-                perp_order_summary = f"[HYBRID SIGNAL] Target: {target_perp_delta:+.4f} {symbol} | Imbalance: {delta_imbalance:+.4f} | Recommended: {side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} on {config.perp_connector}"
+            # Paper mode handling
+            if config.paper_mode:
+                hedge_action_status = f"[PAPER] SIMULATED REBALANCE ({side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} @ ${maker_price:,.2f} on {config.perp_connector} | {urgency_str})"
+                perp_order_summary = f"[PAPER MODE] Simulated {side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} (Target: {target_perp_delta:+.4f} {symbol})"
+                live_perp_delta += -rebalance_size if is_sell else rebalance_size
                 rebalanced = True
                 return (
                     live_perp_delta,
@@ -1473,141 +1485,285 @@ async def execute_perp_rebalance(
                     rebalanced,
                 )
 
-            else:
-                # DIRECT ROUTINE MODE: Direct REST order placement on Derive
-                # 0. Clean Cancellation: Cancel existing open resting orders on perp_symbol before placing new maker orders
-                if not config.paper_mode and auth_headers and subaccount_id:
+            # LIVE EXECUTION MODE
+            use_hummingbot_executor = config.hedge_execution_mode in (
+                "STRATEGY_EXECUTOR",
+                "HUMMINGBOT_API",
+                "EXECUTOR",
+            )
+
+            hb_client = None
+            if use_hummingbot_executor:
+                try:
+                    from config_manager import get_client
+
+                    chat_id = (
+                        getattr(context, "_chat_id", None)
+                        or getattr(context, "chat_id", None)
+                        if context
+                        else None
+                    )
+                    hb_client = await get_client(chat_id, context=context)
+                except Exception as e_cl:
+                    logger.debug(f"Failed to get Hummingbot client: {e_cl}")
+
+            if use_hummingbot_executor and hb_client:
+                # 1. Check if an active order_executor is already running on this connector & pair
+                active_running_executor = None
+                try:
+                    search_res = await hb_client.executors.search_executors(
+                        connector_names=[config.perp_connector],
+                        trading_pairs=[target_perp_symbol],
+                        status="RUNNING",
+                        limit=5,
+                    )
+                    exec_data = (
+                        search_res.get("data", [])
+                        if isinstance(search_res, dict)
+                        else (search_res if isinstance(search_res, list) else [])
+                    )
+                    for ex in exec_data:
+                        if ex.get("is_active") or str(ex.get("status", "")).upper() == "RUNNING":
+                            active_running_executor = ex
+                            break
+                except Exception as e_s:
+                    logger.debug(f"Error checking active running executors: {e_s}")
+
+                if active_running_executor:
+                    ex_id = active_running_executor.get("executor_id") or active_running_executor.get("id")
+                    hedge_action_status = f"EXECUTOR ACTIVE ({side_str} IN PROGRESS | ID: {str(ex_id)[:8]}...)"
+                    perp_order_summary = f"Waiting on active executor {ex_id} on {config.perp_connector}"
+                    return (
+                        live_perp_delta,
+                        hedge_action_status,
+                        perp_order_summary,
+                        False,
+                    )
+
+                # 2. Dispatch new order_executor on configured perpetual connector
+                exec_strategy = "MARKET" if urgency_str == "EMERGENCY" else "LIMIT_MAKER"
+                executor_config = {
+                    "type": "order_executor",
+                    "connector_name": config.perp_connector,
+                    "trading_pair": target_perp_symbol,
+                    "side": side_int,
+                    "amount": rebalance_size,
+                    "execution_strategy": exec_strategy,
+                    "price": maker_price if exec_strategy in ("LIMIT", "LIMIT_MAKER") else None,
+                    "leverage": 1,
+                    "position_action": "OPEN",
+                }
+
+                created_executor = None
+                try:
+                    created_executor = await hb_client.executors.create_executor(
+                        executor_config=executor_config,
+                        account_name="master_account",
+                        controller_id="derive_volatility_loop_trader",
+                    )
+                except Exception as e_create:
+                    logger.warning(
+                        f"Failed to create {exec_strategy} executor on {config.perp_connector}: {e_create}. Trying fallback..."
+                    )
+                    # If LIMIT_MAKER was rejected (e.g. crossing orderbook), retry with LIMIT
+                    if exec_strategy == "LIMIT_MAKER":
+                        try:
+                            executor_config["execution_strategy"] = "LIMIT"
+                            created_executor = await hb_client.executors.create_executor(
+                                executor_config=executor_config,
+                                account_name="master_account",
+                                controller_id="derive_volatility_loop_trader",
+                            )
+                        except Exception as e_retry:
+                            logger.error(f"Fallback LIMIT executor creation failed: {e_retry}")
+
+                if created_executor and isinstance(created_executor, dict):
+                    ex_id = created_executor.get("executor_id") or created_executor.get("id") or "created"
+                    await asyncio.sleep(1.0)
+                    ex_detail = None
                     try:
-                        await http_client.post(
-                            "https://api.lyra.finance/private/cancel_all",
-                            json={
-                                "subaccount_id": subaccount_id,
-                                "instrument_name": perp_symbol,
-                            },
-                            headers=auth_headers,
-                            timeout=4.0,
+                        ex_detail = await hb_client.executors.get_executor(executor_id=ex_id)
+                    except Exception:
+                        pass
+
+                    is_terminated_error = False
+                    if ex_detail and isinstance(ex_detail, dict):
+                        ex_status = str(ex_detail.get("status", "")).upper()
+                        close_type = str(ex_detail.get("close_type", "")).upper()
+                        last_err = ex_detail.get("last_error") or ""
+                        c_info = ex_detail.get("custom_info") or {}
+                        fill_amt = float(
+                            c_info.get("executed_amount_base")
+                            or ex_detail.get("executed_amount_base")
+                            or 0.0
                         )
-                    except Exception as e_can:
-                        logger.debug(
-                            f"Cancel existing perp open orders failed/skipped: {e_can}"
+                        if fill_amt > 0.0:
+                            live_perp_delta += -fill_amt if is_sell else fill_amt
+                            perp_order_summary = f"{execution_mode_str} Dispatched {executor_config['execution_strategy']} {side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} on {config.perp_connector} (Executor ID: {ex_id}) | Filled {fill_amt:.{size_decimals}f} {symbol}"
+                            hedge_action_status = f"EXECUTOR FILLED ({side_str} {fill_amt:.{size_decimals}f} {target_perp_symbol})"
+                            rebalanced = True
+                            return (
+                                live_perp_delta,
+                                hedge_action_status,
+                                perp_order_summary,
+                                rebalanced,
+                            )
+                        elif ex_status == "TERMINATED" and close_type in (
+                            "INSUFFICIENT_BALANCE",
+                            "FAILED",
+                            "STOPPED",
+                            "ERROR",
+                        ):
+                            is_terminated_error = True
+                            logger.warning(
+                                f"Hummingbot executor {ex_id} terminated with error ({close_type}: {last_err}). Falling back to Direct REST execution on Derive..."
+                            )
+
+                    if not is_terminated_error:
+                        hedge_action_status = f"EXECUTOR DISPATCHED ({side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} | ID: {str(ex_id)[:8]}...)"
+                        perp_order_summary = f"{execution_mode_str} Dispatched {executor_config['execution_strategy']} {side_str} {rebalance_size:.{size_decimals}f} {target_perp_symbol} on {config.perp_connector} (Executor ID: {ex_id})"
+                        rebalanced = True
+                        return (
+                            live_perp_delta,
+                            hedge_action_status,
+                            perp_order_summary,
+                            rebalanced,
                         )
+                else:
+                    logger.warning(
+                        f"Hummingbot executor dispatch failed or returned invalid response. Attempting Direct REST fallback if on Derive..."
+                    )
+
+            # DIRECT ROUTINE MODE or Fallback for Derive
+            if (
+                not config.paper_mode
+                and "derive" in config.perp_connector.lower()
+                and auth_headers
+                and subaccount_id
+                and session_key_wallet
+                and smart_contract_wallet
+            ):
+                # 0. Clean Cancellation: Cancel existing open resting orders on perp_symbol before placing new maker orders
+                try:
+                    await http_client.post(
+                        "https://api.lyra.finance/private/cancel_all",
+                        json={
+                            "subaccount_id": subaccount_id,
+                            "instrument_name": perp_symbol,
+                        },
+                        headers=auth_headers,
+                        timeout=4.0,
+                    )
+                except Exception as e_can:
+                    logger.debug(
+                        f"Cancel existing perp open orders failed/skipped: {e_can}"
+                    )
 
                 hedge_action_status = f"PERPETUAL MAKER REBALANCE ({side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} @ ${maker_price:,.2f})"
                 perp_order_summary = f"{execution_mode_str} Submit MAKER {side_str} {rebalance_size:.{size_decimals}f} {perp_symbol} @ ${maker_price:,.2f} (Target: {target_perp_delta:+.4f} {symbol})"
 
-                if not config.paper_mode:
-                    if not (
-                        session_key_wallet and smart_contract_wallet and subaccount_id
-                    ):
-                        perp_order_summary += " | Skipped (Credentials missing in .env)"
+                from derive_action_signing import (
+                    SignedAction,
+                    TradeModuleData,
+                    utils,
+                )
+
+                TRADE_MODULE_ADDRESS = "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b"
+                DOMAIN_SEPARATOR = "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b"
+                ACTION_TYPEHASH = "0x4d7a9f27c403ff9c0f19bce61d76d82f9aa29f8d6d4b0c5474607d9770d1af17"
+
+                try:
+                    trade_data = TradeModuleData(
+                        asset_address=inst_perp_info.get(
+                            "base_asset_address",
+                            "0x0000000000000000000000000000000000000000",
+                        ),
+                        sub_id=int(inst_perp_info.get("base_asset_sub_id", 0)),
+                        limit_price=Decimal(str(maker_price)),
+                        amount=Decimal(str(rebalance_size)),
+                        max_fee=Decimal("100"),
+                        recipient_id=subaccount_id,
+                        is_bid=not is_sell,
+                    )
+                    action = SignedAction(
+                        subaccount_id=subaccount_id,
+                        owner=smart_contract_wallet,
+                        signer=session_key_wallet.address,
+                        signature_expiry_sec=utils.MAX_INT_32,
+                        nonce=utils.get_action_nonce(),
+                        module_address=TRADE_MODULE_ADDRESS,
+                        module_data=trade_data,
+                        DOMAIN_SEPARATOR=DOMAIN_SEPARATOR,
+                        ACTION_TYPEHASH=ACTION_TYPEHASH,
+                    )
+                    action.sign(session_key_wallet.key)
+
+                    order_resp = await http_client.post(
+                        "https://api.lyra.finance/private/order",
+                        json={
+                            **action.to_json(),
+                            "instrument_name": perp_symbol,
+                            "direction": "sell" if is_sell else "buy",
+                            "order_type": "limit",
+                            "post_only": True,
+                            "reduce_only": False,
+                            "time_in_force": "gtc",
+                            "label": "fast-rebalance-perp-maker",
+                        },
+                        headers=auth_headers,
+                        timeout=5.0,
+                    )
+                    order_json = order_resp.json()
+                    res_order = order_json.get("result", {})
+                    order_obj = res_order.get("order", {})
+                    ord_status = order_obj.get("order_status")
+
+                    if ord_status == "filled":
+                        avg_px = float(
+                            order_obj.get("average_price") or maker_price
+                        )
+                        perp_order_summary += f" | MAKER FILLED @ ${avg_px:,.2f}"
+                        live_perp_delta += -rebalance_size if is_sell else rebalance_size
+                        rebalanced = True
+                    elif ord_status == "open":
+                        perp_order_summary += f" | MAKER POSTED @ ${maker_price:,.2f} (Resting GTC | Post-Only)"
+                        rebalanced = True
+                    elif "error" in order_json:
+                        err_info = order_json.get("error", {})
+                        err_msg = (
+                            err_info.get("message", str(err_info))
+                            if isinstance(err_info, dict)
+                            else str(err_info)
+                        )
+                        perp_order_summary += f" | Rejected: {err_msg}"
+                        logger.warning(
+                            f"Perp maker order rejected by Derive: {err_msg}"
+                        )
                     else:
-                        from derive_action_signing import (
-                            SignedAction,
-                            TradeModuleData,
-                            utils,
+                        perp_order_summary += f" | Order Status: {ord_status or 'Submitted'}"
+                        rebalanced = True
+                except Exception as e:
+                    logger.error(
+                        f"Perp maker rebalance execution error: {e}",
+                        exc_info=True,
+                    )
+                    perp_order_summary += f" | Error: {e}"
+                    if not config.paper_mode:
+                        await send_telegram_error_alert(
+                            context=context,
+                            chat_id=config.telegram_chat_id,
+                            error_title="PERPETUAL MAKER REBALANCE ERROR",
+                            error=e,
+                            cycle_number="Maker Rebalance Execution",
+                            cycle_type="Perp Order",
+                            pair=config.trading_pair,
+                            client=http_client,
+                            extra_info=f"Perpetual maker rebalance order failed for {perp_symbol} ({side_str} {rebalance_size} {symbol} @ ${maker_price})",
+                            throttle_seconds=30.0,
                         )
-
-                        TRADE_MODULE_ADDRESS = (
-                            "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b"
-                        )
-                        DOMAIN_SEPARATOR = "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b"
-                        ACTION_TYPEHASH = "0x4d7a9f27c403ff9c0f19bce61d76d82f9aa29f8d6d4b0c5474607d9770d1af17"
-
-                        try:
-                            trade_data = TradeModuleData(
-                                asset_address=inst_perp_info.get(
-                                    "base_asset_address",
-                                    "0x0000000000000000000000000000000000000000",
-                                ),
-                                sub_id=int(inst_perp_info.get("base_asset_sub_id", 0)),
-                                limit_price=Decimal(str(maker_price)),
-                                amount=Decimal(str(rebalance_size)),
-                                max_fee=Decimal("100"),
-                                recipient_id=subaccount_id,
-                                is_bid=not is_sell,
-                            )
-                            action = SignedAction(
-                                subaccount_id=subaccount_id,
-                                owner=smart_contract_wallet,
-                                signer=session_key_wallet.address,
-                                signature_expiry_sec=utils.MAX_INT_32,
-                                nonce=utils.get_action_nonce(),
-                                module_address=TRADE_MODULE_ADDRESS,
-                                module_data=trade_data,
-                                DOMAIN_SEPARATOR=DOMAIN_SEPARATOR,
-                                ACTION_TYPEHASH=ACTION_TYPEHASH,
-                            )
-                            action.sign(session_key_wallet.key)
-
-                            order_resp = await http_client.post(
-                                "https://api.lyra.finance/private/order",
-                                json={
-                                    **action.to_json(),
-                                    "instrument_name": perp_symbol,
-                                    "direction": "sell" if is_sell else "buy",
-                                    "order_type": "limit",
-                                    "post_only": True,
-                                    "reduce_only": False,
-                                    "time_in_force": "gtc",
-                                    "label": "fast-rebalance-perp-maker",
-                                },
-                                headers=auth_headers,
-                                timeout=5.0,
-                            )
-                            order_json = order_resp.json()
-                            res_order = order_json.get("result", {})
-                            order_obj = res_order.get("order", {})
-                            ord_status = order_obj.get("order_status")
-
-                            if ord_status == "filled":
-                                avg_px = float(
-                                    order_obj.get("average_price") or maker_price
-                                )
-                                perp_order_summary += (
-                                    f" | MAKER FILLED @ ${avg_px:,.2f}"
-                                )
-                                live_perp_delta += (
-                                    -rebalance_size if is_sell else rebalance_size
-                                )
-                                rebalanced = True
-                            elif ord_status == "open":
-                                perp_order_summary += f" | MAKER POSTED @ ${maker_price:,.2f} (Resting GTC | Post-Only)"
-                                rebalanced = True
-                            elif "error" in order_json:
-                                err_info = order_json.get("error", {})
-                                err_msg = (
-                                    err_info.get("message", str(err_info))
-                                    if isinstance(err_info, dict)
-                                    else str(err_info)
-                                )
-                                perp_order_summary += f" | Rejected: {err_msg}"
-                                logger.warning(
-                                    f"Perp maker order rejected by Derive: {err_msg}"
-                                )
-                            else:
-                                perp_order_summary += (
-                                    f" | Order Status: {ord_status or 'Submitted'}"
-                                )
-                                rebalanced = True
-                        except Exception as e:
-                            logger.error(
-                                f"Perp maker rebalance execution error: {e}",
-                                exc_info=True,
-                            )
-                            perp_order_summary += f" | Error: {e}"
-                            if not config.paper_mode:
-                                await send_telegram_error_alert(
-                                    context=context,
-                                    chat_id=config.telegram_chat_id,
-                                    error_title="PERPETUAL MAKER REBALANCE ERROR",
-                                    error=e,
-                                    cycle_number="Maker Rebalance Execution",
-                                    cycle_type="Perp Order",
-                                    pair=config.trading_pair,
-                                    client=http_client,
-                                    extra_info=f"Perpetual maker rebalance order failed for {perp_symbol} ({side_str} {rebalance_size} {symbol} @ ${maker_price})",
-                                    throttle_seconds=30.0,
-                                )
+            elif not config.paper_mode and not use_hummingbot_executor:
+                if not (session_key_wallet and smart_contract_wallet and subaccount_id):
+                    perp_order_summary += " | Skipped (Credentials missing in .env)"
 
     return live_perp_delta, hedge_action_status, perp_order_summary, rebalanced
 
@@ -2431,79 +2587,131 @@ async def execute_cycle(
             if live_perp_delta != 0.0:
                 is_perp_long = live_perp_delta > 0
                 flat_side = "sell" if is_perp_long else "buy"
+                flat_side_int = 2 if is_perp_long else 1
                 flat_size = round(abs(live_perp_delta), size_decimals)
-                # 50 bps execution price protection: Sell uses (1.0 - slippage), Buy uses (1.0 + slippage)
-                dyn_limit_price = Decimal(
-                    str(
-                        round(
-                            (
-                                spot_price * (1.0 - perp_slippage_mult)
-                                if is_perp_long
-                                else spot_price * (1.0 + perp_slippage_mult)
-                            ),
-                            2,
+                target_perp_symbol = resolve_perp_trading_pair(
+                    symbol, config.perp_connector, config.perp_trading_pair
+                )
+                flattened_ok = False
+
+                # 1. Try flattening via Hummingbot API first
+                try:
+                    from config_manager import get_client
+
+                    chat_id = (
+                        getattr(context, "_chat_id", None)
+                        or getattr(context, "chat_id", None)
+                        if context
+                        else None
+                    )
+                    hb_client_tp = await get_client(chat_id, context=context)
+                    if hb_client_tp:
+                        close_exec_config = {
+                            "type": "order_executor",
+                            "connector_name": config.perp_connector,
+                            "trading_pair": target_perp_symbol,
+                            "side": flat_side_int,
+                            "amount": flat_size,
+                            "execution_strategy": "MARKET",
+                            "leverage": 1,
+                            "position_action": "CLOSE",
+                        }
+                        await hb_client_tp.executors.create_executor(
+                            executor_config=close_exec_config,
+                            account_name="master_account",
+                            controller_id="derive_volatility_loop_trader",
+                        )
+                        live_perp_delta = 0.0
+                        change_event_details.append(
+                            f"Perpetual Hedge Flattened to 0.00 {symbol} via Hummingbot ({config.perp_connector})"
+                        )
+                        perp_order_summary = f"{execution_mode_str} Flattened Perpetual Hedge to 0.00 {symbol} ({trigger_name})"
+                        hedge_action_status = f"PERP FLATTENED ({trigger_name})"
+                        flattened_ok = True
+                except Exception as e_hb_flat:
+                    logger.debug(f"Hummingbot API flatten attempt: {e_hb_flat}")
+
+                # 2. Fallback / Direct REST on Derive if not already flattened
+                if (
+                    not flattened_ok
+                    and "derive" in config.perp_connector.lower()
+                    and auth_headers
+                    and subaccount_id
+                    and session_key_wallet
+                    and smart_contract_wallet
+                ):
+                    # 50 bps execution price protection: Sell uses (1.0 - slippage), Buy uses (1.0 + slippage)
+                    dyn_limit_price = Decimal(
+                        str(
+                            round(
+                                (
+                                    spot_price * (1.0 - perp_slippage_mult)
+                                    if is_perp_long
+                                    else spot_price * (1.0 + perp_slippage_mult)
+                                ),
+                                2,
+                            )
                         )
                     )
-                )
-                trade_data = TradeModuleData(
-                    asset_address=inst_perp_info.get(
-                        "base_asset_address",
-                        "0x0000000000000000000000000000000000000000",
-                    ),
-                    sub_id=int(inst_perp_info.get("base_asset_sub_id", 0)),
-                    limit_price=dyn_limit_price,
-                    amount=Decimal(str(flat_size)),
-                    max_fee=Decimal("100"),
-                    recipient_id=subaccount_id,
-                    is_bid=not is_perp_long,
-                )
-                action_flat = SignedAction(
-                    subaccount_id=subaccount_id,
-                    owner=smart_contract_wallet,
-                    signer=session_key_wallet.address,
-                    signature_expiry_sec=utils.MAX_INT_32,
-                    nonce=utils.get_action_nonce(),
-                    module_address=TRADE_MODULE_ADDRESS,
-                    module_data=trade_data,
-                    DOMAIN_SEPARATOR=DOMAIN_SEPARATOR,
-                    ACTION_TYPEHASH=ACTION_TYPEHASH,
-                )
-                action_flat.sign(session_key_wallet.key)
-                order_resp = await http_client.post(
-                    "https://api.lyra.finance/private/order",
-                    json={
-                        **action_flat.to_json(),
-                        "instrument_name": perp_symbol,
-                        "direction": flat_side,
-                        "order_type": "market",
-                        "reduce_only": True,
-                        "time_in_force": "ioc",
-                        "label": "tp-flatten-perp",
-                    },
-                    headers=auth_headers,
-                    timeout=5.0,
-                )
-                if (
-                    order_resp.json()
-                    .get("result", {})
-                    .get("order", {})
-                    .get("order_status")
-                    == "filled"
-                ):
-                    live_perp_delta = 0.0
-                    change_event_details.append(
-                        f"Perpetual Hedge Flattened to 0.00 {symbol}"
+                    trade_data = TradeModuleData(
+                        asset_address=inst_perp_info.get(
+                            "base_asset_address",
+                            "0x0000000000000000000000000000000000000000",
+                        ),
+                        sub_id=int(inst_perp_info.get("base_asset_sub_id", 0)),
+                        limit_price=dyn_limit_price,
+                        amount=Decimal(str(flat_size)),
+                        max_fee=Decimal("100"),
+                        recipient_id=subaccount_id,
+                        is_bid=not is_perp_long,
                     )
-                    perp_order_summary = f"{execution_mode_str} Flattened Perpetual Hedge to 0.00 {symbol} ({trigger_name})"
-                    hedge_action_status = f"PERP FLATTENED ({trigger_name})"
-                else:
-                    err_msg = (
+                    action_flat = SignedAction(
+                        subaccount_id=subaccount_id,
+                        owner=smart_contract_wallet,
+                        signer=session_key_wallet.address,
+                        signature_expiry_sec=utils.MAX_INT_32,
+                        nonce=utils.get_action_nonce(),
+                        module_address=TRADE_MODULE_ADDRESS,
+                        module_data=trade_data,
+                        DOMAIN_SEPARATOR=DOMAIN_SEPARATOR,
+                        ACTION_TYPEHASH=ACTION_TYPEHASH,
+                    )
+                    action_flat.sign(session_key_wallet.key)
+                    order_resp = await http_client.post(
+                        "https://api.lyra.finance/private/order",
+                        json={
+                            **action_flat.to_json(),
+                            "instrument_name": perp_symbol,
+                            "direction": flat_side,
+                            "order_type": "market",
+                            "reduce_only": True,
+                            "time_in_force": "ioc",
+                            "label": "tp-flatten-perp",
+                        },
+                        headers=auth_headers,
+                        timeout=5.0,
+                    )
+                    if (
                         order_resp.json()
-                        .get("error", {})
-                        .get("message", "Order not filled")
-                    )
-                    perp_order_summary = f"{execution_mode_str} Flatten Perp: {err_msg}"
-                    hedge_action_status = f"FLATTEN FAILED ({trigger_name})"
+                        .get("result", {})
+                        .get("order", {})
+                        .get("order_status")
+                        == "filled"
+                    ):
+                        live_perp_delta = 0.0
+                        change_event_details.append(
+                            f"Perpetual Hedge Flattened to 0.00 {symbol}"
+                        )
+                        perp_order_summary = f"{execution_mode_str} Flattened Perpetual Hedge to 0.00 {symbol} ({trigger_name})"
+                        hedge_action_status = f"PERP FLATTENED ({trigger_name})"
+                    else:
+                        err_msg = (
+                            order_resp.json()
+                            .get("error", {})
+                            .get("message", "Order not filled")
+                        )
+                        perp_order_summary = f"{execution_mode_str} Flatten Perp: {err_msg}"
+                        hedge_action_status = f"FLATTEN FAILED ({trigger_name})"
             else:
                 perp_order_summary = f"None (Perp already flat on {trigger_name})"
                 hedge_action_status = f"FLAT ({trigger_name})"
@@ -2947,8 +3155,11 @@ async def execute_cycle(
         if abs(delta_imbalance_val) > config.emergency_band
         else ("STANDARD" if rebalance_needed_flag else "NONE")
     )
-    hedge_side_val = "SELL" if delta_imbalance_val < 0 else "BUY"
-    hedge_size_val = round(abs(delta_imbalance_val), size_decimals)
+    hedge_size_val = (
+        max(min_order_size, round(abs(delta_imbalance_val), size_decimals))
+        if rebalance_needed_flag
+        else round(abs(delta_imbalance_val), size_decimals)
+    )
 
     save_heartbeat(
         {
@@ -3227,22 +3438,23 @@ async def execute_fast_perp_hedge_cycle(
                 if attempt == 0:
                     await asyncio.sleep(0.5)
 
-    # Strict Safety Barrier: If we could not verify subaccount positions from Derive, skip fast rehedge
     target_perp_symbol = resolve_perp_trading_pair(
         symbol, config.perp_connector, config.perp_trading_pair
     )
-    if "derive" not in config.perp_connector.lower():
-        ext_perp_amt = await fetch_external_perp_position(
-            context, config.perp_connector, target_perp_symbol
-        )
-        if ext_perp_amt is not None:
-            live_perp_delta = ext_perp_amt
+    ext_perp_amt = await fetch_external_perp_position(
+        context, config.perp_connector, target_perp_symbol
+    )
+    if ext_perp_amt is not None:
+        live_perp_delta = ext_perp_amt
 
-    if not subaccount_fetch_ok or live_perp_delta is None:
+    if live_perp_delta is None and not subaccount_fetch_ok:
         logger.warning(
-            "Fast hedge cycle skipped: Live subaccount positions unavailable from Derive clearinghouse. Holding hedge."
+            "Fast hedge cycle skipped: Live subaccount positions unavailable from Derive clearinghouse or Hummingbot client. Holding hedge."
         )
         return cached_metrics, display_table, alerts_log, False
+
+    if live_perp_delta is None:
+        live_perp_delta = 0.0
 
     # 3. Determine live options delta: Authoritative Clearinghouse Delta (with verified cache fallback)
     if has_clearinghouse_options_delta:
@@ -3417,7 +3629,11 @@ async def execute_fast_perp_hedge_cycle(
                     )
                 ),
                 "side": "SELL" if delta_imb_fast < 0 else "BUY",
-                "amount": round(abs(delta_imb_fast), size_decimals),
+                "amount": (
+                    max(min_order_size, round(abs(delta_imb_fast), size_decimals))
+                    if abs(delta_imb_fast) > config.hedge_band
+                    else round(abs(delta_imb_fast), size_decimals)
+                ),
                 "limit_price": (
                     round(
                         (
