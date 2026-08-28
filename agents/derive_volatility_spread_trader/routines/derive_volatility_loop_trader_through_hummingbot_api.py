@@ -377,8 +377,7 @@ async def fetch_external_perp_position(
         from config_manager import get_client
 
         chat_id = (
-            getattr(context, "_chat_id", None)
-            or getattr(context, "chat_id", None)
+            getattr(context, "_chat_id", None) or getattr(context, "chat_id", None)
             if context
             else None
         )
@@ -1523,16 +1522,23 @@ async def execute_perp_rebalance(
                         else (search_res if isinstance(search_res, list) else [])
                     )
                     for ex in exec_data:
-                        if ex.get("is_active") or str(ex.get("status", "")).upper() == "RUNNING":
+                        if (
+                            ex.get("is_active")
+                            or str(ex.get("status", "")).upper() == "RUNNING"
+                        ):
                             active_running_executor = ex
                             break
                 except Exception as e_s:
                     logger.debug(f"Error checking active running executors: {e_s}")
 
                 if active_running_executor:
-                    ex_id = active_running_executor.get("executor_id") or active_running_executor.get("id")
+                    ex_id = active_running_executor.get(
+                        "executor_id"
+                    ) or active_running_executor.get("id")
                     hedge_action_status = f"EXECUTOR ACTIVE ({side_str} IN PROGRESS | ID: {str(ex_id)[:8]}...)"
-                    perp_order_summary = f"Waiting on active executor {ex_id} on {config.perp_connector}"
+                    perp_order_summary = (
+                        f"Waiting on active executor {ex_id} on {config.perp_connector}"
+                    )
                     return (
                         live_perp_delta,
                         hedge_action_status,
@@ -1541,7 +1547,9 @@ async def execute_perp_rebalance(
                     )
 
                 # 2. Dispatch new order_executor on configured perpetual connector
-                exec_strategy = "MARKET" if urgency_str == "EMERGENCY" else "LIMIT_MAKER"
+                exec_strategy = (
+                    "MARKET" if urgency_str == "EMERGENCY" else "LIMIT_MAKER"
+                )
                 executor_config = {
                     "type": "order_executor",
                     "connector_name": config.perp_connector,
@@ -1549,7 +1557,11 @@ async def execute_perp_rebalance(
                     "side": side_int,
                     "amount": rebalance_size,
                     "execution_strategy": exec_strategy,
-                    "price": maker_price if exec_strategy in ("LIMIT", "LIMIT_MAKER") else None,
+                    "price": (
+                        maker_price
+                        if exec_strategy in ("LIMIT", "LIMIT_MAKER")
+                        else None
+                    ),
                     "leverage": 1,
                     "position_action": "OPEN",
                 }
@@ -1569,20 +1581,30 @@ async def execute_perp_rebalance(
                     if exec_strategy == "LIMIT_MAKER":
                         try:
                             executor_config["execution_strategy"] = "LIMIT"
-                            created_executor = await hb_client.executors.create_executor(
-                                executor_config=executor_config,
-                                account_name="master_account",
-                                controller_id="derive_volatility_loop_trader",
+                            created_executor = (
+                                await hb_client.executors.create_executor(
+                                    executor_config=executor_config,
+                                    account_name="master_account",
+                                    controller_id="derive_volatility_loop_trader",
+                                )
                             )
                         except Exception as e_retry:
-                            logger.error(f"Fallback LIMIT executor creation failed: {e_retry}")
+                            logger.error(
+                                f"Fallback LIMIT executor creation failed: {e_retry}"
+                            )
 
                 if created_executor and isinstance(created_executor, dict):
-                    ex_id = created_executor.get("executor_id") or created_executor.get("id") or "created"
+                    ex_id = (
+                        created_executor.get("executor_id")
+                        or created_executor.get("id")
+                        or "created"
+                    )
                     await asyncio.sleep(1.0)
                     ex_detail = None
                     try:
-                        ex_detail = await hb_client.executors.get_executor(executor_id=ex_id)
+                        ex_detail = await hb_client.executors.get_executor(
+                            executor_id=ex_id
+                        )
                     except Exception:
                         pass
 
@@ -1669,8 +1691,12 @@ async def execute_perp_rebalance(
                 )
 
                 TRADE_MODULE_ADDRESS = "0xB8D20c2B7a1Ad2EE33Bc50eF10876eD3035b5e7b"
-                DOMAIN_SEPARATOR = "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b"
-                ACTION_TYPEHASH = "0x4d7a9f27c403ff9c0f19bce61d76d82f9aa29f8d6d4b0c5474607d9770d1af17"
+                DOMAIN_SEPARATOR = (
+                    "0xd96e5f90797da7ec8dc4e276260c7f3f87fedf68775fbe1ef116e996fc60441b"
+                )
+                ACTION_TYPEHASH = (
+                    "0x4d7a9f27c403ff9c0f19bce61d76d82f9aa29f8d6d4b0c5474607d9770d1af17"
+                )
 
                 try:
                     trade_data = TradeModuleData(
@@ -1719,11 +1745,11 @@ async def execute_perp_rebalance(
                     ord_status = order_obj.get("order_status")
 
                     if ord_status == "filled":
-                        avg_px = float(
-                            order_obj.get("average_price") or maker_price
-                        )
+                        avg_px = float(order_obj.get("average_price") or maker_price)
                         perp_order_summary += f" | MAKER FILLED @ ${avg_px:,.2f}"
-                        live_perp_delta += -rebalance_size if is_sell else rebalance_size
+                        live_perp_delta += (
+                            -rebalance_size if is_sell else rebalance_size
+                        )
                         rebalanced = True
                     elif ord_status == "open":
                         perp_order_summary += f" | MAKER POSTED @ ${maker_price:,.2f} (Resting GTC | Post-Only)"
@@ -1740,7 +1766,9 @@ async def execute_perp_rebalance(
                             f"Perp maker order rejected by Derive: {err_msg}"
                         )
                     else:
-                        perp_order_summary += f" | Order Status: {ord_status or 'Submitted'}"
+                        perp_order_summary += (
+                            f" | Order Status: {ord_status or 'Submitted'}"
+                        )
                         rebalanced = True
                 except Exception as e:
                     logger.error(
@@ -2710,7 +2738,9 @@ async def execute_cycle(
                             .get("error", {})
                             .get("message", "Order not filled")
                         )
-                        perp_order_summary = f"{execution_mode_str} Flatten Perp: {err_msg}"
+                        perp_order_summary = (
+                            f"{execution_mode_str} Flatten Perp: {err_msg}"
+                        )
                         hedge_action_status = f"FLATTEN FAILED ({trigger_name})"
             else:
                 perp_order_summary = f"None (Perp already flat on {trigger_name})"
