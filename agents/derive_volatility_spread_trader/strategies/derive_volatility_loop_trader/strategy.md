@@ -129,7 +129,7 @@ Strikes are selected via continuous Black-Scholes inversion using the Abramowitz
 
 ### Strict Structural Constraints:
 - **Strict Single-Tenor Expiry Rule**: All 4 legs of the Iron Condor must belong strictly to the **same single expiration timestamp** (default `14 DTE`, e.g., `Sep 04, 2026 08:00 UTC`).
-- **Asset Precision & Min Sizes**: Automatically scales size precision and order minimums per underlying (e.g. BTC: 4 decimals, 0.01 min; ETH: 3 decimals, 0.10 min; HYPE: 1 decimal, 1.0 min).
+- **Asset Precision & Min Sizes**: Automatically scales size precision and order minimums per underlying across all 9 Derive assets (e.g. BTC: 4 decimals, 0.01 min; ETH/XAUT: 3 decimals, 0.10 min; SOL/ZEC: 2 decimals, 0.10 min; HYPE: 1 decimal, 1.0 min; XRP/ADA/CC: 1 decimal, 10.0 min).
 
 ---
 

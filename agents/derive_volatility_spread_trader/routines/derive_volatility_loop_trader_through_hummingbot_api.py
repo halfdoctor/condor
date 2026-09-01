@@ -38,11 +38,11 @@ LAST_KNOWN_MARK_PRICES: dict[str, float] = {}
 
 
 class Config(BaseModel):
-    """Autonomous Decoupled Dual-Cadence Trader: Derivatives Monkey Consensus Cross-Check, Pure Target Delta (30Δ/10Δ), 30s Fast Rehedge, 50 Bps Slippage Protection"""
+    """Autonomous Decoupled Dual-Cadence Trader: Derivatives Monkey Consensus Cross-Check, Pure Target Delta (30Δ/10Δ), 30s Fast Rehedge, 50 Bps Slippage Protection across all Derive assets (ETH, BTC, HYPE, ZEC, SOL, XAUT, XRP, ADA, CC)"""
 
     trading_pair: str = Field(
         default="ETH-USDT",
-        description="Underlying asset trading pair (ETH-USDT, BTC-USDT, HYPE-USDT)",
+        description="Underlying asset trading pair (e.g. ETH-USDT, BTC-USDT, HYPE-USDT, ZEC-USDT, SOL-USDT, XAUT-USDT, XRP-USDT, ADA-USDT, CC-USDT)",
     )
     perp_connector: str = Field(
         default="derive_perpetual",
@@ -50,7 +50,7 @@ class Config(BaseModel):
     )
     perp_trading_pair: str | None = Field(
         default=None,
-        description="Perpetual trading pair on perp_connector (e.g. ETH-USDC on Derive, ETH-USD on Hyperliquid, ETH-USDT on Binance/Bybit; auto-resolved if None)",
+        description="Perpetual trading pair on perp_connector (e.g. ETH-PERP / BTC-PERP / ZEC-PERP / SOL-PERP / XAUT-PERP / XRP-PERP / ADA-PERP / CC-PERP on Derive, ETH-USD on Hyperliquid; auto-resolved if None)",
     )
     poll_interval_seconds: int = Field(
         default=300,
@@ -263,7 +263,7 @@ def get_asset_precision_and_min_size(
 ) -> tuple[int, float]:
     """Dynamically determine the size decimal precision and minimum order size based on asset type and exchange specs.
 
-    Prevents rounding errors on high-value assets like BTC (4 decimals) vs ETH (3 decimals) vs HYPE (1 decimal).
+    Prevents rounding errors on high-value assets like BTC (4 decimals) vs ETH/XAUT (3 decimals) vs SOL/ZEC (2 decimals) vs HYPE (1 decimal) vs XRP/ADA/CC (1 decimal).
     """
     sym = symbol.upper().split("-")[0]
     min_amount = None
@@ -278,14 +278,17 @@ def get_asset_precision_and_min_size(
     if sym == "BTC":
         min_size = min_amount or 0.01
         decimals = 4
-    elif sym == "ETH":
+    elif sym in ["ETH", "XAUT"]:
         min_size = min_amount or 0.10
         decimals = 3
-    elif sym == "SOL":
+    elif sym in ["SOL", "ZEC"]:
         min_size = min_amount or 0.10
         decimals = 2
     elif sym == "HYPE":
         min_size = min_amount or 1.00
+        decimals = 1
+    elif sym in ["XRP", "ADA", "CC"]:
+        min_size = min_amount or 10.00
         decimals = 1
     else:
         min_size = min_amount or 0.10
@@ -313,12 +316,12 @@ def has_position_state_materially_changed(
 def parse_option_contract_details(
     instrument_name: str,
 ) -> tuple[float | None, str | None, float | None, float | None]:
-    """Parse strike (K), option type ('C'/'P'), exact DTE (days), and exact T (years) directly from instrument name format (e.g. 'ETH-20260828-1950-C')."""
+    """Parse strike (K), option type ('C'/'P'), exact DTE (days), and exact T (years) directly from instrument name format (e.g. 'ETH-20260828-1950-C', 'XRP-20260925-0_9-C')."""
     try:
         parts = instrument_name.split("-")
         if len(parts) >= 4:
             exp_date_str = parts[1]
-            strike = float(parts[2])
+            strike = float(parts[2].replace("_", "."))
             opt_type = parts[3].upper()
 
             exp_dt = datetime.datetime.strptime(exp_date_str, "%Y%m%d").replace(
@@ -340,11 +343,21 @@ def round_derive_strike(strike: float, spot: float, pair: str = "ETH") -> float:
     symbol = pair.upper().split("-")[0]
     if symbol == "BTC" or spot > 10000:
         increment = 1000.0
-    elif symbol == "HYPE" or spot < 100:
-        increment = 1.0
-    else:
+    elif symbol in ["ETH", "XAUT"] or spot > 1000:
         increment = 50.0
-    return round(strike / increment) * increment
+    elif symbol in ["ZEC"] or spot > 300:
+        increment = 25.0
+    elif symbol in ["SOL"] or spot > 50:
+        increment = 5.0
+    elif symbol in ["HYPE"] or spot >= 5:
+        increment = 1.0
+    elif symbol in ["XRP"] or spot >= 0.5:
+        increment = 0.05
+    elif symbol in ["ADA", "CC"] or spot < 0.5:
+        increment = 0.01
+    else:
+        increment = 1.0
+    return round(round(strike / increment) * increment, 4)
 
 
 def resolve_perp_trading_pair(
@@ -360,10 +373,12 @@ def resolve_perp_trading_pair(
     if "hyperliquid" in conn:
         return f"{sym}-USD"
     elif "derive" in conn:
-        return f"{sym}-USDC"
+        return f"{sym}-PERP"
     elif any(
         x in conn for x in ["binance", "bybit", "okx", "gate", "kucoin", "bitget"]
     ):
+        if sym == "XAUT":
+            return "PAXG-USDT" if "binance" in conn else f"{sym}-USDT"
         return f"{sym}-USDT"
     else:
         return f"{sym}-USDT"
@@ -884,13 +899,23 @@ async def fetch_robust_spot_price(
     client: httpx.AsyncClient, symbol: str = "ETH"
 ) -> float:
     """Fetch live spot price non-blockingly across 4 independent venues. If all fail, raises RuntimeError to prevent static fallback trading."""
+    sym = symbol.upper().split("-")[0]
+
+    def _fmt_price(px: float) -> float:
+        if px >= 1000:
+            return round(px, 2)
+        elif px >= 1.0:
+            return round(px, 4)
+        else:
+            return round(px, 6)
+
     # 1. Derive Perpetual Index/Mark Price
     try:
         r = (
             (
                 await client.post(
                     "https://api.lyra.finance/public/get_ticker",
-                    json={"instrument_name": f"{symbol}-PERP"},
+                    json={"instrument_name": f"{sym}-PERP"},
                     timeout=3.5,
                 )
             )
@@ -899,21 +924,22 @@ async def fetch_robust_spot_price(
         )
         price = float(r.get("index_price") or r.get("mark_price") or 0.0)
         if price > 0:
-            return round(price, 2)
+            return _fmt_price(price)
     except Exception as e:
         logger.warning(f"Derive live spot fetch failed: {e}")
 
     # 2. Binance Public Ticker
     try:
+        bsym = "PAXGUSDT" if sym == "XAUT" else f"{sym}USDT"
         r = (
             await client.get(
-                f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT",
+                f"https://api.binance.com/api/v3/ticker/price?symbol={bsym}",
                 timeout=3.5,
             )
         ).json()
         price = float(r.get("price") or 0.0)
         if price > 0:
-            return round(price, 2)
+            return _fmt_price(price)
     except Exception as e:
         logger.warning(f"Binance live spot fetch failed: {e}")
 
@@ -926,10 +952,10 @@ async def fetch_robust_spot_price(
                 timeout=3.5,
             )
         ).json()
-        if symbol in r:
-            price = float(r[symbol])
+        if sym in r:
+            price = float(r[sym])
             if price > 0:
-                return round(price, 2)
+                return _fmt_price(price)
     except Exception as e:
         logger.warning(f"Hyperliquid live spot fetch failed: {e}")
 
@@ -938,7 +964,7 @@ async def fetch_robust_spot_price(
         r = (
             (
                 await client.get(
-                    f"https://api.coinbase.com/v2/prices/{symbol}-USD/spot", timeout=3.5
+                    f"https://api.coinbase.com/v2/prices/{sym}-USD/spot", timeout=3.5
                 )
             )
             .json()
@@ -946,12 +972,12 @@ async def fetch_robust_spot_price(
         )
         price = float(r.get("amount") or 0.0)
         if price > 0:
-            return round(price, 2)
+            return _fmt_price(price)
     except Exception as e:
         logger.warning(f"Coinbase live spot fetch failed: {e}")
 
     raise RuntimeError(
-        f"CRITICAL: Failed to fetch live spot price for {symbol} across all 4 data venues (Derive, Binance, Hyperliquid, Coinbase). Skipping cycle to prevent execution on invalid pricing."
+        f"CRITICAL: Failed to fetch live spot price for {sym} across all 4 data venues (Derive, Binance, Hyperliquid, Coinbase). Skipping cycle to prevent execution on invalid pricing."
     )
 
 
@@ -967,14 +993,14 @@ async def fetch_dynamic_market_volatility(
     # 2. Dynamic 7D Realized Volatility from Live Hourly Candles
     rv_7d = 25.0
     try:
-        binance_sym = f"{symbol}USDT"
+        binance_sym = "PAXGUSDT" if symbol == "XAUT" else f"{symbol}USDT"
         k_resp = (
             await client.get(
                 f"https://api.binance.com/api/v3/klines?symbol={binance_sym}&interval=1h&limit=168",
                 timeout=4.0,
             )
         ).json()
-        closes = [float(k[4]) for k in k_resp if len(k) > 4]
+        closes = [float(k[4]) for k in k_resp if isinstance(k, list) and len(k) > 4]
         if len(closes) >= 24:
             returns = [
                 math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))
@@ -1009,7 +1035,9 @@ async def fetch_dynamic_market_volatility(
                     timeout=4.0,
                 )
             ).json()
-            closes = [float(c["c"]) for c in hl_resp if "c" in c]
+            closes = [
+                float(c["c"]) for c in hl_resp if isinstance(c, dict) and "c" in c
+            ]
             if len(closes) >= 24:
                 returns = [
                     math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))
@@ -2207,7 +2235,7 @@ async def execute_cycle(
 
                         pos_d = amt * unit_d
 
-                        if symbol in iname:
+                        if iname.startswith(f"{symbol}-"):
                             opt_cnt += 1
                             calc_opt_delta += pos_d
                             active_options_legs_raw.append(
@@ -2241,12 +2269,19 @@ async def execute_cycle(
                             )
 
                         parts = iname.split("-")
-                        strike_disp = (
-                            f"${float(parts[2]):,.0f}"
-                            if len(parts) >= 4
-                            and parts[2].replace(".", "", 1).isdigit()
-                            else "-"
-                        )
+                        strike_disp = "-"
+                        if len(parts) >= 4:
+                            try:
+                                strike_num = float(parts[2].replace("_", "."))
+                                if strike_num < 1.0:
+                                    strike_disp = f"${strike_num:,.4f}"
+                                elif strike_num < 100.0:
+                                    strike_disp = f"${strike_num:,.2f}"
+                                else:
+                                    strike_disp = f"${strike_num:,.0f}"
+                            except (ValueError, TypeError):
+                                strike_disp = parts[2]
+
                         dte_disp = (
                             f"{contract_dte:.1f}d" if contract_dte is not None else "-"
                         )
@@ -2276,7 +2311,7 @@ async def execute_cycle(
                             }
                         )
                     elif itype == "perp":
-                        if symbol in iname:
+                        if iname.startswith(f"{symbol}-"):
                             calc_perp_delta += amt
                         live_active_positions_table.append(
                             {
@@ -2322,7 +2357,9 @@ async def execute_cycle(
     # -------------------------------------------------------------
     prev_state = load_previous_position_state()
     eth_opt_legs = [
-        p for p in active_options_legs_raw if symbol in p.get("instrument_name", "")
+        p
+        for p in active_options_legs_raw
+        if p.get("instrument_name", "").startswith(f"{symbol}-")
     ]
     has_eth_ic_open = bool(eth_opt_legs and len(eth_opt_legs) >= 4)
 

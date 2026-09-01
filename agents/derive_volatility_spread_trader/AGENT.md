@@ -37,7 +37,7 @@ Identify volatility mispricings by comparing forecast realized volatility (RV) a
 ### 2. Strategy Modes & Structure Selection
 - **Long-Volatility Mode (Forecast RV - IV > Threshold)**:
   - Structure: ATM Straddle or 25-delta Straddle (14-30 DTE).
-  - Execution: Buy call + put; delta hedge with primary `ETH-PERP` (or configurable `BTC-PERP` / `HYPE-PERP`).
+  - Execution: Buy call + put; delta hedge with primary `ETH-PERP` (or configurable `BTC-PERP`, `HYPE-PERP`, `ZEC-PERP`, `SOL-PERP`, `XAUT-PERP`, `XRP-PERP`, `ADA-PERP`, `CC-PERP`).
 - **Short-Volatility Mode (IV - Forecast RV > Threshold)**:
   - Structure: Defined-risk Iron Condor / Iron Butterfly (15-20 delta wings).
   - Execution: Sell straddle/strangle with wing protection; tight risk limits.
