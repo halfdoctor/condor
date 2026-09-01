@@ -2480,9 +2480,7 @@ async def execute_cycle(
 
     # Strict TP/SL Evaluation: ONLY evaluated if mark data is verified reliable and entry credit is authentic
     if has_eth_ic_open and mark_data_reliable and entry_credit_usd >= 5.0:
-        min_pnl_threshold = max(
-            3.0, (config.target_profit_pct / 100.0) * entry_credit_usd * 0.95
-        )
+        min_pnl_threshold = (config.target_profit_pct / 100.0) * entry_credit_usd
         take_profit_triggered = (
             (profit_captured_pct >= config.target_profit_pct)
             and (unrealized_pnl >= min_pnl_threshold)
@@ -2617,7 +2615,7 @@ async def execute_cycle(
                     max_exit_cost = None
                     if take_profit_triggered:
                         max_exit_cost = entry_credit_usd * (
-                            1.0 - (config.target_profit_pct / 100.0) * 0.85
+                            1.0 - (config.target_profit_pct / 100.0)
                         )
                     elif stop_loss_triggered:
                         max_exit_cost = entry_credit_usd + (
@@ -2660,23 +2658,20 @@ async def execute_cycle(
                             else 0.0
                         )
 
-                        # HARD SAFETY GATE
+                        # HARD SAFETY GATE: Ensure quoted RFQ profit >= target_profit_pct before signing
                         can_execute_quote = True
                         if take_profit_triggered:
-                            min_required_profit = max(
-                                2.0,
-                                (config.target_profit_pct / 100.0)
-                                * entry_credit_usd
-                                * 0.85,
-                            )
+                            min_required_profit = (
+                                config.target_profit_pct / 100.0
+                            ) * entry_credit_usd
                             if (
-                                quote_realized_pnl < min_required_profit
-                                or quote_profit_pct < (config.target_profit_pct * 0.85)
+                                quote_profit_pct < config.target_profit_pct
+                                or quote_realized_pnl < min_required_profit
                             ):
                                 logger.warning(
                                     f"Take-Profit Quote REJECTED: Quoted cost ${quote_close_cost:.2f} yields PnL +${quote_realized_pnl:.2f} "
-                                    f"({quote_profit_pct:.1f}% profit vs minimum required ${min_required_profit:.2f}). "
-                                    f"Aborting execution to prevent closing at insufficient profit or loss."
+                                    f"({quote_profit_pct:.1f}% profit vs required target >={config.target_profit_pct:.1f}% / ${min_required_profit:.2f}). "
+                                    f"Aborting execution to prevent closing below target profit."
                                 )
                                 can_execute_quote = False
                         elif stop_loss_triggered:
