@@ -236,7 +236,7 @@ def test_install_bridge_runs_the_computed_command(monkeypatch):
     monkeypatch.setattr(setup_llm.subprocess, "run", fake_run)
 
     assert setup_llm._install_bridge("gemini", say=lambda *a: None) is True
-    assert calls["args"] == ["npm", "install", "-g", "@google/gemini-cli"]
+    assert calls["args"] == ["npm", "install", "-g", "antigravity-acp"]
 
 
 def test_install_bridge_reports_a_nonzero_exit(monkeypatch):

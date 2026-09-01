@@ -76,7 +76,8 @@ def test_connection_hint_points_at_docker_for_a_local_host():
     assert "docker compose ps" in hint
 
 
-def test_connection_hint_is_generic_for_a_remote_host():
+def test_connection_hint_is_generic_for_a_remote_host(monkeypatch):
+    monkeypatch.setattr(config_module, "USE_TAILSCALE", False)
     hint = doctor._connection_hint("some-remote-host", Exception("Connection refused"))
     assert "docker compose ps" not in hint
     assert "firewall" in hint

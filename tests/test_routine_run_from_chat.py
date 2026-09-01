@@ -170,6 +170,7 @@ def test_unreachable_main_process_is_a_tool_error(project, monkeypatch):
 
 def test_run_without_an_active_server_never_calls_the_api(project, monkeypatch):
     monkeypatch.setattr(mcp_routines.settings, "active_server", "")
+    monkeypatch.setattr(mcp_routines, "_resolve_active_server", lambda: None)
     api = _api(monkeypatch)
 
     out = asyncio.run(mcp_routines.run_routine("global_probe", {}))
