@@ -53,10 +53,13 @@ else:
     WEB_URL = f"http://localhost:{WEB_PORT}"
 
 # ── Telemetry (FEAT-023) ──
-# Opt-in and OFF by default. Nothing is collected, buffered or sent unless the
-# install's admin has explicitly consented, or an operator sets CONDOR_TELEMETRY
-# here. An unset value is *not* "on": it means "no override", and the stored
-# consent decides — whose default is `unknown`, which emits nothing.
+# An operator override, in both directions. An unset value means "no override",
+# and the stored consent decides — whose default, with no answer given, is
+# `ping`: the four adoption events and nothing else, from the first boot. The
+# admin prompt chooses between `ping` and `usage`. An install whose admin
+# *refused* (stored consent `denied`, from Settings -> Privacy or from an older
+# build's "No thanks") stays at `off` across upgrades; setting this to
+# `ping`/`usage` overrides that refusal too.
 #   off   - nothing, ever. emit() returns immediately.
 #   ping  - install / heartbeat / version_change / shutdown only.
 #   usage - the full allowlisted taxonomy in condor/telemetry/schema.py.
@@ -87,20 +90,37 @@ def resolve_mode(env=None) -> str:
     return MODE_LOCAL if value == MODE_LOCAL else MODE_TELEGRAM
 
 
+def resolve_use_tailscale(env=None) -> bool:
+    """Whether the dashboard is meant to be reached over a Tailscale tailnet.
+
+    Set by ``setup-environment.sh`` when the user opts in. Another reason (next
+    to local mode) :func:`resolve_web_host` binds loopback: ``tailscale serve``
+    (``utils/tailscale.py``) is what actually exposes the dashboard when this is
+    on, only on the tailnet.
+    """
+    env = os.environ if env is None else env
+    return (env.get("USE_TAILSCALE") or "").strip().lower() in ("true", "1", "yes")
+
+
 def resolve_web_host(env=None) -> str:
     """The address the dashboard binds to.
 
     Local mode has no login, so it binds loopback only: an unauthenticated
     dashboard with full trading control must not be one firewall rule away from
-    the internet. ``WEB_HOST`` is the explicit, documented opt-out (set it to
-    ``0.0.0.0`` and you have chosen to expose it). Telegram mode, which does
-    authenticate, keeps binding all interfaces.
+    the internet. Tailscale binds loopback for a related but different reason:
+    ``tailscale serve`` is what actually exposes it, only on the tailnet —
+    binding ``0.0.0.0`` at the same time would put it back on every public
+    interface too. ``WEB_HOST`` is the explicit, documented opt-out (set it to
+    ``0.0.0.0`` and you have chosen to expose it). Otherwise (Telegram mode,
+    Tailscale off), which does authenticate, keeps binding all interfaces.
     """
     env = os.environ if env is None else env
     explicit = (env.get("WEB_HOST") or "").strip()
     if explicit:
         return explicit
-    return "127.0.0.1" if resolve_mode(env) == MODE_LOCAL else "0.0.0.0"
+    if resolve_mode(env) == MODE_LOCAL or resolve_use_tailscale(env):
+        return "127.0.0.1"
+    return "0.0.0.0"
 
 
 def resolve_local_user_id(env=None) -> int:
@@ -203,5 +223,6 @@ def check_local_user(env=None, get_role=None) -> None:
 
 CONDOR_MODE = resolve_mode()
 LOCAL_MODE = CONDOR_MODE == MODE_LOCAL
+USE_TAILSCALE = resolve_use_tailscale()
 WEB_HOST = resolve_web_host()
 LOCAL_USER_ID = resolve_local_user_id()

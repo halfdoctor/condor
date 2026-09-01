@@ -312,12 +312,10 @@ def test_routines_dir_resolves_bare_agent_slug(tmp_path, monkeypatch):
 # ── Shared per-Agent skill library (FEAT-003 brain) ──
 
 
-def test_agent_skill_library_read_and_edit(tmp_path, monkeypatch):
+def test_agent_skill_library_read_and_edit(tmp_path):
     """An Agent's skills/<slug>/SKILL.md library is readable and editable."""
-    from condor.memory import paths as paths_module
     from condor.memory.skills import SkillStore
 
-    monkeypatch.setattr(paths_module, "_PROJECT_ROOT", tmp_path)
     skill_dir = tmp_path / "agents" / "executor_manager" / "skills" / "size_grid"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
@@ -735,6 +733,9 @@ def test_numeric_credentials_reach_the_subprocess_as_strings(monkeypatch):
     class _NumericPasswordServer:
         def get_accessible_servers(self, user_id):
             return ["local"]
+
+        def has_server_access(self, user_id, name, permission=None):
+            return True
 
         def get_server(self, name):
             return {

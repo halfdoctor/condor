@@ -20,7 +20,7 @@ from pathlib import Path
 
 from mcp_servers.condor.condor_client import call_main_api
 from mcp_servers.condor.exceptions import APIError
-from mcp_servers.condor.settings import settings
+from mcp_servers.condor.settings import caller_slug, settings
 
 # Wall-clock budget for a delegated one-shot run, unchanged from when the tool
 # executed the routine itself, and the granularity we poll the run with.
@@ -231,7 +231,7 @@ def _resolve_with_owner(name: str, target: str | None):
             if found:
                 return found, owner
 
-    return _resolve_routine(name), owner or settings.specialist_slug or "condor"
+    return _resolve_routine(name), caller_slug(owner)
 
 
 def _store_name(routine, fallback: str) -> str:
@@ -457,7 +457,12 @@ async def get_instance(instance_id: str) -> dict:
 async def start_routine(
     name: str, config: dict | None, target: str | None = None
 ) -> dict:
-    """Start a continuous routine in the main process, so it can be stopped there."""
+    """Start a continuous routine in the main process, so it can be stopped there.
+
+    Takes the same ``target`` as ``run`` and resolves it the same way: starting a
+    continuous routine and running a one-shot are the same question — "who is
+    this run for?" — and it must not have two answers (ARCH-218).
+    """
     routine, agent = _resolve_with_owner(name, target)
     if not routine:
         return {"error": f"Routine '{name}' not found"}
@@ -484,7 +489,7 @@ async def start_routine(
                     "routine_name": _store_name(routine, name),
                     "server_name": active_server,
                     "config": config or {},
-                    "attribute_to": agent or settings.specialist_slug or "condor",
+                    "attribute_to": agent,
                 }
             ),
         )

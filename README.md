@@ -15,9 +15,11 @@ A Telegram bot for monitoring and trading with Hummingbot via the **Hummingbot A
 > **Privacy:** Condor counts installs anonymously — a random id, the version,
 > and a heartbeat; nothing about you or your trading. Everything beyond that is
 > **opt-in** from the one prompt it sends on first boot, and
-> `CONDOR_TELEMETRY=off` silences telemetry entirely. What each level does and
-> does not collect, where it goes, and how to verify it, is spelled out in
-> [PRIVACY.md](PRIVACY.md).
+> `CONDOR_TELEMETRY=off` silences telemetry entirely. Your conversations are
+> never part of that: the only way one leaves is if you press Share on it and
+> confirm the redacted transcript, which `CONDOR_SHARING=off` disables outright.
+> What each level does and does not collect, where it goes, and how to verify
+> it, is spelled out in [PRIVACY.md](PRIVACY.md).
 
 ## Features
 
@@ -95,6 +97,7 @@ The following applies after **Install Condor**. If you used **Install only Hummi
 - **Control:** `make run` starts Condor in that session, `make stop` stops it, `make restart` does both, `make status` shows whether it is up. Use `make run-fg` to run in the foreground when a startup error needs debugging.
 - In Telegram, use **`/servers`** for Hummingbot API URLs and auth, **`/keys`** for exchange credentials, and **`/gateway`** for DEX setup (or **`/start`** for the setup shortcuts) so commands like `/portfolio` and `/trade` can reach your stack.
 - If Condor and the API are on **different machines**, install [Tailscale](https://tailscale.com/download) on the Condor host and add the API in **`/servers`** with host **`hummingbot-api`** (not a public IP). See [Secure Connection via Tailscale](#secure-connection-via-tailscale) below.
+- **Check the install:** `make doctor` re-verifies dependencies, `.env`/`config.yml`, the AI model, the dashboard's network binding, Tailscale, and whether every configured Hummingbot API server is actually reachable and authenticating. Run it any time something stops working — it is read-only.
 - If something fails, see **Troubleshooting** below.
 
 ## Local mode (no Telegram)
@@ -365,7 +368,7 @@ make tailscale-status   # confirm hummingbot-api appears on your tailnet
 Test from the Condor host:
 
 ```bash
-curl -u YOUR_USERNAME:YOUR_PASSWORD http://hummingbot-api:8000/health
+curl -u YOUR_USERNAME:YOUR_PASSWORD http://hummingbot-api:8000/
 ```
 
 ### Manual install (`make install`)
@@ -407,6 +410,10 @@ Both `condor` and `hummingbot-api` should appear as connected peers.
 **Do not open port 8000 on your public firewall** when Tailscale is enabled. Allow SSH (port 22) for server administration only.
 
 ## Troubleshooting
+
+Start with `make doctor` — it checks dependencies, config, the AI model, port
+exposure, Tailscale, and API connectivity in one pass, and names the fix for
+whatever it finds. The table below covers the rest.
 
 | Issue | Solution |
 |-------|----------|

@@ -19,6 +19,7 @@ from telegram.ext import (
     filters,
 )
 
+from condor import paths
 from condor.persistence import SafePicklePersistence
 from condor.telemetry import taps as telemetry_taps
 from handlers import cancel_command, clear_all_input_states
@@ -26,6 +27,7 @@ from utils.auth import restricted
 from utils.config import (
     LOCAL_MODE,
     TELEGRAM_TOKEN,
+    USE_TAILSCALE,
     WEB_HOST,
     WEB_PORT,
     WEB_URL,
@@ -213,61 +215,72 @@ async def start_callback_handler(
             await _show_admin_menu(query, context)
 
 
+# Modules the handlers import from that do not live under ``handlers/``, and
+# that are safe to re-execute. Everything under ``handlers/`` itself is
+# discovered by :func:`_discover_handler_modules`.
+#
+# ``routines/`` is deliberately absent: routines have their own mtime-aware
+# discovery in ``routines.base.discover_routines(force_reload=True)``, which
+# owns reimporting individual routine modules. Only the base module is listed,
+# so that machinery itself stays fresh.
+_EXTRA_RELOAD_MODULES = (
+    "config_manager",
+    "utils.auth",
+    "utils.telegram_formatters",
+    "routines.base",
+)
+
+
+def _discover_handler_modules() -> list[str]:
+    """Every module under ``handlers/``, children before parents.
+
+    Derived rather than hand-listed. A hand-maintained list drifts, and it
+    drifts *silently*: ``reload_handlers`` skips any name not in
+    ``sys.modules``, so a stale entry is a no-op and a missing entry means the
+    watcher logs a successful reload while the running bot keeps the old code.
+    That is worse than no hot-reload, because it reports success. The list this
+    replaced named three ``handlers.dex.swap_*`` modules that no longer exist
+    and omitted six that do, including ``handlers.dex.router``.
+
+    Naming every module matters because ``importlib.reload`` is NOT recursive:
+    reloading ``handlers.dex`` re-executes its ``__init__``, but its
+    ``from .router import ...`` re-binds the *cached* ``handlers.dex.router``,
+    so an edit there is missed unless that module is reloaded in its own right.
+
+    For the same reason children sort before parents: by the time a package's
+    ``__init__`` re-executes, the submodules it imports from have already been
+    refreshed.
+    """
+    root = Path(__file__).parent / "handlers"
+    modules: set[str] = set()
+    for path in root.rglob("*.py"):
+        parts = path.relative_to(root.parent).with_suffix("").parts
+        # Per-agent runtime stores can sit under a watched tree (FEAT-003) and
+        # are data, not code — the file watcher skips them for the same reason.
+        if "__pycache__" in parts or "store" in parts:
+            continue
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts:
+            modules.add(".".join(parts))
+    return sorted(modules, key=lambda name: (-name.count("."), name))
+
+
 def reload_handlers():
     """Reload all handler modules."""
-    modules_to_reload = [
-        "handlers.portfolio",
-        "handlers.bots",
-        "handlers.bots.menu",
-        "handlers.bots.controllers",
-        "handlers.bots._shared",
-        "handlers.executors",
-        "handlers.executors.menu",
-        "handlers.executors.grid",
-        "handlers.executors.position",
-        "handlers.executors._shared",
-        "handlers.trading",
-        "handlers.trading.router",
-        "handlers.cex",
-        "handlers.cex.menu",
-        "handlers.cex.trade",
-        "handlers.cex.orders",
-        "handlers.cex.positions",
-        "handlers.cex._shared",
-        "handlers.dex",
-        "handlers.dex.menu",
-        "handlers.dex.swap_quote",
-        "handlers.dex.swap_execute",
-        "handlers.dex.swap_history",
-        "handlers.dex.pools",
-        "handlers.dex._shared",
-        "handlers.config",
-        "handlers.config.servers",
-        "handlers.config.api_keys",
-        "handlers.config.gateway",
-        "handlers.config.user_preferences",
-        "routines.base",
-        "handlers.routines",
-        "handlers.agents",
-        "handlers.agents.menu",
-        # NOTE: no "condor.runtime.*" module belongs in this list. The runtime
-        # holds live subprocess handles (agent sessions); re-executing those
-        # modules resets the registry and silently orphans every running agent.
-        "handlers.agents.stream",
-        "handlers.agents.confirmation",
-        "handlers.agents._shared",
-        "handlers.memory",
-        "handlers.admin",
-        "handlers.admin.update",
-        "utils.auth",
-        "utils.telegram_formatters",
-        "config_manager",
-    ]
+    # NOTE: no "condor.runtime.*" module belongs here. The runtime holds live
+    # subprocess handles (agent sessions); re-executing those modules resets
+    # the registry and silently orphans every running agent. The discovery
+    # above only walks handlers/, so it cannot pull them in.
+    modules_to_reload = [*_EXTRA_RELOAD_MODULES, *_discover_handler_modules()]
 
+    reloaded = 0
     for module_name in modules_to_reload:
         if module_name in sys.modules:
             importlib.reload(sys.modules[module_name])
-            logger.info(f"Reloaded module: {module_name}")
+            logger.debug(f"Reloaded module: {module_name}")
+            reloaded += 1
+    logger.info(f"Reloaded {reloaded} modules")
 
     # Re-register fetch functions after reload (preserves in-memory cache)
     try:
@@ -525,7 +538,7 @@ async def _notify_interrupted_runs(bot, report) -> None:
     One summary per chat rather than a message per run: a crash with several
     live loops would otherwise spam the user at the worst possible moment.
     """
-    from condor.notifications import NotifyBot
+    from condor.notifications import announce, user_for_chat
 
     by_chat: dict[int, list] = {}
     for run in report.interrupted:
@@ -546,24 +559,17 @@ async def _notify_interrupted_runs(bot, report) -> None:
             suffix = " — restarted" if run.restarted else ""
             lines.append(f"• {run.label} (last tick {run.last_tick}){suffix}")
         text = "\n".join(lines)
+        # Telegram and the bell (FEAT-048) in one call: ``announce`` resolves
+        # the sender once and files the notice exactly once, including when the
+        # sender *is* the bell (local mode, FEAT-049). A private chat id is the
+        # owner's user id; a group has no dashboard owner, so a group summary is
+        # simply not filed anywhere.
         try:
-            await bot.send_message(chat_id=chat_id, text=text)
+            await announce(
+                user_for_chat(chat_id), chat_id, text, kind="system", bot=bot
+            )
         except Exception:
             logger.warning("Could not notify chat %s about interrupted runs", chat_id)
-        # And on the bell (FEAT-048). A private chat id is the owner's user id;
-        # ``record`` ignores anything that is not one, so a group summary is
-        # simply not filed anywhere. Skipped when the sender above *is* the bell
-        # (local mode, FEAT-049): it already filed exactly this text.
-        if isinstance(bot, NotifyBot):
-            continue
-        try:
-            from condor.notifications import record, user_for_chat
-
-            owner = user_for_chat(chat_id)
-            if owner:
-                await record(owner, text, kind="system")
-        except Exception:
-            logger.debug("Could not record interrupted-run notice", exc_info=True)
 
 
 def _outbound_bot(application: Application):
@@ -593,6 +599,15 @@ async def startup(application: Application) -> None:
     and never run — which is exactly how boot reconciliation silently died.
     Called explicitly from :func:`_run_dual`, before the first update is served.
     """
+    # First, before anything reads a conversation or reconciles a delegation:
+    # settle where the runtime store lives (FEAT-051). Idempotent, so this is a
+    # no-op on every boot after the first; it is a named public function rather
+    # than inline code because a second entry point (a CLI, a worker) would have
+    # to call it too.
+    from condor.migrations import ensure_migrated
+
+    ensure_migrated()
+
     # Sync server permissions (ensures all servers have ownership entries)
     await sync_server_permissions()
 
@@ -632,6 +647,13 @@ async def startup(application: Application) -> None:
     sds = get_server_data_service()
     sds.start()
     await sds.auto_subscribe_servers()
+
+    # Ride the ticker-pool poll the SDS just started: an hourly price snapshot
+    # per server is the only source of 24h change on the CLOB side, and it costs
+    # no upstream request (FEAT-053).
+    from condor import ticker_history
+
+    ticker_history.install_listener()
 
     # Start agent session health monitor. The health monitor is process
     # lifecycle, not a session operation, so it is driven off the module
@@ -677,6 +699,20 @@ async def startup(application: Application) -> None:
         logger.info("Telemetry level: %s", level)
     except Exception:
         logger.exception("Telemetry init failed (continuing without it)")
+
+    # Conversation sharing (FEAT-054, FEAT-055). Two jobs, deliberately not part
+    # of the telemetry block above: they share no consent record, no queue and
+    # no endpoint with it. Both are free on an install where nobody has opted
+    # in — the delivery job finds an empty queue and the sweep finds no user at
+    # ``always``, and neither touches the network.
+    try:
+        from condor.sharing import share as sharing
+        from condor.sharing import sweep as sharing_sweep
+
+        sharing.register_jobs(application)
+        sharing_sweep.register_jobs(application)
+    except Exception:
+        logger.exception("Sharing job registration failed (continuing without it)")
 
     # Start file watcher
     asyncio.create_task(watch_and_reload(application))
@@ -791,13 +827,14 @@ def get_persistence() -> SafePicklePersistence:
     """
     Build a persistence object that works both locally and in Docker.
     - Uses an env var override if provided.
-    - Defaults to <project_root>/data/condor_bot_data.pickle.
+    - Defaults to <project_root>/data/condor_bot_data.pickle, resolved through
+      condor.paths.data_dir() so $CONDOR_DATA_DIR repoints the whole
+      operational store at once rather than this one file.
     - Ensures the parent directory exists, but does NOT create the file.
     - Uses SafePicklePersistence for atomic writes, backup recovery,
       and ephemeral key filtering.
     """
-    base_dir = Path(__file__).parent
-    default_path = base_dir / "data" / "condor_bot_data.pickle"
+    default_path = paths.data_dir() / "condor_bot_data.pickle"
 
     persistence_path = Path(os.getenv("CONDOR_PERSISTENCE_FILE", default_path))
 
@@ -908,7 +945,8 @@ def _web_server_config(web_app):
     """uvicorn's config for the dashboard, isolated so the bind address is testable.
 
     ``WEB_HOST`` is ``0.0.0.0`` in telegram mode (unchanged) and loopback in
-    local mode, where the dashboard has no login at all — see
+    local mode, where the dashboard has no login at all, or when Tailscale is
+    enabled, where `tailscale serve` is what actually exposes it — see
     :func:`utils.config.resolve_web_host` for why that is not negotiable by
     accident.
     """
@@ -951,8 +989,21 @@ async def _run_dual(application: Application) -> None:
         await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await application.start()
 
-    # Create and start the web server
+    # Create and start the web server. WEB_HOST (utils.config.resolve_web_host)
+    # already resolves to loopback for Tailscale same as it does for local mode
+    # -- here we only have to make sure `tailscale serve` is actually proxying
+    # the tailnet to that loopback bind, or it would be reachable nowhere at
+    # all.
     web_app = create_app()
+    if USE_TAILSCALE:
+        from utils.tailscale import ensure_serve
+
+        if not await ensure_serve(WEB_PORT):
+            logger.error(
+                "Dashboard bound to 127.0.0.1 only; tailnet forwarding could "
+                "not be confirmed, so it will NOT be reachable remotely "
+                "until `tailscale serve` is fixed (see error above)."
+            )
     server = uvicorn.Server(_web_server_config(web_app))
 
     # Start WebSocket manager
