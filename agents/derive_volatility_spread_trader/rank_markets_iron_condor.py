@@ -33,7 +33,7 @@ class MarketRanker:
         except Exception as e:
             return {"symbol": symbol, "data": None, "error": str(e)}
 
-    def scan_and_rank(self) -> list:
+    def scan_and_rank(self, sort_by: str = "readiness") -> list:
         # Parallel fetch for low latency
         raw_results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
@@ -77,6 +77,8 @@ class MarketRanker:
                         "allowed": False,
                         "rec": "NOT_LISTED",
                         "confidence": 0,
+                        "tier_order": 0,
+                        "failed_gates": ["Not Listed"],
                         "reasons": [
                             "Market not currently listed on options exchange dashboard."
                         ],
@@ -122,6 +124,22 @@ class MarketRanker:
             reasons = signal["reasons"]
             suggested_strikes = signal["suggested_strikes"]
             optimal_dte = signal.get("optimal_dte", {})
+
+            # Identify failed gates from rule_evaluation
+            rule_eval = signal.get("rule_evaluation", {})
+            failed_gates = []
+            if not rule_eval.get("volatility_rule_passed", True):
+                failed_gates.append("Vol")
+            if not rule_eval.get("gamma_regime_rule_passed", True):
+                failed_gates.append("GEX")
+            if not rule_eval.get("spot_vs_flip_rule_passed", True):
+                failed_gates.append("Flip")
+            if not rule_eval.get("term_structure_rule_passed", True):
+                failed_gates.append("Term")
+            if not rule_eval.get("skew_rule_passed", True):
+                failed_gates.append("Skew")
+
+            tier_order = 3 if allowed else (2 if rec == "HOLD_NEUTRAL" else 1)
 
             # --- Quantitative Multi-Factor Ranking (0 - 100) ---
             # 1. Vol Edge / VRP Score (Max 30 pts)
@@ -179,6 +197,8 @@ class MarketRanker:
                     "symbol": sym,
                     "status": "ACTIVE",
                     "score": total_score,
+                    "tier_order": tier_order,
+                    "failed_gates": failed_gates,
                     "score_breakdown": {
                         "vrp_score": score_vrp,
                         "gex_score": score_gex,
@@ -208,33 +228,56 @@ class MarketRanker:
                 }
             )
 
-        # Sort descending by score
-        market_data.sort(key=lambda x: x["score"], reverse=True)
+        # Sort based on strategy preference
+        if sort_by == "readiness":
+            market_data.sort(
+                key=lambda x: (
+                    x.get("tier_order", 0),
+                    x["score"],
+                    x.get("confidence", 0),
+                ),
+                reverse=True,
+            )
+        elif sort_by == "confidence":
+            market_data.sort(
+                key=lambda x: (x.get("confidence", 0), x["score"]),
+                reverse=True,
+            )
+        else:  # "score"
+            market_data.sort(key=lambda x: x["score"], reverse=True)
+
         return market_data
 
 
-def render_ranking_cli(ranked_markets: list):
+def render_ranking_cli(ranked_markets: list, sort_by: str = "readiness"):
     c = Colors
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    print("\n" + "=" * 110)
+    sort_labels = {
+        "readiness": "READINESS (Actionable First)",
+        "score": "SCORE (Raw Multi-Factor)",
+        "confidence": "CONFIDENCE (Strategy Conviction)",
+    }
+    sort_disp = sort_labels.get(sort_by, sort_by.upper())
+
+    print("\n" + "=" * 142)
     print(
         f"{c.BOLD}{c.HEADER}  DERIVATIVES MONKEY MULTI-MARKET SCANNER — SHORT-VOL IRON CONDOR RANKING{c.ENDC}"
     )
     print(
-        f"{c.DIM}  Scan Time: {ts} | Scoring: Vol Edge (30%) + GEX/Dealer Hedge (35%) + Term Structure (20%) + Skew (15%){c.ENDC}"
+        f"{c.DIM}  Scan Time: {ts} | Sort: {sort_disp} | Scoring: Vol Edge (30%) + GEX/Dealer Hedge (35%) + Term Structure (20%) + Skew (15%){c.ENDC}"
     )
-    print("=" * 110 + "\n")
+    print("=" * 142 + "\n")
 
     # Table Header
-    header = f"{'Rank':<5} {'Market':<7} {'Score':<8} {'Spot Price':<12} {'30D IV':<9} {'RV':<8} {'VRP (pts)':<11} {'GEX Regime':<15} {'Dist Flip':<11} {'Term Structure':<16} {'Skew':<13} {'Signal':<12}"
+    header = f"{'Rank':<5} {'Market':<7} {'Score':<8} {'Conf':<6} {'Spot Price':<12} {'30D IV':<9} {'RV':<8} {'VRP (pts)':<11} {'GEX Regime':<15} {'Dist Flip':<11} {'Term Structure':<16} {'Skew':<13} {'Signal':<16}"
     print(f"{c.BOLD}{header}{c.ENDC}")
-    print("-" * 135)
+    print("-" * 142)
 
     for idx, m in enumerate(ranked_markets, 1):
         if m["status"] != "ACTIVE":
             print(
-                f"{idx:<5} {m['symbol']:<7} {'0/100':<8} {'—':<12} {'—':<9} {'—':<8} {'—':<11} {c.DIM}{'NOT LISTED':<15}{c.ENDC} {'—':<11} {'—':<16} {'—':<13} {c.DIM}UNAVAILABLE{c.ENDC}"
+                f"{idx:<5} {m['symbol']:<7} {'0/100':<8} {'—':<6} {'—':<12} {'—':<9} {'—':<8} {'—':<11} {c.DIM}{'NOT LISTED':<15}{c.ENDC} {'—':<11} {'—':<16} {'—':<13} {c.DIM}UNAVAILABLE{c.ENDC}"
             )
             continue
 
@@ -248,6 +291,17 @@ def render_ranking_cli(ranked_markets: list):
                 else f"{c.FAIL}{score_str:<8}{c.ENDC}"
             )
         )
+
+        conf_val = m.get("confidence", 0)
+        conf_str = f"{conf_val}%"
+        if conf_val >= 80:
+            conf_colored = f"{c.BOLD}{c.OKGREEN}{conf_str:<6}{c.ENDC}"
+        elif conf_val >= 65:
+            conf_colored = f"{c.OKGREEN}{conf_str:<6}{c.ENDC}"
+        elif conf_val >= 50:
+            conf_colored = f"{c.WARNING}{conf_str:<6}{c.ENDC}"
+        else:
+            conf_colored = f"{c.FAIL}{conf_str:<6}{c.ENDC}"
 
         spot_str = f"${m['spot']:,.2f}"
         iv_str = f"{m['iv30']:.1f}%"
@@ -284,18 +338,23 @@ def render_ranking_cli(ranked_markets: list):
         # Skew
         skew_str = m["skew_bias"].upper()[:12]
 
-        # Allowed / Rec
+        # Allowed / Rec with failed gates annotation
+        failed = m.get("failed_gates", [])
+        fail_desc = f" ({','.join(failed)})" if failed else ""
         if m["allowed"]:
-            rec_str = f"{c.BOLD}{c.OKGREEN}ALLOWED{c.ENDC}"
+            rec_raw = "ALLOWED"
+            rec_colored = f"{c.BOLD}{c.OKGREEN}{rec_raw:<16}{c.ENDC}"
         elif m["rec"] == "HOLD_NEUTRAL":
-            rec_str = f"{c.WARNING}WATCHLIST{c.ENDC}"
+            rec_raw = f"WATCH{fail_desc}"
+            rec_colored = f"{c.WARNING}{rec_raw:<16}{c.ENDC}"
         else:
-            rec_str = f"{c.FAIL}AVOID{c.ENDC}"
+            rec_raw = f"AVOID{fail_desc}"
+            rec_colored = f"{c.FAIL}{rec_raw:<16}{c.ENDC}"
 
-        row = f"{idx:<5} {c.BOLD}{m['symbol']:<7}{c.ENDC} {score_colored} {spot_str:<12} {iv_str:<9} {rv_str:<8} {vrp_str:<11} {gex_colored} {dist_colored} {term_colored} {skew_str:<13} {rec_str:<12}"
+        row = f"{idx:<5} {c.BOLD}{m['symbol']:<7}{c.ENDC} {score_colored} {conf_colored} {spot_str:<12} {iv_str:<9} {rv_str:<8} {vrp_str:<11} {gex_colored} {dist_colored} {term_colored} {skew_str:<13} {rec_colored}"
         print(row)
 
-    print("-" * 135)
+    print("-" * 142)
 
     # --- Actionable Execution Summary ---
     active_allowed = [
@@ -414,14 +473,37 @@ def render_ranking_cli(ranked_markets: list):
         print(f"│")
         print(f"│ {c.BOLD}⚡ WATCHLIST / CONDITIONAL TRIGGERS:{c.ENDC}")
         for w in watchlist:
-            if w["dist_pct"] <= 0:
-                trigger_note = f"Spot (${w['spot']:,.2f}) needs to cross above Gamma Flip (${w['flip']:,.2f})"
-            elif w["net_gamma_reg"] not in ["long_gamma", "positive"]:
-                trigger_note = f"Dealer GEX needs to flip positive (currently {w['net_gamma_reg']})"
-            else:
-                trigger_note = f"Volatility edge needs to expand (currently VRP {w['vrp']:+.2f} vol pts)"
+            failed = w.get("failed_gates", [])
+            triggers = []
+            if "Flip" in failed or w["dist_pct"] <= 0:
+                triggers.append(
+                    f"Spot (${w['spot']:,.2f}) must clear Gamma Flip (${w['flip']:,.2f})"
+                )
+            if "GEX" in failed or w["net_gamma_reg"] not in ["long_gamma", "positive"]:
+                triggers.append(
+                    f"Dealer GEX must flip positive (currently {w['net_gamma_reg']})"
+                )
+            if "Term" in failed or w["term_tag"] != "contango":
+                triggers.append(
+                    f"Term structure must normalize to contango (currently {w['term_tag'].upper()} {w['term_spread']:+.1f} pts)"
+                )
+            if "Vol" in failed:
+                triggers.append(
+                    f"Volatility edge must expand (currently VRP {w['vrp']:+.2f} vol pts)"
+                )
+            if "Skew" in failed:
+                triggers.append(
+                    f"Skew must recover from panic put bias (25D RR: {w['rr25']:.1f})"
+                )
+
+            if not triggers:
+                triggers.append(
+                    f"Volatility edge needs to expand (currently VRP {w['vrp']:+.2f} vol pts)"
+                )
+
+            trigger_note = " & ".join(triggers)
             print(
-                f"│   • {c.BOLD}{w['symbol']:<5}{c.ENDC} (Score: {w['score']:>2}/100) — {trigger_note}"
+                f"│   • {c.BOLD}{w['symbol']:<5}{c.ENDC} (Score: {w['score']:>2}/100 | Conf: {w['confidence']}%) — {trigger_note}"
             )
 
     print(
@@ -439,6 +521,14 @@ def main():
         type=str,
         default=",".join(DEFAULT_MARKETS),
         help="Comma-separated list of symbols (default: ETH,BTC,HYPE,XAUT,SOL,XRP,ZEC,ADA,CC)",
+    )
+    parser.add_argument(
+        "-s",
+        "--sort",
+        type=str,
+        choices=["readiness", "score", "confidence"],
+        default="readiness",
+        help="Sort ranking by: readiness (deployment tier + score), score (raw multi-factor), or confidence (default: readiness)",
     )
     parser.add_argument(
         "-j", "--json", action="store_true", help="Output raw JSON ranking"
@@ -470,7 +560,7 @@ def main():
 
     while True:
         try:
-            ranked = ranker.scan_and_rank()
+            ranked = ranker.scan_and_rank(sort_by=args.sort)
 
             if args.output:
                 with open(args.output, "w") as f:
@@ -481,7 +571,7 @@ def main():
             else:
                 if args.watch:
                     os.system("cls" if os.name == "nt" else "clear")
-                render_ranking_cli(ranked)
+                render_ranking_cli(ranked, sort_by=args.sort)
 
         except Exception as e:
             print(

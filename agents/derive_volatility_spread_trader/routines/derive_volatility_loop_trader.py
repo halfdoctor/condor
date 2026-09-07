@@ -3260,6 +3260,7 @@ async def execute_cycle(
         if rebalance_needed_flag
         else round(abs(delta_imbalance_val), size_decimals)
     )
+    hedge_side_val = "SELL" if delta_imbalance_val < 0 else "BUY"
 
     save_heartbeat(
         {
