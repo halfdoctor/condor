@@ -18,6 +18,17 @@ what a routine reaches. It follows that calling ``execute_code`` is handing over
 the whole process, so every caller must gate it at least as tightly as
 ``condor/web/routes/code.py`` does (SEC-151); "the caller is authenticated" is
 not a gate.
+
+Which means the ``code_run`` preference that gate honors is **admin-equivalent
+by construction**, not a narrower permission that happens to include code: a
+snippet reaches the API client, the config, every ``condor.*`` module and the
+process itself, so granting it grants everything a confirmation prompt stands in
+front of elsewhere (SEC-616). Grant it as you would admin. A snippet is not
+confirmed per call on purpose — gating it by name would put a prompt in front of
+every agent tick's market read — so this grant, the per-run record in
+``condor/code_runs.py`` and the action-log row
+(:func:`condor.runtime.danger.is_code_execution_call`) are the whole containment;
+unattended dry-run sessions refuse it outright in ``condor/agents/risk.py``.
 """
 
 from __future__ import annotations
@@ -184,6 +195,10 @@ async def execute_code(
         id=run_id,
         created=time.time(),
         agent=agent,
+        # The same authenticated id that resolves the client and stamps the
+        # run's reports. Recording it is what lets a listing authorize its rows
+        # without opening them (FEAT-061); 0 when nothing authenticated.
+        user_id=chat_id,
         label=label,
         server=server_name,
         code=code,

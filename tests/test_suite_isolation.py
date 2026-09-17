@@ -9,15 +9,17 @@ Asserting on "nothing appeared on disk after the run" would be flaky (the real
 bot may be running while the suite is), so what is pinned here is the mechanism
 instead: with the autouse fixture in ``conftest.py`` active, every path a
 writer can build resolves outside the repository. If someone reintroduces a
-root that ignores ``CONDOR_RUNTIME_ROOT``, ``CONDOR_DATA_DIR`` or
-``CONDOR_AGENTS_ROOT``, one of these fails.
+root that ignores ``CONDOR_RUNTIME_ROOT``, ``CONDOR_DATA_DIR``,
+``CONDOR_AGENTS_ROOT``, ``CONDOR_STOCK_AGENTS_ROOT`` or ``CONDOR_REPORTS_DIR``,
+one of these fails.
 
-All three roots are covered, because all three are durable and all three were
+All four roots are covered, because all four are durable and all four were
 reachable from a test: ``.condor/`` (conversations, delegations, state,
 telemetry), ``data/`` (the bell, routine hooks, backtests, code runs) -- whose
 three cwd-relative constants READ-215 replaced with resolvers -- and
 ``agents/`` (every agent's per-user memory and skill library), the one READ-215
-did not reach and CORR-220 did.
+did not reach and CORR-220 did -- and ``reports/``, which had a constant *and*
+a cwd-relative twin until ARCH-605 gave it a resolver.
 """
 
 from pathlib import Path
@@ -25,6 +27,8 @@ from pathlib import Path
 from condor import backtest_store, code_runs, paths
 from condor.agents.delegate import DelegateTask, _record_dir
 from condor.memory import paths as memory_paths
+from condor.reports import store as report_store
+from handlers.bots import archived_report
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -54,10 +58,22 @@ def test_the_agent_stores_are_isolated_too():
     the two stores can build is asserted here, the default slug and a named
     agent alike.
     """
-    assert paths.agents_root() != REPO / "agents"
-    assert _outside_the_repo(paths.agents_root())
-    assert _outside_the_repo(memory_paths.assistant_home())
-    assert _outside_the_repo(memory_paths.assistant_home("grid_scalper"))
+    assert paths.local_agents_root() != REPO / "agents"
+    assert _outside_the_repo(paths.local_agents_root())
+    # The shipped root is repointed too: a test that saw the real library
+    # layered under its tmp root would list the developer's whole registry.
+    assert paths.stock_agents_root() != REPO / "agents"
+    assert _outside_the_repo(paths.stock_agents_root())
+    assert _outside_the_repo(memory_paths.agent_home())
+    assert _outside_the_repo(memory_paths.agent_home("grid_scalper"))
+    for home in memory_paths.agent_home_layers("grid_scalper"):
+        assert _outside_the_repo(home)
+    for root in memory_paths.shared_skills_roots():
+        assert _outside_the_repo(root)
+    for root in memory_paths.shared_routines_roots():
+        assert _outside_the_repo(root)
+    for root in memory_paths.defaults_layers():
+        assert _outside_the_repo(root)
     assert _outside_the_repo(memory_paths.store_root(42))
     assert _outside_the_repo(memory_paths.store_root(42, "grid_scalper"))
     assert _outside_the_repo(memory_paths.builtin_skills_root("grid_scalper"))
@@ -97,6 +113,23 @@ def test_the_operational_store_is_isolated_too():
     assert _outside_the_repo(paths.backtests_dir())
     assert _outside_the_repo(paths.legacy_backtests_file())
     assert _outside_the_repo(paths.code_runs_dir())
+
+
+def test_the_report_output_root_is_isolated_too():
+    """``reports/`` is the fourth durable root (ARCH-605).
+
+    It was a module constant until the resolver arrived, so a test that forgot
+    the monkeypatch pair wrote an HTML report -- and an index row pointing at it
+    -- into the developer's live ``reports/``, where the dashboard then listed
+    it. Both producers are asserted: the store and the archived-bot report
+    writer, which used to build the *cwd-relative* name instead.
+    """
+    assert paths.reports_dir() != REPO / "reports"
+    assert _outside_the_repo(paths.reports_dir())
+    assert _outside_the_repo(paths.reports_index_path())
+    assert _outside_the_repo(report_store._charts_dir())
+    assert _outside_the_repo(report_store._index_file())
+    assert _outside_the_repo(archived_report.ensure_reports_dir())
 
 
 def test_the_default_stores_land_outside_the_install():

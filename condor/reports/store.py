@@ -9,11 +9,9 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 
+from condor import paths
 from condor.fsutil import atomic_write_json, atomic_write_text
 
-# reports/ is a repository-root output directory, not this source package.
-CHARTS_DIR = Path(__file__).resolve().parents[2] / "reports"
-INDEX_FILE = CHARTS_DIR / "reports_index.json"
 MAX_REPORTS = int(os.environ.get("CONDOR_MAX_REPORTS", "100"))
 
 _index_lock = asyncio.Lock()
@@ -32,17 +30,13 @@ _report_owner: contextvars.ContextVar[int | None] = contextvars.ContextVar(
 
 
 def _charts_dir() -> Path:
-    # Resolve through the public package so existing runtime overrides of
-    # condor.reports.CHARTS_DIR keep working after the module-to-package split.
-    from . import CHARTS_DIR as configured_dir
-
-    return configured_dir
+    # reports/ is a repository-root output directory, not this source package;
+    # condor.paths owns it, so $CONDOR_REPORTS_DIR moves it after import.
+    return paths.reports_dir()
 
 
 def _index_file() -> Path:
-    from . import INDEX_FILE as configured_file
-
-    return configured_file
+    return paths.reports_index_path()
 
 
 def reset_last_report_id() -> None:
@@ -163,6 +157,27 @@ def get_report_raw_html(report_id: str) -> tuple[str, str] | None:
     return path.read_text(encoding="utf-8"), entry["filename"]
 
 
+def resolve_report_asset(filename: str) -> Path | None:
+    """Resolve a persisted report asset (the plotly bundle) by name, or None.
+
+    The name is matched against a fixed allowlist pattern before it is joined,
+    and the resolved path must still land inside ``reports/_assets``. This is
+    deliberately *not* a ``/{name}`` handler that reads a caller-supplied path
+    — that shape is what SEC-044 and SEC-112 removed. Assets are vendored
+    library bytes, identical for every user and carrying no account data, so
+    unlike report bodies they need no authentication.
+    """
+    from . import rendering
+
+    if not rendering.PLOTLY_ASSET_PATTERN.fullmatch(filename):
+        return None
+    directory = rendering.assets_dir(_charts_dir()).resolve()
+    path = (directory / filename).resolve()
+    if not path.is_relative_to(directory) or not path.is_file():
+        return None
+    return path
+
+
 def _read_index() -> list[dict]:
     index_file = _index_file()
     if not index_file.exists():
@@ -187,6 +202,7 @@ def list_reports(
     tag: str | None = None,
     search: str | None = None,
     agent: str | None = None,
+    subject: str | None = None,
     limit: int = 50,
     offset: int = 0,
     owner_id: int | None = None,
@@ -198,6 +214,11 @@ def list_reports(
     are dropped (fail closed, SEC-196). ``None`` means no owner filter,
     which the web routes reserve for admins; internal callers that match
     on ``source_name`` (routine run lists) also pass ``None``.
+
+    ``subject`` matches what a report is about exactly (FEAT-078): pass a key
+    built by :mod:`condor.reports.subjects`. Entries saved without a subject —
+    every entry written before the field existed — never match one, and a key
+    whose report has since been pruned simply matches nothing.
     """
     entries = _read_index()
     entries.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
@@ -212,6 +233,8 @@ def list_reports(
         entries = [entry for entry in entries if tag in entry.get("tags", [])]
     if agent:
         entries = [entry for entry in entries if entry.get("agent") == agent]
+    if subject:
+        entries = [entry for entry in entries if entry.get("subject") == subject]
     if search:
         query = search.lower()
         entries = [

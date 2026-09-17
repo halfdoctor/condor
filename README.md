@@ -12,9 +12,10 @@ A Telegram bot for monitoring and trading with Hummingbot via the **Hummingbot A
 >
 > Full walkthrough: [Securing Condor and Hummingbot API with Tailscale](https://hummingbot.org/blog/posts/securing-condor-and-hummingbot-api-with-tailscale/) · [Hummingbot API Tailscale guide](https://hummingbot.org/hummingbot-api/tailscale/)
 
-> **Privacy:** Condor counts installs anonymously — a random id, the version,
-> and a heartbeat; nothing about you or your trading. Everything beyond that is
-> **opt-in** from the one prompt it sends on first boot, and
+> **Privacy:** Condor sends anonymous usage stats — a random id, the version,
+> which features get used and what breaks; nothing about you or your trading.
+> Usage summaries start only after the admin has been shown a notice saying so,
+> they can be turned off from that notice or Settings → Privacy, and
 > `CONDOR_TELEMETRY=off` silences telemetry entirely. Your conversations are
 > never part of that: the only way one leaves is if you press Share on it and
 > confirm the redacted transcript, which `CONDOR_SHARING=off` disables outright.
@@ -30,7 +31,7 @@ A Telegram bot for monitoring and trading with Hummingbot via the **Hummingbot A
 - **Web Dashboard** - Browser UI (via **`/web`**) with a live trade panel that covers both CEX and DEX venues: order book trading, DEX swaps, and CLMM liquidity positions created and drawn directly on the chart
 - **Configuration** - Manage API servers, exchange credentials, and Gateway through Telegram (`/servers`, `/keys`, `/gateway`)
 - **AI Assistant** - Natural language trading help via **`/agent`** (optional OpenAI or OpenRouter keys, or any custom OpenAI-compatible endpoint like Venice AI; MCP tools when configured)
-- **AI Agents** - Domain agents that can be consulted, delegated to, or run on a loop — each can author its own tick strategy (analysis order, decision rules, risk limits) and run it autonomously with dry-run support
+- **AI Agents** - Domain agents that can be asked, delegated to, or run on a loop — each can author its own tick strategy (analysis order, decision rules, risk limits) and run it autonomously with dry-run support
 - **Issue Reporting** - A **Report an issue** button in the web dashboard prefills a GitHub issue draft (with opt-in, review-before-send diagnostics) that you submit from your own GitHub account
 
 ## What you need

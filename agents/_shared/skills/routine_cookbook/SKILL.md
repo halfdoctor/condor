@@ -84,10 +84,20 @@ A **one-off computation** is not. "What were SOL's hourly returns yesterday",
 "what is the spread between these two venues right now", "aggregate these
 executors by controller" — write the Python and call
 `run_code(code="...")`. It runs in the bot with exactly the primitives below
-(`context`, `client`, pandas, `ReportBuilder`, every `condor.*` module, and
-`condor.primitives` to find the rest), returns its `print` output and its
-`result`, and hands you the traceback to fix when it fails. No file, no `Config`
-class, no library entry.
+(`context`, `client`, pandas, `pandas_ta`, `ReportBuilder`, every `condor.*`
+module, and `condor.primitives` to find the rest), returns its `print` output and
+its `result`, and hands you the traceback to fix when it fails. No file, no
+`Config` class, no library entry.
+
+**Technical analysis: use `pandas_ta`, never hand-rolled math.** Condor pins the
+same version the hummingbot-api image runs (`pandas-ta>=0.4.71b` →
+`0.4.71b0`), so an RSI, EMA, ATR, MACD or Bollinger band computed in a routine
+is bit-for-bit the one a Hummingbot controller or a backtest computes. Writing
+your own EMA instead silently disagrees with the strategy you are analysing.
+Both call styles work — `pandas_ta.rsi(df["close"], length=14)` and the
+accessor `df.ta.macd(append=True)`. In 0.4.x the multi-output column names
+repeat the deviation, e.g. `BBP_20_2.0_2.0`, `MACD_12_26_9` — read the columns
+off the returned frame rather than assuming a 0.3.x name.
 
 Promote a snippet to a routine when you have run essentially the same thing a
 third time, or the moment it needs to be scheduled, shared, or visible to the
@@ -133,6 +143,37 @@ async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
 
 Must export: `Config` (Pydantic BaseModel) and `async def run(config, context) -> str`.
 The `Config` docstring is the UI description. `CATEGORY` groups it in the catalog.
+
+### Never put a credential in a `Config` default
+
+A routine's **definition is public to the whole install**: its name, its
+docstring, every field default and description, and its full source are readable
+by every approved user of this Condor — the Routines page, the MCP schema and
+`GET /routines/{name}/source` all serve them unscoped. An API key typed as a
+`Field(default=...)` is therefore published the moment the file lands, with no
+review step in between.
+
+```python
+# WRONG — this key is now readable by every user of the install
+class Config(BaseModel):
+    rpc_url: str = Field(default="https://mainnet.helius-rpc.com/?api-key=3f8c…")
+    api_key: str = Field(default="sk-proj-…")
+
+# RIGHT — the field selects, run() reads the credential at run time
+class Config(BaseModel):
+    network: str = Field(default="mainnet-beta", description="Solana network")
+
+async def run(config: Config, context: ContextTypes.DEFAULT_TYPE) -> str:
+    rpc_url = os.environ["HELIUS_RPC_URL"]      # env, or config.yml, or get_client()
+```
+
+Read secrets **inside `run()`** — from the environment, from `config.yml`, or
+from the API client you already get with `get_client()` — and never return or
+print them either. Discovery refuses to load a routine whose `Config` obviously
+ships one (an `sk-` key, a URL carrying `api-key=`, a `password`/`private_key`
+field with a live-looking value), so `create_routine` will reject the file and
+tell you why. That check is a tripwire for the obvious mistake, not a scanner:
+a credential it does not recognise still ships. The rule is yours to keep.
 
 ## The loop: create → test → fix
 
@@ -180,6 +221,7 @@ manage_routines(action="run", name="x", agent="agent_slug", config={})
 - **Look it up, don't guess** — `describe("<ref>")` before writing any call
   whose exact signature you are not certain of, and `catalog()` before writing a
   fetch you suspect already exists.
+- **No credential in a `Config` default, description or docstring** — the definition is install-public; read secrets inside `run()`.
 - One routine per task. Lead with code, be direct.
 - Test after writing (`manage_routines(action="run", ...)`) and fix until the output is clean.
 

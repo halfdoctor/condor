@@ -6,14 +6,17 @@ out three times, in three modules, as a literal expression. That put this
 deployment's data inside the code, and it meant a test run wrote into the
 developer's live install because there was no single knob to turn.
 
-There are **three** roots, not one, and this module is where all three are
-named. They are separate on purpose (``.gitignore`` has always listed the first
-two apart) and the line between them is *who writes and when*:
+There are **four** roots, not one, and this module is where all four are
+named. They are separate on purpose (``.gitignore`` has always listed them
+apart) and the line between them is *who writes and when*:
 
     <repo>/.condor/                    # or $CONDOR_RUNTIME_ROOT
     ├── users/{user_id}/               # the runtime store: one conversation's
     │   ├── conversations/{conv_id}/   # worth of thinking, written turn by turn
-    │   └── delegations/{task_id}/     # by a live session
+    │   ├── delegations/{task_id}/     # by a live session
+    │   ├── ui/                        # ...and what they did to the world by
+    │   └── telegram/                  # hand, from the dashboard and from chat
+    ├── deed_coverage.json
     ├── state/{namespace}/
     └── telemetry/
 
@@ -24,13 +27,25 @@ two apart) and the line between them is *who writes and when*:
     ├── backtests/
     └── code_runs/
 
-    <repo>/agents/                     # or $CONDOR_AGENTS_ROOT
-    ├── <slug>/AGENT.md                # the agent registry: each agent's
-    ├── <slug>/skills/                 # definition, its library, and the
-    ├── <slug>/store/user_{user_id}/   # memory it accumulated per user
-    └── _shared/{skills,routines}/
+    <repo>/reports/                    # or $CONDOR_REPORTS_DIR
+    ├── reports_index.json             # what a run had to show for itself:
+    ├── <report_id>.html               # one rendered report per file, indexed
+    └── assets/                        # and served to Telegram and the web
 
-``data/`` is the older of the three and is named literally in agent-facing text
+    <repo>/agents/                     # or $CONDOR_STOCK_AGENTS_ROOT
+    ├── <slug>/AGENT.md                # the shipped library: the curated
+    ├── <slug>/skills/                 # agents, their playbooks and the
+    ├── _defaults/                     # shared defaults. Tracked by git and
+    └── _shared/{skills,routines}/     # read-only at runtime.
+
+    <repo>/.condor/agents/             # or $CONDOR_AGENTS_ROOT
+    ├── <slug>/AGENT.md                # this install's own: everything the
+    ├── <slug>/skills/                 # running product writes -- new agents,
+    ├── <slug>/store/user_{user_id}/   # forked definitions, promoted skills,
+    ├── <slug>/strategies/<sslug>/     # journals, stores, mutes. Git has
+    └── _shared/{skills,routines}/     # never heard of it.
+
+``data/`` is the oldest of them and is named literally in agent-facing text
 (``data/code_runs/`` in the ``run_code`` tool description), so folding it into
 ``.condor/`` would open a new split rather than close one. What it did lack was
 a resolver: three of its stores built their path at import from the bare name
@@ -38,17 +53,36 @@ a resolver: three of its stores built their path at import from the bare name
 pickle and ``code_runs`` were already anchored at the repo. Both now come from
 :func:`data_dir`.
 
-``agents/`` is the odd one, and the reason it took a third pass to reach: it is
-*half version-controlled*. An agent's definition and its skill library are
-committed; the ``store/user_{id}/`` under them is not. Only the whole root can
-be repointed, because :func:`condor.memory.paths.assistant_home` is the single
-parent of both, so a test that moves it gets an empty registry as well as an
-empty store -- which is what a test that touches memory wants, and what a test
-that reads a real agent's definition must not do. It resolved from a module
-constant until then, so isolating it meant monkeypatching a private name in
-every module that wrote a memory, and the modules that forgot wrote into the
-developer's live library (an ``audit.log`` for a ``user_424242`` that exists
-nowhere in the repo is what that leaves behind).
+``reports/`` is what a run had to show for itself, and it arrived here last
+(ARCH-605) having made *both* of the mistakes the paragraph above describes, at
+once. ``condor/reports/store.py`` built it at import from
+``Path(__file__).parents[2]`` -- anchored at the repo, but a module constant no
+env var could move, which cost a re-import shim so monkeypatching still worked
+and made eighteen test modules patch a pair of names by hand. A second
+producer, ``handlers/bots/archived_report.py``, built the bare name ``reports``
+instead, so a process launched from anywhere but the checkout split the store
+in two. It keeps its own root rather than folding into ``data/``: ``/reports/``
+has always had its own ``.gitignore`` line and every install's history is
+already there.
+
+``agents/`` used to be **one** root that was *half version-controlled*: an
+agent's definition and its skill library were committed, the ``store/user_{id}/``
+under them was not, and the product rewrote both. That made every ``/update``
+an offer to discard the operator's own agent (``updates/components.py`` blocks
+on ``incoming n dirty``), and it made the split a thing each box maintained by
+hand in ``.git/info/exclude``. FEAT-115 cut it in two along the line that was
+already there: :func:`stock_agents_root` is the **shipped library** -- tracked,
+curated, never written at runtime -- and :func:`local_agents_root` is what this
+install writes. Reads are layered, local shadowing stock **per item** (a file,
+a skill folder, a strategy's ``strategy.md``), so an operator who tweaks the
+shipped ``condor`` agent keeps the tweak *and* still receives upstream's new
+skills for it. :mod:`condor.memory.paths` owns that resolution; this module
+only names the two roots.
+
+Both roots stay inside the checkout, and that is a constraint rather than a
+preference: an agent's own file tools run with the repo as their working
+directory and a dozen prompt strings name ``agents/...`` literally, so a local
+root outside the tree would be a path the agent cannot reach.
 
 **The user is the first path segment** of the runtime store. A person's whole
 footprint is one directory: it can be listed, tarred, handed to support or
@@ -57,7 +91,8 @@ that a route could forget to make -- it is a path the caller cannot name.
 
 Two rules this module keeps:
 
-* :func:`runtime_root`, :func:`data_dir` and :func:`agents_root` are a
+* :func:`runtime_root`, :func:`data_dir`, :func:`reports_dir`,
+  :func:`stock_agents_root` and :func:`local_agents_root` are a
   *function call at every use*, never a module constant. The env override has
   to be observable after import, or the test fixture that isolates the suite
   cannot work and the MCP/ACP subprocesses cannot inherit it.
@@ -93,10 +128,13 @@ from pathlib import Path
 RUNTIME_ROOT_ENV = "CONDOR_RUNTIME_ROOT"
 DATA_DIR_ENV = "CONDOR_DATA_DIR"
 AGENTS_ROOT_ENV = "CONDOR_AGENTS_ROOT"
+STOCK_AGENTS_ROOT_ENV = "CONDOR_STOCK_AGENTS_ROOT"
+REPORTS_DIR_ENV = "CONDOR_REPORTS_DIR"
 
 RUNTIME_DIRNAME = ".condor"
 DATA_DIRNAME = "data"
 AGENTS_DIRNAME = "agents"
+REPORTS_DIRNAME = "reports"
 
 # <repo>: condor/paths.py -> condor/ -> <repo>
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -107,6 +145,8 @@ LEGACY_RUNTIME_ROOT = _PROJECT_ROOT / "condor" / ".runtime"
 USERS_DIRNAME = "users"
 CONVERSATIONS_DIRNAME = "conversations"
 DELEGATIONS_DIRNAME = "delegations"
+UI_DIRNAME = "ui"
+TELEGRAM_DIRNAME = "telegram"
 
 # Every id here becomes a directory name, so none of them may escape one.
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -158,21 +198,41 @@ def data_dir() -> Path:
     return _PROJECT_ROOT / DATA_DIRNAME
 
 
-def agents_root() -> Path:
-    """The agent registry: one directory per agent, its library and its stores.
+def stock_agents_root() -> Path:
+    """The shipped agent library: ``<repo>/agents``, tracked and read-only.
 
-    Every path under ``agents/`` hangs off this -- an agent's home, its skills,
-    the ``_shared/`` libraries and each ``store/user_{id}/`` -- and
-    :mod:`condor.memory.paths` builds them all from here.
-    ``$CONDOR_AGENTS_ROOT`` overrides it, read on every call for the same
-    reason :func:`runtime_root` reads its own: the suite's autouse fixture sets
-    it after import, and the MCP/ACP subprocesses inherit the environment
-    rather than the constant.
+    What the repo ships and what a ``git pull`` updates -- the curated agents,
+    ``_defaults/`` and ``_shared/{skills,routines}/``. Nothing in the running
+    product writes here; the one sanctioned write is
+    ``manage_agents(action="publish")``, which is the maintainer authoring the
+    library on purpose and leaves a dirty tree they then commit.
+
+    ``$CONDOR_STOCK_AGENTS_ROOT`` overrides it, read on every call for the same
+    reason :func:`runtime_root` reads its own.
+    """
+    override = os.environ.get(STOCK_AGENTS_ROOT_ENV)
+    if override:
+        return Path(override).expanduser()
+    return _PROJECT_ROOT / AGENTS_DIRNAME
+
+
+def local_agents_root() -> Path:
+    """This install's own agent tree: ``<repo>/.condor/agents``, never tracked.
+
+    Every write the running product makes lands here -- a new agent, an edited
+    ``AGENT.md``, a promoted skill, a strategy, a journal, a memory store, a
+    mute set -- so ``git status --porcelain agents/`` stays empty on a box that
+    has been running agents for weeks. It sits under :func:`runtime_root`
+    because that is already gitignored and already this deployment's data.
+
+    ``$CONDOR_AGENTS_ROOT`` overrides it, read on every call: the suite's
+    autouse fixture sets it after import, and the MCP/ACP subprocesses inherit
+    the environment rather than the constant.
     """
     override = os.environ.get(AGENTS_ROOT_ENV)
     if override:
         return Path(override).expanduser()
-    return _PROJECT_ROOT / AGENTS_DIRNAME
+    return runtime_root() / AGENTS_DIRNAME
 
 
 def notifications_path() -> Path:
@@ -185,9 +245,57 @@ def routine_hooks_path() -> Path:
     return data_dir() / "routine_hooks.json"
 
 
+def push_subscriptions_path() -> Path:
+    """Per-user Web Push subscriptions (``condor.push``, FEAT-083).
+
+    The third file in :func:`notifications_path`'s shape and for the same
+    reason: one browser's registration has to outlive the tab that made it, or
+    the notification with the window closed -- the whole point -- has nowhere
+    to go.
+    """
+    return data_dir() / "push_subscriptions.json"
+
+
+def vapid_dir() -> Path:
+    """Home of this install's VAPID keypair (``condor.push``, FEAT-083).
+
+    A directory of its own, at ``0700``, rather than a ``0600`` file beside the
+    other stores. Mode on the *file* is not a defence we can rely on here: a
+    ``0600`` file bind-mounted into a container reads fine on macOS and is
+    ``Permission denied`` on every Linux deploy, because the uid inside is not
+    the uid that wrote it. Putting the secret behind a private directory keeps
+    the same reader out and stops the file's own mode from being load-bearing.
+    """
+    return data_dir() / "push_keys"
+
+
+def vapid_key_path() -> Path:
+    """The VAPID keypair itself. Written once; rotating it kills every device."""
+    return vapid_dir() / "vapid.json"
+
+
+def update_run_path() -> Path:
+    """The current or last ``/update`` run (``condor.updates.run``).
+
+    Durable because the process that starts a Condor update is the process that
+    dies: this file is how the machine that comes back up answers "did it work".
+    """
+    return data_dir() / "update_run.json"
+
+
 def backtests_dir() -> Path:
     """One JSON file per backtest, plus ``_index.json`` (``backtest_store.py``)."""
     return data_dir() / "backtests"
+
+
+def run_history_dir() -> Path:
+    """One gzipped series per finished bot run, plus ``_index.json``.
+
+    Sibling of :func:`backtests_dir` and the same shape of store: a small index
+    read on every poll, a payload opened only when someone draws the run
+    (``run_history_store.py``).
+    """
+    return data_dir() / "run_history"
 
 
 def legacy_backtests_file() -> Path:
@@ -202,6 +310,31 @@ def code_runs_dir() -> Path:
     default location is part of that contract.
     """
     return data_dir() / "code_runs"
+
+
+def reports_dir() -> Path:
+    """Every rendered report, plus ``reports_index.json`` and the shared assets.
+
+    A root of its own and not ``data_dir() / "reports"``: ``/reports/`` has its
+    own ``.gitignore`` entry and every install already has its history there, so
+    folding it in would move files rather than close a split. What it lacked was
+    a resolver -- ``condor/reports/store.py`` built it at import from
+    ``Path(__file__).parents[2]``, which no env var could move, and
+    ``handlers/bots/archived_report.py`` built the bare name ``reports``, which
+    the working directory could. Both come from here now (ARCH-605).
+
+    ``$CONDOR_REPORTS_DIR`` overrides it, read on every call for the same reason
+    :func:`runtime_root` reads its own.
+    """
+    override = os.environ.get(REPORTS_DIR_ENV)
+    if override:
+        return Path(override).expanduser()
+    return _PROJECT_ROOT / REPORTS_DIRNAME
+
+
+def reports_index_path() -> Path:
+    """The report index: one row per saved report (``condor.reports.store``)."""
+    return reports_dir() / "reports_index.json"
 
 
 def users_root() -> Path:
@@ -221,11 +354,53 @@ def conversation_dir(user_id: int | str, conv_id: str) -> Path:
 
 
 def delegations_dir(user_id: int | str) -> Path:
+    """Every agent *run* this user owns -- delegations and consults alike.
+
+    The name is historical (FEAT-058): the directory predates there being a
+    second kind of run to put in it, and splitting the store would have cost
+    every reader a merge and retention a second home for a rename nobody sees.
+    Same reasoning as the ``data/`` root above.
+    """
     return user_dir(user_id) / DELEGATIONS_DIRNAME
 
 
 def delegation_dir(user_id: int | str, task_id: str) -> Path:
     return delegations_dir(user_id) / safe_id(task_id)
+
+
+def ui_dir(user_id: int | str) -> Path:
+    """What this person did to the world straight from the dashboard (FEAT-105).
+
+    The fourth door's record, and the only one of the four with no id of its own
+    to hang off: a Deploy pressed on ``/bots`` belongs to no conversation and no
+    task, so its deeds accumulate per *person*. That is also what identifies the
+    actor on a shared install — the acting user is the first segment of the path
+    rather than a field in a row, which is a claim a route cannot forget to make.
+    """
+    return user_dir(user_id) / UI_DIRNAME
+
+
+def telegram_dir(user_id: int | str) -> Path:
+    """What this person did to the world straight from Telegram (CORR-622).
+
+    The fifth door, and on this product the busiest one: ``CLAUDE.md`` opens
+    with "Condor is a Telegram bot". It is shaped like :func:`ui_dir` and for
+    the same reason -- a Deploy pressed in ``/executors`` belongs to no
+    conversation and no task, so its deeds accumulate per *person* -- and it is
+    kept apart from ``ui/`` because "somebody pressed Deploy in the dashboard"
+    and "somebody pressed Deploy in the chat" are different answers to the same
+    question.
+    """
+    return user_dir(user_id) / TELEGRAM_DIRNAME
+
+
+def deed_coverage_path() -> Path:
+    """When this install began recording at *every* door (CORR-622).
+
+    Not under ``users/``: it is a fact about the build, not about a person.
+    :func:`condor.agents.deeds.coverage_since` owns what goes in it.
+    """
+    return runtime_root() / "deed_coverage.json"
 
 
 def state_dir(namespace: str) -> Path:

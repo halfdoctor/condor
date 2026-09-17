@@ -5,6 +5,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from mcp_servers._profiles import parse_profile_flags
+
 # Imported for its ``load_dotenv()`` side effect as much as for the helper:
 # ``_parse_settings()`` runs at import, before anything else in the process
 # pulls this module in, so without it ``.env`` is not yet in ``os.environ`` and
@@ -12,6 +14,10 @@ from dataclasses import dataclass
 from utils.config import resolve_admin_id
 
 logger = logging.getLogger("condor.mcp")
+
+#: Default tool profile (FEAT-066). ``full`` on purpose: a launch with no flag —
+#: the checked-in ``.mcp.json``, an external MCP host — keeps the whole surface.
+DEFAULT_TOOL_PROFILE = "full"
 
 
 @dataclass
@@ -32,6 +38,25 @@ class Settings:
     # refuse to recurse. Every agent has this seat now, not just Condor, since an
     # agent can start a delegation of itself (FEAT-041).
     delegate_worker: bool = False
+    # Marks a run already answering someone's ``delegate(action="ask")``. Ask
+    # depth is bounded at one: an ask is auto-approved and its caller is blocked
+    # waiting on it, so a target free to ask onward would nest blocked callers
+    # with nobody watching any of them. Enforced in ``tools/delegate.py``.
+    ask_target: bool = False
+    # Which slice of the tool surface this process registers (FEAT-066). An ACP
+    # bridge filters no tool itself, so the mounted surface IS the permission
+    # model: see ``server.TOOL_PROFILES``. It is a separate flag from
+    # the two above rather than derived from them, because the seat it narrows is
+    # the *tick*, and neither ``agent_slug`` nor ``delegate_worker`` tells an
+    # unattended loop apart from an attended chat with the same specialist.
+    tool_profile: str = DEFAULT_TOOL_PROFILE
+    # Tools the operator switched off for this agent (FEAT-091), arriving as
+    # ``--mute-tools a,b,c``. Subtracted from the profile in
+    # ``server.register_tools``, so a muted tool is never registered and the
+    # model is never told it exists — the only enforcement that also holds on an
+    # ACP seat, which cannot be handed an allowlist. Empty is the norm: an
+    # install nobody has curated spawns exactly the argv it always did.
+    muted_tools: tuple[str, ...] = ()
 
     @property
     def specialist_slug(self) -> str:
@@ -98,7 +123,12 @@ def _parse_settings() -> Settings:
     parser.add_argument("--server-name", default=None)
     parser.add_argument("--session-key", default=None)
     parser.add_argument("--delegate-worker", action="store_true", default=False)
+    parser.add_argument("--ask-target", action="store_true", default=False)
     args, _ = parser.parse_known_args()
+    # ``--profile``/``--mute-tools`` are declared once, in the shared leaf, so
+    # this seat and the hummingbot-api seat cannot drift on the wire format
+    # ``condor.runtime.toolsets`` writes (ARCH-570).
+    tool_profile, muted_tools = parse_profile_flags(DEFAULT_TOOL_PROFILE)
 
     return Settings(
         chat_id=(
@@ -117,9 +147,12 @@ def _parse_settings() -> Settings:
         agent_slug=args.agent_slug or os.environ.get("CONDOR_AGENT_SLUG", ""),
         active_server=args.server_name or os.environ.get("CONDOR_SERVER_NAME", ""),
         session_key=args.session_key or os.environ.get("CONDOR_SESSION_KEY", ""),
+        ask_target=(args.ask_target or os.environ.get("CONDOR_ASK_TARGET", "") == "1"),
         delegate_worker=(
             args.delegate_worker or os.environ.get("CONDOR_DELEGATE_WORKER", "") == "1"
         ),
+        tool_profile=tool_profile,
+        muted_tools=muted_tools,
     )
 
 

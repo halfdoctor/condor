@@ -14,6 +14,7 @@ import { useDexUpstream } from "@/hooks/useDexUpstream";
 import { useServer } from "@/hooks/useServer";
 import { api, type PoolSummary } from "@/lib/api";
 import { useDexFavorites } from "@/lib/dexFavorites";
+import { DEX_NETWORK_KEY } from "@/lib/sessionState";
 
 /** GeckoTerminal rate-limits per IP across every viewer and every polling chart. */
 const POOL_STALE_MS = 30_000;
@@ -33,9 +34,6 @@ const FAVORITES_BATCH_SIZE = 30;
  * indexes, since a chain missing from either has no pools to browse.
  */
 const DEFAULT_NETWORK = "solana-mainnet-beta";
-
-/** Survives a reload, so the chain you browse is not re-picked on every visit. */
-const NETWORK_KEY = "condor.dex.network";
 
 /** An EVM address or a Solana pubkey — the same guard the backend applies. */
 const ADDRESS_RE = /^(0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})$/;
@@ -61,7 +59,7 @@ export function Dex() {
     view: "trending",
   });
   const [network, setNetwork] = useState<string>(
-    () => localStorage.getItem(NETWORK_KEY) || DEFAULT_NETWORK,
+    () => localStorage.getItem(DEX_NETWORK_KEY) || DEFAULT_NETWORK,
   );
   const [dexes, setDexes] = useState<string[]>([]);
   const [query, setQuery] = useState("");
@@ -86,7 +84,7 @@ export function Dex() {
   }, [source, debouncedQuery, dexes, network]);
 
   useEffect(() => {
-    localStorage.setItem(NETWORK_KEY, network);
+    localStorage.setItem(DEX_NETWORK_KEY, network);
   }, [network]);
 
   const { data: chains = [] } = useQuery({
@@ -142,25 +140,28 @@ export function Dex() {
     source.kind !== "favorites" &&
     (source.kind === "gateway" || !isSearch || isAddress);
 
+  // Everything that picks *which* listing is showing; the page within it is
+  // appended below.
+  const listingKey = [
+    "dex-pools",
+    server,
+    source.kind,
+    source.kind === "gecko"
+      ? source.view
+      : source.kind === "gateway"
+        ? source.connector
+        : "favorites",
+    isGateway ? "" : network,
+    effectiveQuery,
+    isGateway ? "" : dexes.join(","),
+  ];
+
   const {
     data: pagedPools,
     isFetching,
     dataUpdatedAt: poolsUpdatedAt,
   } = useQuery({
-    queryKey: [
-      "dex-pools",
-      server,
-      source.kind,
-      source.kind === "gecko"
-        ? source.view
-        : source.kind === "gateway"
-          ? source.connector
-          : "favorites",
-      isGateway ? "" : network,
-      effectiveQuery,
-      isGateway ? "" : dexes.join(","),
-      page,
-    ],
+    queryKey: [...listingKey, page],
     queryFn: () =>
       api.getDexPools(
         server!,
@@ -187,7 +188,14 @@ export function Dex() {
       ),
     enabled,
     staleTime: POOL_STALE_MS,
-    placeholderData: (prev) => prev,
+    // The previous page stays up while the next one loads — but only a page of
+    // this same listing. Carried across tabs, or into a query that will never
+    // run (a ticker typed into Search), it sat under a pager whose Next still
+    // worked while the rows never changed.
+    placeholderData: (prev, prevQuery) =>
+      enabled && listingKey.every((part, i) => prevQuery?.queryKey[i] === part)
+        ? prev
+        : undefined,
   });
 
   // The pasted address may be a *pool*, not a token. Both are 44 base58

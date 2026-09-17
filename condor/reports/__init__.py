@@ -1,9 +1,9 @@
 """Composable HTML reports and persistent report storage."""
 
+from . import subjects
 from .builder import LiveReport, ReportBuilder
+from .rendering import hydrate
 from .store import (
-    CHARTS_DIR,
-    INDEX_FILE,
     MAX_REPORTS,
     attribute_owner,
     attribute_to,
@@ -16,14 +16,14 @@ from .store import (
     list_reports,
     list_reports_grouped,
     reset_last_report_id,
+    resolve_report_asset,
     run_scope,
 )
 
 __all__ = [
     "ReportBuilder",
     "LiveReport",
-    "CHARTS_DIR",
-    "INDEX_FILE",
+    "subjects",
     "MAX_REPORTS",
     "attribute_owner",
     "attribute_to",
@@ -33,6 +33,8 @@ __all__ = [
     "reset_last_report_id",
     "get_last_report_id",
     "get_report_raw_html",
+    "hydrate",
+    "resolve_report_asset",
     "list_reports",
     "list_reports_grouped",
     "get_report",
