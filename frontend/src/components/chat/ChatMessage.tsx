@@ -20,9 +20,12 @@ import type {
   ChatMessage as ChatMessageType,
 } from "@/hooks/useChatSocket";
 import { useAuthedImage } from "@/hooks/useAuthedImage";
+import { useBrainLabel } from "@/hooks/useBrainLabel";
 import { agentColor } from "@/lib/agentColor";
 import { copyText } from "@/lib/clipboard";
+import type { AgentBindingOption, ChatAgentOption } from "@/lib/api";
 import { splitStreamedMarkdown } from "@/lib/markdownStream";
+import { BrainPicker } from "./BrainPicker";
 import { ChartSlot, ChartSlotHost } from "./ChartSlots";
 import { RunStrip } from "./ToolCallStatus";
 
@@ -313,10 +316,182 @@ function Attachment({ attachment }: { attachment: ChatAttachment }) {
   );
 }
 
+/**
+ * A spawn that never came up — most often a model whose provider key this
+ * install does not have — offering the one obvious next step instead of a
+ * dead end: fall back to the model Condor already knows works, or pick a
+ * specific one. `BrainPicker` already drives `switchBrain`, which already
+ * respawns a slot with no live session behind it (the path a detached-after-
+ * restart tab uses) — this is that, reached one failure earlier.
+ *
+ * A component of its own, not a branch inside `ChatMessageView`, because it
+ * needs `useBrainLabel` to name the fallback model — a hook `ChatMessageView`
+ * cannot call conditionally once any of its other branches start using one.
+ */
+function StartErrorNote({
+  message,
+  brainOptions,
+  agentBindings,
+  attemptedAgentKey,
+  attemptedAgentSlug,
+  defaultAgentKey,
+  onRetryModel,
+}: {
+  message: ChatMessageType;
+  brainOptions?: ChatAgentOption[];
+  agentBindings?: AgentBindingOption[];
+  attemptedAgentKey?: string;
+  /** The bound Agent the dead spawn was answering for, if any — resolves the
+   *  picker's label off that Agent's own default model when `attemptedAgentKey`
+   *  is empty, which it is for every bound Agent (the backend resolves "" to
+   *  "whatever is bound" at spawn time, so the slot never learns a concrete
+   *  key). Without this the trigger has nothing to say and reads as a bare
+   *  chevron. */
+  attemptedAgentSlug?: string;
+  defaultAgentKey?: string;
+  onRetryModel?: (agentKey: string, messageId: string) => void;
+}) {
+  const agents = brainOptions ?? [];
+  // The note stamps its own attempt the moment it is created, and a retry
+  // keeps that current — read it in preference to the thread's live prop,
+  // which is the *slot's* current attempt and has already moved on by the
+  // time a later retry on this same note fails.
+  const effectiveAttemptedKey = message.attemptedAgentKey ?? attemptedAgentKey;
+  const effectiveAttemptedSlug = message.attemptedAgentSlug ?? attemptedAgentSlug;
+
+  const { short: defaultLabel } = useBrainLabel({
+    agents,
+    selectedAgentKey: defaultAgentKey || "",
+  });
+  // The same resolution the picker's own trigger uses: an empty key under a
+  // bound Agent means "whatever it runs on", which only its binding can name.
+  const { effectiveKey: attemptedEffectiveKey } = useBrainLabel({
+    agents,
+    agentBindings,
+    selectedAgentKey: effectiveAttemptedKey || "",
+    selectedAgentSlug: effectiveAttemptedSlug || "",
+  });
+  // What a retry in flight is trying, and what a retry that already landed
+  // is now running on — both named through the one resolution so either
+  // reads exactly like the picker's own trigger would, a bound Agent
+  // included. Harmless to compute when neither applies: an empty key still
+  // resolves to *something* (the default agent), it is just never rendered.
+  const { label: retryTargetLabel } = useBrainLabel({
+    agents,
+    agentBindings,
+    selectedAgentKey: message.retryTargetKey || "",
+    selectedAgentSlug: effectiveAttemptedSlug || "",
+  });
+  const { label: resolvedLabel } = useBrainLabel({
+    agents,
+    agentBindings,
+    selectedAgentKey: message.resolvedAgentKey || "",
+    selectedAgentSlug: message.resolvedAgentSlug || "",
+  });
+  // Offering "use the default" when the default is exactly what just failed
+  // would read as a fix and repeat the same error — but that is only known
+  // for a concrete attempted key. A bound Agent that failed with no key of
+  // its own (`effectiveAttemptedKey` empty) has nothing but a *guess* behind
+  // `attemptedEffectiveKey` (its own declared default, read off a cached
+  // binding) — good enough to label the picker's trigger, never good enough
+  // to prove "this is the same as the install's default" and hide the one
+  // fix that might actually work. The backend's own start-failure frame
+  // carries no resolved `agent_key` to check this against (chat_ws.py's
+  // `except` only sends `message`/`phase`), so an unknown attempt is treated
+  // as different from the default rather than silently the same.
+  const canFallBackToDefault =
+    !!onRetryModel &&
+    !!defaultAgentKey &&
+    (!effectiveAttemptedKey || defaultAgentKey !== attemptedEffectiveKey);
+
+  // The retry this note offered landed: the failure is no longer live, so it
+  // folds away into one quiet line — no error heading, no original failure
+  // text, no trace of the model that was attempted — instead of sitting in
+  // the transcript looking exactly as alarming as it did before anyone
+  // touched it.
+  if (message.resolved) {
+    return (
+      <div className="group mb-4 border-l-2 border-[var(--chat-rule)] pl-3">
+        <div className="flex items-center gap-1.5 text-sm text-[var(--color-text-muted)]">
+          <Check className="h-3.5 w-3.5 shrink-0" />
+          <span>Switched to {resolvedLabel} · ready</span>
+          <div className="ml-auto">
+            <TurnActions ts={message.ts} text={`Switched to ${resolvedLabel}`} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // A retry is on the way — the stale failure stays off screen rather than
+  // sitting there unchanged while the respawn is answered.
+  if (message.retrying) {
+    return (
+      <div className="group mb-4 border-l-2 border-[var(--chat-rule)] pl-3">
+        <div className="flex items-center gap-1.5 text-sm text-[var(--color-text-muted)]">
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+          <span>
+            {message.retryTargetKey !== undefined
+              ? `Switching to ${retryTargetLabel}…`
+              : "Switching…"}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group mb-4 border-l-2 border-[var(--chat-rule)] pl-3">
+      <div className="mb-1 flex items-center gap-1.5">
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+        <TurnLabel label="Error" color="var(--color-text-muted)" />
+        <div className="ml-auto">
+          <TurnActions ts={message.ts} text={message.text} />
+        </div>
+      </div>
+      <div className="chat-markdown text-sm text-[var(--color-text-muted)]">
+        <ReactMarkdown remarkPlugins={GFM} components={STATIC_COMPONENTS}>
+          {message.text}
+        </ReactMarkdown>
+      </div>
+      {onRetryModel && agents.length > 0 && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          {canFallBackToDefault && (
+            <button
+              onClick={() => onRetryModel(defaultAgentKey, message.id)}
+              className="rounded-md bg-[var(--color-primary)] px-3 py-1.5 text-xs font-semibold text-[var(--on-primary)] hover:bg-[var(--color-primary-hover)]"
+            >
+              Use {defaultLabel}
+            </button>
+          )}
+          <span className="text-xs text-[var(--color-text-muted)]">
+            {canFallBackToDefault ? "or pick another model:" : "Pick another model:"}
+          </span>
+          <BrainPicker
+            agents={agents}
+            agentBindings={agentBindings}
+            selectedAgentKey={effectiveAttemptedKey || ""}
+            selectedAgentSlug={effectiveAttemptedSlug || ""}
+            onSelect={(sel) => {
+              if (sel.agentKey) onRetryModel(sel.agentKey, message.id);
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 export const ChatMessageView = memo(function ChatMessageView({
   message,
   live = false,
   agentName = "Assistant",
+  brainOptions,
+  agentBindings,
+  attemptedAgentKey,
+  attemptedAgentSlug,
+  defaultAgentKey,
+  onRetryModel,
 }: {
   message: ChatMessageType;
   /**
@@ -332,6 +507,28 @@ export const ChatMessageView = memo(function ChatMessageView({
    * what the gutter takes its colour from.
    */
   agentName?: string;
+  /** The model roster, for the picker a `start_error` note offers. Absent on
+   *  any surface that does not pass one — the note then reads with no picker,
+   *  same as before this existed. */
+  brainOptions?: ChatAgentOption[];
+  /** The domain-Agent roster, so a bound Agent's own default model names the
+   *  picker — only `start_error` reads it, and only when `attemptedAgentSlug`
+   *  is set. */
+  agentBindings?: AgentBindingOption[];
+  /** The model the dead spawn was trying to use — the slot's own `agent_key`,
+   *  which a failed start never overwrites. Names the picker's current
+   *  selection so its trigger reads the model that failed, not a blank chevron. */
+  attemptedAgentKey?: string;
+  /** The bound Agent the dead spawn was answering for, if any — see
+   *  `StartErrorNote`'s own doc for why this matters when `attemptedAgentKey`
+   *  is empty. */
+  attemptedAgentSlug?: string;
+  /** Condor's own default model, for `start_error`'s one-click fallback. */
+  defaultAgentKey?: string;
+  /** Respawns the slot this message belongs to on a different model, naming
+   *  this message's own id so the outcome updates this note rather than a
+   *  generic banner. Only `start_error` reads it. */
+  onRetryModel?: (agentKey: string, messageId: string) => void;
 }) {
   // Key material in what was just sent (FEAT-056). It gets the warning
   // treatment rather than the quiet note: half of these say text the user can
@@ -355,6 +552,24 @@ export const ChatMessageView = memo(function ChatMessageView({
           </ReactMarkdown>
         </div>
       </div>
+    );
+  }
+
+  // A spawn that never came up — most often a model whose provider key this
+  // install does not have — is the one failure in the transcript with an
+  // obvious next step, so it gets `StartErrorNote` instead of the plain
+  // `NOTE_KINDS` divider.
+  if (message.role === "system" && message.kind === "start_error") {
+    return (
+      <StartErrorNote
+        message={message}
+        brainOptions={brainOptions}
+        agentBindings={agentBindings}
+        attemptedAgentKey={attemptedAgentKey}
+        attemptedAgentSlug={attemptedAgentSlug}
+        defaultAgentKey={defaultAgentKey}
+        onRetryModel={onRetryModel}
+      />
     );
   }
 

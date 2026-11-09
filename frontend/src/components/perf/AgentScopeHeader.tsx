@@ -2,9 +2,17 @@ import { Bot, ExternalLink, Server, Zap } from "lucide-react";
 import { type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { agentBucketLabel, isAgentBucket } from "@/components/perf/agentFilter";
+import { workspaceHref } from "@/components/agent/workspace/workspaceUrl";
+import { agentBucketLabel, isAgentBucket, runParam } from "@/components/perf/agentFilter";
 import { agentColor } from "@/lib/agentColor";
-import { loopFacts, loopStatus, type FleetOwner } from "@/lib/agent-attribution";
+import {
+  isPseudoRunKey,
+  livenessFacts,
+  loopFacts,
+  loopStatus,
+  ownerDisplayName,
+  type FleetOwner,
+} from "@/lib/agent-attribution";
 import { shortBotName } from "@/lib/formatters";
 import { useSeconds } from "@/hooks/useSeconds";
 
@@ -94,6 +102,11 @@ export function AgentScopeHeader({
   // on and no key to mint a colour from, so it gets the name and the fold and
   // none of the affordances that only mean something for a run.
   const bucket = isAgentBucket(runKey);
+  // A door (chat, delegation, the dashboard) is a run key with a colour, but no
+  // loop stands behind it either: its owner ships `live: null`, so the status
+  // would always read "idle", and its slug is reserved, so no agent owns it and
+  // the workspace would open some unrelated loop strategy instead (CORR-396).
+  const loopless = bucket || isPseudoRunKey(runKey);
   const label = agentBucketLabel(runKey, owners);
   const live = owner?.live ?? null;
   const status = loopStatus(live);
@@ -102,6 +115,10 @@ export function AgentScopeHeader({
   // The reading of the loop is pure and lives in lib/ where a test can reach it
   // (the ARCH-300 split); what stays here is the clock and the markup.
   const facts = loopFacts(live, now);
+  // Quiet or dead (FEAT-137). Only for a loop that is running: a stopped one
+  // has no liveness left to diagnose, and the schedule band above already
+  // falls silent for it.
+  const liveness = running ? livenessFacts(live, now) : [];
 
   // `snapshotTick` lands on that tick's full snapshot, collapsing the main page
   // → agent → session → snapshot walk a tick needs otherwise.
@@ -113,14 +130,15 @@ export function AgentScopeHeader({
   // in the URL is the whole point of the Lab, so this is the shortest possible
   // demonstration of it.
   const openSession = (snapshotTick?: number) => {
-    if (!owner) return;
-    const params = new URLSearchParams({
-      view: snapshotTick ? "tick" : "runs",
-      strategy: owner.strategySlug,
-    });
-    if (live?.sessionNum) params.set("run", `s${live.sessionNum}`);
-    if (snapshotTick) params.set("tick", String(snapshotTick));
-    navigate(`/agents/${owner.agentSlug}?${params}`);
+    if (!owner || loopless) return;
+    navigate(
+      workspaceHref(owner.agentSlug, {
+        open: "runs",
+        strategy: owner.strategySlug,
+        run: live?.sessionNum ? runParam(live.sessionNum) : null,
+        tick: snapshotTick || null,
+      }),
+    );
   };
 
   const did = live?.lastDid ?? null;
@@ -134,11 +152,7 @@ export function AgentScopeHeader({
         />
         <span
           className="truncate"
-          title={
-            owner
-              ? `${owner.agentName || owner.agentSlug} / ${owner.strategyName || owner.strategySlug}`
-              : label
-          }
+          title={owner ? ownerDisplayName(owner) : label}
         >
           {label}
         </span>
@@ -151,10 +165,11 @@ export function AgentScopeHeader({
             {shortBotName(botName)}
           </span>
         )}
-        {/* Only a run can be idle. A bucket has no loop to be between ticks of,
-            and saying "idle" beside it would answer a question nobody asked
-            with a fact about a thing that does not exist (CORR-363). */}
-        {!bucket && (
+        {/* Only a loop can be idle. A bucket has no loop to be between ticks of,
+            and neither is a door (chat, delegation, dashboard): saying "idle"
+            beside either would answer a question nobody asked with a fact
+            about a thing that does not exist (CORR-363, CORR-396). */}
+        {!loopless && (
           <span className="flex shrink-0 items-center gap-1.5 font-normal">
             <StatusDot status={status} />
             <span className="text-xs capitalize text-[var(--color-text-muted)]">{status}</span>
@@ -165,7 +180,7 @@ export function AgentScopeHeader({
             {facts.join(" · ")}
           </span>
         )}
-        {owner && (
+        {owner && !loopless && (
           <button
             type="button"
             onClick={() => openSession()}
@@ -181,6 +196,20 @@ export function AgentScopeHeader({
           </button>
         )}
       </h2>
+      {/* How long since it last got a reading and last did something that
+          worked (FEAT-137). Beside the bot list because that is where "this
+          one is quiet" and "this one is dead" have to be told apart: the
+          schedule band above says a tick is due, which a dead strategy's
+          ticks also are. */}
+      {liveness.length > 0 && (
+        <span
+          data-loop-liveness
+          className="block truncate text-[10px] tabular-nums text-[var(--color-text-muted)]"
+          title="When this loop last obtained a reading, and last completed a call that changed the market. Both are outcomes — a tick that achieved nothing moves neither."
+        >
+          {liveness.join(" · ")}
+        </span>
+      )}
       {/* What the agent last *did* — a tool call that ran, not a paraphrase.
           Above the words because the deed is the fact and the narration is the
           commentary on it. Clicking lands on that tick's snapshot. */}
@@ -225,9 +254,9 @@ export function AgentScopeHeader({
       {legacyBots.length > 0 && (
         <span
           className="block truncate text-[10px] text-amber-500/90"
-          title={`These were configured before this strategy's namespace existed, so this scope folds their whole record: ${legacyBots.join(", ")}`}
+          title={`These were configured before this loop's namespace existed, so this scope folds their whole record: ${legacyBots.join(", ")}`}
         >
-          includes trading from before this strategy adopted {legacyBots.join(", ")}
+          includes trading from before this loop adopted {legacyBots.join(", ")}
         </span>
       )}
       {children}

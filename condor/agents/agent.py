@@ -30,7 +30,7 @@ Disk layout::
         AGENT.md                       # Agent identity + domain knowledge (no `role`)
         skills/<slug>/SKILL.md         # shared skills (the brain + every strategy) [FEAT-002/003]
         store/user_{id}/               # learned memory (the shared brain) [FEAT-003]
-        strategies/{sslug}/            # owned playbooks (see strategy.py)
+        loops/{sslug}/            # owned playbooks (see strategy.py)
 
 ``<root>`` is **two** roots since FEAT-115: the shipped library the repo tracks
 and this install's own, which git has never heard of. An Agent may be
@@ -55,6 +55,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from condor.frontmatter import parse_frontmatter, render_frontmatter, slugify
 from condor.fsutil import atomic_write_text
@@ -70,6 +71,9 @@ from condor.memory.paths import (
     iter_agent_slugs,
     resolve_agent_file,
 )
+from condor.paths import UnsafeIdError
+
+from .strategy import AlreadyExistsError
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +101,19 @@ class Agent:
     server_name: str = ""
     created_by: int = 0
     created_at: str = ""
+    # Stable identity, slug-independent (FEAT-143). 32 hex characters, minted by
+    # ``create`` and — for every agent that predates this field — at export.
+    # NOT ``agent_id``: that name already means *the slug* in 446 places
+    # (``get_engine(agent_id)``), so a second identifier under it would make
+    # every one of them ambiguous. Empty is legal and means "never exported,
+    # never created under this field"; nothing mints it on a read path.
+    agent_uid: str = ""
+    # Bundle bookkeeping (FEAT-143), written only by an export: the version the
+    # last bundle of this agent carried, and the digest of the content it was
+    # computed over. Together they are what lets a re-export of unchanged
+    # content return the same version instead of inflating one per export.
+    bundle_version: int = 0
+    bundle_digest: str = ""
 
     def __post_init__(self):
         if not self.created_at:
@@ -193,6 +210,41 @@ def identity_header(slug: str, name: str = "") -> str:
     )
 
 
+#: The tool that pushes an agent's own controller source to a server.
+CONTROLLERS_TOOL = "manage_agent_controllers"
+
+
+def _with_implied_tools(slug: str, tools: list[str]) -> list[str]:
+    """``tools`` plus any tool a capability the agent has cannot work without.
+
+    A ``tools:`` allowlist is frozen when an ``AGENT.md`` is forked down to the
+    local root, so a customized agent never receives a tool shipped after its
+    fork. For ``manage_agent_controllers`` that is not merely a missing feature:
+    the prompt's CONTROLLERS section (and the controller-mode block) tell every
+    agent that has controllers to call it before deploying — so a forked
+    allowlist left the agent told to call a tool it could not reach (QA on
+    PR 244). The condition is the prompt's own, ``agent_controllers(slug)``,
+    so the two cannot disagree. An empty list is unrestricted and stays empty;
+    an operator mute still removes the tool, which is the way to switch it off.
+    """
+    if not tools:
+        return tools
+    from mcp_servers.condor.profiles import canonical_tool_name
+
+    names = {canonical_tool_name(t).rsplit("__", 1)[-1] for t in tools}
+    if CONTROLLERS_TOOL in names:
+        return tools
+    from condor.agent_controllers import agent_controllers
+
+    try:
+        if not agent_controllers(slug):
+            return tools
+    except Exception:
+        log.exception("agent_controllers(%s) failed; leaving tools as authored", slug)
+        return tools
+    return [*tools, CONTROLLERS_TOOL]
+
+
 def _load_agent_from_file(path: Path, slug: str) -> Agent | None:
     """Load an Agent from a resolved ``AGENT.md``, whichever root it came from."""
     if not path.exists():
@@ -205,12 +257,15 @@ def _load_agent_from_file(path: Path, slug: str) -> Agent | None:
             description=meta.get("description", ""),
             instructions=body,
             agent_key=meta.get("agent_key", ""),
-            tools=meta.get("tools", []) or [],
+            tools=_with_implied_tools(slug, meta.get("tools", []) or []),
             when_to_consult=meta.get("when_to_consult", ""),
             server_required=meta.get("server_required", True),
             server_name=meta.get("server_name", "") or "",
             created_by=meta.get("created_by", 0),
             created_at=meta.get("created_at", ""),
+            agent_uid=str(meta.get("agent_uid", "") or ""),
+            bundle_version=int(meta.get("bundle_version", 0) or 0),
+            bundle_digest=str(meta.get("bundle_digest", "") or ""),
         )
     except Exception:
         log.exception("Failed to load agent from %s", path)
@@ -228,7 +283,11 @@ class AgentStore:
     def get(self, slug: str) -> Agent | None:
         if not slug:
             return None
-        path = resolve_agent_file(slug, AGENT_MD)
+        try:
+            path = resolve_agent_file(slug, AGENT_MD)
+        except UnsafeIdError:
+            # Not one path segment (SEC-648): no agent can live there.
+            return None
         if path is None:
             return None
         return _load_agent_from_file(path, slug)
@@ -303,6 +362,11 @@ class AgentStore:
             raise ValueError(
                 f"'{CHAT_SLUG}' is reserved for the default agent — pick another name"
             )
+        # ``_save`` overwrites unconditionally; ``get`` resolves through the
+        # layers, so a shipped agent is refused too instead of forked and
+        # clobbered (CORR-635).
+        if self.get(slug) is not None:
+            raise AlreadyExistsError(f"Agent '{slug}' already exists")
         agent = Agent(
             slug=slug,
             name=name,
@@ -314,6 +378,10 @@ class AgentStore:
             server_required=server_required,
             server_name=server_name,
             created_by=created_by,
+            # Minted here and nowhere else on a write path (FEAT-143): a new
+            # agent is a new lineage, and this is the one moment that is true.
+            # ``get`` must never mint, or reading an agent would write to disk.
+            agent_uid=uuid4().hex,
         )
         self._save(agent)
         log.info("Created agent %s (dir: %s)", agent.name, agent.slug)
@@ -329,16 +397,28 @@ class AgentStore:
             raise ValueError(
                 f"'{CHAT_SLUG}' is the default agent and cannot be deleted"
             )
-        if resolves_to_stock(slug, AGENT_MD):
+        try:
+            stock_only_def = resolves_to_stock(slug, AGENT_MD)
+            agent_dir = agent_home(slug)
+        except UnsafeIdError:
+            # A traversal slug names no deletable agent (SEC-648).
+            return False
+        if stock_only_def:
             # A shipped agent has no local file to remove and an update would
             # bring it straight back, so deletion would be a lie. FEAT-090's
             # mute is the reversible answer that already exists.
             raise ValueError(stock_delete_error(slug))
-        agent_dir = agent_home(slug)
         path = agent_dir / AGENT_MD
         if not path.exists():
             return False
         path.unlink()
+        # The bundle stamp is install bookkeeping about the AGENT.md just
+        # removed, not brain content — left behind, it keeps agent_home()
+        # existing forever and makes a later re-pull of this slug read as an
+        # update of nothing rather than a fresh install.
+        from condor.agents.bundle import stamp_path
+
+        stamp_path(agent_dir).unlink(missing_ok=True)
         # Remove the whole dir only when nothing else lives there (no strategies,
         # store or skills) — the brain/strategies must not be silently dropped.
         try:
@@ -360,6 +440,9 @@ class AgentStore:
             "server_name": agent.server_name,
             "created_by": agent.created_by,
             "created_at": agent.created_at,
+            "agent_uid": agent.agent_uid,
+            "bundle_version": agent.bundle_version,
+            "bundle_digest": agent.bundle_digest,
         }
         # Forks a stock AGENT.md down before overwriting it, so the shipped
         # copy is never the file this writes and the local one carries a

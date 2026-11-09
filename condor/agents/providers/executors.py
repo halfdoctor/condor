@@ -6,10 +6,18 @@ live ticks and the web API always agree.
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import TYPE_CHECKING, Any
+
+from condor.fetchers.executors import describe_executor_error, price_pending_rows
 
 from . import register_provider
 from .base import BaseProvider, ProviderResult
+
+if TYPE_CHECKING:
+    from condor.agents.ownership import OwnedBot
+
+log = logging.getLogger(__name__)
 
 
 class ExecutorsProvider(BaseProvider):
@@ -22,8 +30,9 @@ class ExecutorsProvider(BaseProvider):
         config: dict,
         agent_id: str = "",
         bot_names: list[str] | None = None,
-        since: float = 0.0,
+        owned: list[OwnedBot] | None = None,
     ) -> ProviderResult:
+        from condor.agents.attribution import ownership_windows
         from condor.agents.performance import fetch_agent_performance
 
         if not agent_id:
@@ -39,17 +48,27 @@ class ExecutorsProvider(BaseProvider):
         bases = list(bot_names or []) or [config.get("bot_name", "")]
 
         try:
-            # ``since`` slices an adopted bot's history to this session's window,
+            # Each owned base is sliced to the window this session held it over,
             # so what the agent is told it earned is what the dashboard attributes
             # to it — inherited PnL is not reported as its own.
             perf = await fetch_agent_performance(
-                client, agent_id, bot_names=bases, since=since
+                client,
+                agent_id,
+                bot_names=bases,
+                windows=ownership_windows(owned or []),
+                # The session report's curve, cut from the histories these
+                # figures were sliced from, so the tick walks them once.
+                pnl_series=True,
             )
         except Exception as e:
+            # The summary is embedded in the tick prompt and snapshot, and the
+            # raw exception carries the backend URL: keep it in the server log.
+            log.warning("executors provider fetch failed", exc_info=True)
+            _, message = describe_executor_error(e)
             return ProviderResult(
                 name=self.name,
-                data={"error": str(e)},
-                summary=f"Active Executors: failed to fetch ({e})",
+                data={"error": message},
+                summary=f"Active Executors: failed to fetch ({message})",
             )
 
         running = [e for e in perf.executors if e["status"] == "RUNNING"]
@@ -90,16 +109,28 @@ class ExecutorsProvider(BaseProvider):
         for o in orphaned:
             pos = (o.get("custom_info") or {}).get("position_address")
             reason = (o.get("custom_info") or {}).get("hold_reason") or "close failed"
+            # ESCALATE, do not self-recover (LP-6). This block is built for the
+            # two tick-seat callers — the loop and the winddown — and that seat
+            # mounts no liquidity tools: ``manage_clmm`` is in LIQUIDITY_TOOLS,
+            # which ``profiles.py`` deliberately withholds from ``tick`` on the
+            # grounds that "its orphan hint tells it to report, not to
+            # self-recover". The hint said the opposite for every tick, so a
+            # loop that followed it spent the tick discovering the tool it was
+            # told to use does not exist, and the position stayed open.
             lines.append(
                 f"  🚨 ORPHANED POSITION: executor {o['id']} ({o['pair']}) terminated "
-                f"({reason}) with position {pos} still open on-chain. Stopping the executor "
-                "will NOT close it — it has already terminated. Close it with "
-                'manage_clmm(action="close", position_address=..., pool_address=...); '
-                "list_orphaned_positions() reports the dex, pool and network for "
-                "the call, and pool_address is required. A new create_lp_executor CANNOT adopt "
-                "the position and would mint a second one. Then mark it recovered with "
-                f"resolve_orphaned_position(executor_id=\"{o['id']}\"). "
-                "Do not open new positions on these funds first."
+                f"({reason}) with position {pos} still open on-chain. Stopping the "
+                "executor will NOT close it — it has already terminated, and a new "
+                "create_lp_executor CANNOT adopt it (it would mint a second one). "
+                "You cannot close it yourself: closing liquidity directly needs "
+                "manage_clmm, which this seat does not mount. So ESCALATE — call "
+                "list_orphaned_positions() for the dex, pool and network, then "
+                "send_notification with those details and the position address so "
+                "an operator or an attended agent can close it. Journal it. Do NOT "
+                f"call resolve_orphaned_position(executor_id=\"{o['id']}\") yet: that "
+                "marks it recovered and drops it from this warning, so calling it on "
+                "a position still open on-chain hides live exposure. Do not open new "
+                "positions on these funds."
             )
         if perf.bot_names:
             lines.append(f"  Bots operated: {', '.join(perf.bot_names)}")
@@ -120,6 +151,13 @@ class ExecutorsProvider(BaseProvider):
                 "concluding this session is break-even."
             )
 
+        unpriced = await price_pending_rows(client, running)
+        if unpriced:
+            lines.append(
+                f"  ⚠️ No size for executor(s) {', '.join(unpriced)} — "
+                "their exposure is unknown, so new positions are refused until "
+                "they fill, report their own size, or a price is available."
+            )
         total_exposure = sum(r.get("amount", 0) for r in running)
 
         return ProviderResult(
@@ -134,6 +172,7 @@ class ExecutorsProvider(BaseProvider):
                 "total_volume": perf.volume,
                 "total_fees": perf.fees,
                 "total_exposure": total_exposure,
+                "unpriced_exposure": unpriced,
                 "open_count": perf.open_count,
                 "closed_count": perf.closed_count,
                 "win_rate": perf.win_rate,
@@ -147,6 +186,24 @@ class ExecutorsProvider(BaseProvider):
                 "controllers": perf.controllers,
                 "close_type_counts": perf.close_type_counts,
                 "fees_known": perf.fees_known,
+                # Whether this tick obtained a reading at all ([[CORR-725]]'s
+                # tri-state). Present only on the success path above: a fetch
+                # that raised returns ``{"error": ...}``, so the absence of this
+                # key is itself the statement that nothing was read, and
+                # ``TickEngine`` stamps ``last_reading_at`` on ``ok`` alone
+                # ([[FEAT-137]]).
+                "reading": perf.reading,
+                # Both scopes, labelled, beside the folded totals above
+                # ([[FEAT-135]]). None = unavailable, never the other scope.
+                "session_realized_pnl": perf.session_realized_pnl,
+                "session_volume": perf.session_volume,
+                "session_instances": perf.session_instances,
+                "lifetime_realized_pnl": perf.lifetime_realized_pnl,
+                "lifetime_volume": perf.lifetime_volume,
+                "lifetime_instances": perf.lifetime_instances,
+                # None when it could not be derived here; the engine then fetches
+                # it itself (TickEngine._pnl_series).
+                "pnl_series": perf.pnl_series,
             },
             summary="\n".join(lines),
         )

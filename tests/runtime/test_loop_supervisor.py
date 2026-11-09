@@ -64,7 +64,7 @@ def _seed_session(
     ``user_id=None`` writes the pre-CORR-082 shape, which carried no owner.
     """
     session_dir = (
-        agents_root / agent_slug / "strategies" / sslug / "sessions" / f"session_{num}"
+        agents_root / agent_slug / "loops" / sslug / "sessions" / f"session_{num}"
     )
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "journal.md").write_text("# Journal\n\n## Decisions\n\n")
@@ -172,6 +172,20 @@ def test_reconcile_marks_interrupted(tmp_path):
     assert "brigado.mm session 1" in report.summary()
 
 
+def test_reconcile_settles_past_entries_that_are_not_sessions(tmp_path):
+    """Stray files and folders under ``sessions/`` are skipped, not fatal."""
+    session_dir = _seed_session(tmp_path, tick=3)
+    (session_dir.parent / ".DS_Store").write_text("")
+    notes = session_dir.parent / "notes"
+    notes.mkdir()
+    (notes / "status.json").write_text(json.dumps({"state": LoopState.RUNNING}))
+
+    report = asyncio.run(LoopSupervisor().reconcile_boot(agents_root=tmp_path))
+
+    assert report.total == 1
+    assert read_status(session_dir)["state"] == LoopState.INTERRUPTED
+
+
 def test_reconcile_closes_ownership_at_the_last_recorded_instant(tmp_path):
     """The orphan gap between a crash and the reboot belongs to no session.
 
@@ -226,7 +240,9 @@ def test_reconcile_restart_is_opt_in(tmp_path, monkeypatch):
 
     called = []
     monkeypatch.setattr(
-        supervisor, "_restart", lambda status: called.append(status) or True
+        supervisor,
+        "_restart",
+        lambda status, session_dir=None: called.append(status) or True,
     )
 
     report = asyncio.run(supervisor.reconcile_boot(agents_root=tmp_path))
@@ -243,7 +259,7 @@ def test_reconcile_restart_opt_in_starts_new_session(tmp_path, monkeypatch):
 
     started = []
 
-    async def fake_restart(status):
+    async def fake_restart(status, session_dir=None):
         started.append(status["agent_slug"])
         return True
 
@@ -259,12 +275,46 @@ def test_reconcile_restart_opt_in_starts_new_session(tmp_path, monkeypatch):
     assert "restarted" in report.summary()
 
 
+def test_reconcile_restarts_the_newest_session_that_opted_in(tmp_path, monkeypatch):
+    """Two settled sessions of one strategy: the newest is the one that returns.
+
+    Session directories are visited ascending by number, so taking the first
+    opted-in session met took the *oldest*. A strategy stopped and started
+    again before the crash has both on disk — only a boot retires a SUSPENDED
+    record, and none ran in between — so it came back on the retired session's
+    server and model pins and its owner, with the session that was actually
+    running skipped.
+    """
+    old = _seed_session(
+        tmp_path, num=1, state=LoopState.SUSPENDED, restart_on_boot=True
+    )
+    new = _seed_session(tmp_path, num=2, restart_on_boot=True)
+    for session_dir, server in ((old, "retired_box"), (new, "live_box")):
+        status = json.loads((session_dir / "status.json").read_text())
+        status["pins"] = {"server_name": server}
+        (session_dir / "status.json").write_text(json.dumps(status))
+
+    supervisor = LoopSupervisor()
+    chosen = []
+
+    async def fake_restart(status, session_dir=None):
+        chosen.append((status["session_num"], status["pins"]["server_name"]))
+        return True
+
+    monkeypatch.setattr(supervisor, "_restart", fake_restart)
+
+    asyncio.run(supervisor.reconcile_boot(agents_root=tmp_path))
+
+    # One restart per strategy still (CORR-728), and it is session 2's pins.
+    assert chosen == [(2, "live_box")]
+
+
 def test_reconcile_restart_failure_is_reported_not_fatal(tmp_path, monkeypatch):
     """A restart that blows up still leaves the run interrupted and reported."""
     session_dir = _seed_session(tmp_path, restart_on_boot=True)
     supervisor = LoopSupervisor()
 
-    async def boom(status):
+    async def boom(status, session_dir=None):
         raise RuntimeError("config no longer valid")
 
     monkeypatch.setattr(supervisor, "_restart", boom)
@@ -310,6 +360,10 @@ def _run_real_restart(tmp_path, monkeypatch, supervisor):
 
     async def _inert_loop(self):
         ticked.append(self.agent_id)
+        # The run came up; only the tick *body* is inert. ``_restart`` waits for
+        # the first tick before it reports success (CORR-728), and the real
+        # ``_loop`` is what settles that.
+        self._note_first_tick("")
 
     monkeypatch.setattr(TickEngine, "_loop", _inert_loop)
 
@@ -401,7 +455,7 @@ def test_sessions_index_reports_real_status(tmp_path):
     supervisor = LoopSupervisor()
     asyncio.run(supervisor.reconcile_boot(agents_root=tmp_path))
 
-    strategy_dir = tmp_path / "brigado" / "strategies" / "mm"
+    strategy_dir = tmp_path / "brigado" / "loops" / "mm"
     status = infer_latest_session_status(strategy_dir, "brigado.mm")
 
     assert status["status"] == LoopState.INTERRUPTED
@@ -410,12 +464,12 @@ def test_sessions_index_reports_real_status(tmp_path):
 
 def test_sessions_index_falls_back_for_legacy_sessions(tmp_path):
     """Sessions written before status files existed still report idle."""
-    session_dir = tmp_path / "brigado" / "strategies" / "mm" / "sessions" / "session_3"
+    session_dir = tmp_path / "brigado" / "loops" / "mm" / "sessions" / "session_3"
     session_dir.mkdir(parents=True)
     (session_dir / "journal.md").write_text("# Journal\n")
 
     status = infer_latest_session_status(
-        tmp_path / "brigado" / "strategies" / "mm", "brigado.mm"
+        tmp_path / "brigado" / "loops" / "mm", "brigado.mm"
     )
     assert status["status"] == "idle"
     assert status["session_num"] == 3
@@ -492,6 +546,7 @@ def test_stop_all_stops_every_engine(tmp_path):
         async def _stop(agent_id=engine.agent_id):
             stopped.append(agent_id)
             supervisor.unregister(agent_id, LoopState.STOPPED)
+            return True
 
         engine.stop = _stop
         supervisor.register(engine)
@@ -504,6 +559,42 @@ def test_stop_all_stops_every_engine(tmp_path):
         # SUSPENDED, not STOPPED: the process ended these, not their owner, and
         # only that distinction lets the next boot honour ``restart_on_boot``.
         assert read_status(d)["state"] == LoopState.SUSPENDED
+
+
+def test_stop_all_keeps_the_stopped_a_winddown_wrote(tmp_path):
+    """CORR-644: an engine mid-winddown is not overwritten with SUSPENDED.
+
+    Its stop() defers to the winddown (returns False) and the winddown's own
+    teardown already recorded STOPPED; only the engine stop() actually stopped
+    is SUSPENDED.
+    """
+    supervisor = LoopSupervisor()
+    plain_dir, winding_dir = tmp_path / "plain", tmp_path / "winding"
+    plain_dir.mkdir()
+    winding_dir.mkdir()
+    plain = _fake_engine(plain_dir, num=1)
+    winding = _fake_engine(winding_dir, num=2)
+    winding._shutting_down = True
+
+    async def _plain_stop():
+        supervisor.unregister(plain.agent_id, LoopState.STOPPED)
+        return True
+
+    async def _winding_stop():
+        # The winddown's finally ends the run while stop() waits for it.
+        supervisor.unregister(winding.agent_id, LoopState.STOPPED)
+        return False
+
+    plain.stop = _plain_stop
+    winding.stop = _winding_stop
+    supervisor.register(plain)
+    supervisor.register(winding)
+
+    asyncio.run(supervisor.stop_all())
+
+    assert supervisor.all() == {}
+    assert read_status(plain_dir)["state"] == LoopState.SUSPENDED
+    assert read_status(winding_dir)["state"] == LoopState.STOPPED
 
 
 def test_for_strategy_filters_by_pair(tmp_path):

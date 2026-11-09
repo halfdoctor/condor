@@ -121,6 +121,43 @@ def test_mark_read_all_and_by_id(store):
     assert unread_count(USER_A) == 0
 
 
+def test_clear_empties_only_own_bucket(store):
+    async def go():
+        await record(USER_A, "A1")
+        await record(USER_A, "A2")
+        await record(USER_B, "B1")
+        await notifications.clear(USER_A)
+
+    asyncio.run(go())
+
+    assert list_for(USER_A) == []
+    assert unread_count(USER_A) == 0
+    assert [n.text for n in list_for(USER_B)] == ["B1"]
+
+
+def test_clear_failure_is_reported_and_keeps_history(store, monkeypatch):
+    """A clear that could not be written must not report success."""
+    from fastapi import HTTPException
+
+    from condor.web.routes.notifications import clear_notifications
+
+    asyncio.run(record(USER_A, "kept"))
+
+    def broken(_data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(notifications, "_write_all", broken)
+
+    with pytest.raises(OSError):
+        asyncio.run(notifications.clear(USER_A))
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(clear_notifications(user=WebUser(id=USER_A, role="user")))
+
+    assert exc.value.status_code == 500
+    assert "disk full" not in exc.value.detail
+    assert [n.text for n in list_for(USER_A)] == ["kept"]
+
+
 def test_no_user_records_nothing(store):
     """A producer with nobody behind it is not an error."""
     assert asyncio.run(record(0, "orphan")) is None
@@ -461,10 +498,12 @@ def test_notify_route_counts_a_bell_only_delivery_as_recorded(store, monkeypatch
     from condor.web.routes import agents as agents_routes
     from condor.web.routes.agents import NotifyRequest, notify_user
 
-    async def _no_conversation(session_key: str) -> str:
+    async def _no_conversation(session_key: str, user) -> str:
         return ""
 
-    monkeypatch.setattr(agents_routes, "_conversation_for_session", _no_conversation)
+    monkeypatch.setattr(
+        agents_routes, "_owned_conversation_for_session", _no_conversation
+    )
 
     class _DeadBot:
         async def send_message(self, **kw):

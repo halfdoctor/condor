@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Cpu,
   History,
   Loader2,
   Repeat,
@@ -14,12 +15,12 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useState } from "react";
+import { memo, useCallback, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { ActivityFeed } from "@/components/agent/ActivityFeed";
-import { MarkdownEditor } from "@/components/agent/AgentOverviewTab";
+import { MarkdownEditor } from "@/components/agent/MarkdownEditor";
 import { AgentStrategies } from "@/components/agent/AgentStrategies";
 import { LoopBanner } from "@/components/agent/LoopBanner";
 import { ConfirmDialog } from "@/components/agent/ConfirmDialog";
@@ -35,6 +36,7 @@ import {
   Empty,
   Row,
 } from "@/components/agent/knowledge/KnowledgeChrome";
+import { ControllersTab } from "@/components/agent/knowledge/ControllersTab";
 import { MemoryEditor } from "@/components/agent/knowledge/MemoryEditor";
 import { SkillEditor } from "@/components/agent/knowledge/SkillEditor";
 import {
@@ -44,7 +46,15 @@ import {
   type SkillCard,
   type SkillProposal,
 } from "@/lib/api";
+import { agentQuery } from "@/lib/queryClient";
 import { formatRoutineName } from "@/lib/routineUtils";
+
+/**
+ * One plugin list for every render (PERF-393): a fresh `[remarkGfm]` is a new
+ * prop to ReactMarkdown each time, and this component is `memo`'d so the chat
+ * pane's 50 ms stream flushes stop re-parsing AGENT.md.
+ */
+const GFM = [remarkGfm];
 
 /**
  * Everything an agent is, in one editable surface.
@@ -67,7 +77,7 @@ import { formatRoutineName } from "@/lib/routineUtils";
  * opening the panel on an agent with forty playbooks costs a few kilobytes, and
  * the one you clicked costs its own request.
  */
-export function AgentKnowledge({
+export const AgentKnowledge = memo(function AgentKnowledge({
   slug,
   dense = false,
   tab,
@@ -162,19 +172,11 @@ export function AgentKnowledge({
   /**
    * The loops, for the banner above the sections.
    *
-   * The same `["agent", slug]` key `AgentStrategies` reads, so the two share
-   * one set of records through react-query and the banner costs no second
-   * fetch when the Strategies section is open. Same conditional cadence for
-   * the same reason (PERF-305): only a live loop can move a countdown, and an
-   * idle agent should not buy 5s of Hummingbot round-trips to be told so.
+   * The same `["agent", slug]` query `AgentStrategies` reads, so the banner
+   * costs no second fetch when the Strategies section is open, and polls only
+   * while a loop is live (`agentQuery`, PERF-305).
    */
-  const { data: agentDetail } = useQuery({
-    queryKey: ["agent", slug],
-    queryFn: () => api.getAgent(slug),
-    enabled: !!slug,
-    refetchInterval: (q) =>
-      q.state.data?.strategies.some((s) => s.status === "running") ? 5000 : false,
-  });
+  const { data: agentDetail } = useQuery(agentQuery(slug));
 
   // One dirty flag for whichever editor is mounted — only ever one is.
   const [dirty, setDirty] = useState(false);
@@ -195,8 +197,11 @@ export function AgentKnowledge({
 
   const refresh = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ["agent-brain", slug] });
-    // The agent page polls a different key for the same AGENT.md.
-    queryClient.invalidateQueries({ queryKey: ["agent", slug] });
+    // The same AGENT.md, and the front-matter facts read off it, also arrive
+    // under ["agent", slug] — the banner above reads that key and so does the
+    // workspace page. Its poll is gated to a running loop (`agentQuery`), so
+    // for an idle agent this invalidation is the only thing that re-reads it.
+    queryClient.invalidateQueries({ queryKey: agentQuery(slug).queryKey });
     // A body lives under its own key, and keys match element by element — so
     // "agent-brain" never reaches "agent-brain-body". Without this the reader
     // stays mounted across a save and renders the text from before it, and
@@ -207,10 +212,10 @@ export function AgentKnowledge({
   }, [queryClient, slug]);
 
   const deleteMut = useMutation({
-    mutationFn: () =>
-      deleting!.kind === "skill"
-        ? api.deleteAgentSkill(slug, deleting!.card.slug)
-        : api.deleteAgentMemory(slug, deleting!.card.name),
+    mutationFn: (target: Reading) =>
+      target.kind === "skill"
+        ? api.deleteAgentSkill(slug, target.card.slug)
+        : api.deleteAgentMemory(slug, target.card.name),
     onSuccess: () => {
       refresh();
       setDeleting(null);
@@ -277,6 +282,22 @@ export function AgentKnowledge({
     },
   });
 
+  /**
+   * Allow one imported routine file to run in the Condor process (FEAT-147).
+   *
+   * Not optimistic, unlike the mute above: the row does not merely change
+   * state, it *becomes* a different row — the server imports the file and
+   * answers with its real description and config schema, or refuses because
+   * the module raised. So this one waits for the round trip and re-fetches.
+   */
+  const allowMut = useMutation({
+    mutationFn: (v: { kind: "routine"; name: string; allowed: boolean }) =>
+      api.setAgentCodeTrust(slug, v),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["agent-brain", slug] });
+    },
+  });
+
   // A count is what the *agent* gets, because that is the number the tab is
   // asked for. When something is muted the panel lists more rows than that, so
   // the count says "7/9" — otherwise the tab would contradict its own list.
@@ -285,7 +306,10 @@ export function AgentKnowledge({
     memories: brain?.memories.length ?? 0,
     tools: brain?.tools.filter((t) => !t.muted).length ?? 0,
     strategies: brain?.strategies.length ?? 0,
-    routines: brain?.routines.filter((r) => !r.muted).length ?? 0,
+    // `pending` counts against the agent too: a routine whose code has not
+    // been allowed to run here is one the agent cannot call, muted or not.
+    routines: brain?.routines.filter((r) => !r.muted && !r.pending).length ?? 0,
+    controllers: brain?.controllers?.length ?? 0,
   };
   const totals = {
     skills: brain?.skills.length ?? 0,
@@ -329,8 +353,8 @@ export function AgentKnowledge({
       ...withMuted(counts.tools, totals.tools),
     },
     {
-      id: "strategies",
-      label: "Strategies",
+      id: "loops",
+      label: "Loops",
       icon: <Repeat className="h-3.5 w-3.5" />,
       count: counts.strategies,
     },
@@ -341,6 +365,18 @@ export function AgentKnowledge({
       count: counts.routines,
       ...withMuted(counts.routines, totals.routines),
     },
+    // Only for an agent that carries controllers (FEAT-127): every other
+    // agent's strip is unchanged rather than growing a section that is empty.
+    ...(counts.controllers > 0
+      ? [
+          {
+            id: "controllers" as const,
+            label: "Controllers",
+            icon: <Cpu className="h-3.5 w-3.5" />,
+            count: counts.controllers,
+          },
+        ]
+      : []),
     {
       id: "activity",
       label: "Activity",
@@ -552,7 +588,7 @@ export function AgentKnowledge({
                 onAskAgent={onAskAgent}
               />
             )}
-            {activeTab === "strategies" && (
+            {activeTab === "loops" && (
               <AgentStrategies
                 slug={slug}
                 dense={dense}
@@ -567,7 +603,17 @@ export function AgentKnowledge({
                 onMute={(name, muted) =>
                   muteMut.mutate({ kind: "routine", name, muted })
                 }
+                onAllow={(name) =>
+                  allowMut.mutate({ kind: "routine", name, allowed: true })
+                }
+                allowing={allowMut.isPending}
                 onAskAgent={onAskAgent}
+              />
+            )}
+            {activeTab === "controllers" && (
+              <ControllersTab
+                slug={slug}
+                controllers={brain.controllers ?? []}
               />
             )}
             {activeTab === "activity" && <ActivityFeed agent={slug} />}
@@ -584,7 +630,7 @@ export function AgentKnowledge({
             ? deleteMut.error.message
             : "Could not delete this."
         }
-        onConfirm={() => deleteMut.mutate()}
+        onConfirm={() => deleting && deleteMut.mutate(deleting)}
         onClose={() => setDeleting(null)}
       >
         {deleting?.kind === "memory" ? (
@@ -640,7 +686,7 @@ export function AgentKnowledge({
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">{body}</div>
     </div>
   );
-}
+});
 
 // ── Tabs ──
 
@@ -718,7 +764,7 @@ function BrainTab({
             api
               .updateAgentMd(slug, value)
               .then(() =>
-                queryClient.invalidateQueries({ queryKey: ["agent", slug] }),
+                queryClient.invalidateQueries({ queryKey: agentQuery(slug).queryKey }),
               )
           }
           invalidateKey={["agent-brain", slug]}
@@ -762,7 +808,7 @@ function BrainTab({
       </div>
       {prose ? (
         <div className="chat-markdown text-xs text-[var(--color-text)]">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{prose}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={GFM}>{prose}</ReactMarkdown>
         </div>
       ) : (
         <Empty>This agent has no AGENT.md yet.</Empty>
@@ -828,7 +874,7 @@ function ProposedSkill({
       </button>
       {open && (
         <div className="chat-markdown mt-2 text-xs text-[var(--color-text)]">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          <ReactMarkdown remarkPlugins={GFM}>
             {proposal.body}
           </ReactMarkdown>
         </div>
@@ -1149,6 +1195,8 @@ function RoutinesTab({
   action,
   onOpen,
   onMute,
+  onAllow,
+  allowing,
   onAskAgent,
 }: {
   brain: AgentBrain;
@@ -1157,9 +1205,14 @@ function RoutinesTab({
   onOpen?: (routineName: string) => void;
   /** Switch a routine off for this agent, or back on (FEAT-090). */
   onMute?: (name: string, muted: boolean) => void;
+  /** Let an imported routine's file execute in this process (FEAT-147). */
+  onAllow?: (name: string) => void;
+  /** An allow is in flight — the chips stop inviting a second click. */
+  allowing?: boolean;
   /** Put the improvement to the agent that runs it (FEAT-092). */
   onAskAgent?: (text: string) => void;
 }) {
+  const anyPending = brain.routines.some((r) => r.pending);
   return (
     <div className="space-y-1.5">
       <div className="flex items-start justify-between gap-3">
@@ -1171,6 +1224,15 @@ function RoutinesTab({
         </p>
         {action}
       </div>
+      {anyPending && (
+        <p className="rounded border border-amber-500/40 bg-amber-500/5 px-2.5 py-1.5 text-[11px] text-amber-400">
+          Some of these routines came from an imported bundle and have not run
+          here yet. A routine runs as Python inside the Condor process, with no
+          sandbox — open it, read it, then Allow it. Allowing is separate from
+          the on/off switch: the switch says whether this agent may use it, Allow
+          says whether its code may run at all.
+        </p>
+      )}
       {brain.routines.length === 0 ? (
         <Empty>No routines this agent can run.</Empty>
       ) : (
@@ -1180,6 +1242,23 @@ function RoutinesTab({
             title={formatRoutineName(r.name)}
             badges={
               <>
+                {r.pending && (
+                  <Chip
+                    tone="warn"
+                    title={
+                      r.pending_reason === "changed"
+                        ? "Allowed before, but the file has changed since — read it again, then allow it"
+                        : "Imported code that has never run here — read it, then allow it"
+                    }
+                    onClick={
+                      onAllow && !allowing ? () => onAllow(r.name) : undefined
+                    }
+                  >
+                    {r.pending_reason === "changed"
+                      ? "changed — allow"
+                      : "not allowed to run — allow"}
+                  </Chip>
+                )}
                 {r.muted && (
                   <Chip title="Switched off — this agent cannot run it">
                     muted

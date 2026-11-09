@@ -22,8 +22,8 @@ tick and a background worker run for nobody's conversation and pass no
 so ``on_complete="resume"`` has nothing to wake and returns ``False`` silently,
 while ``notify`` sends the answer to the *user* rather than to the agent that
 needed it. For those seats a blocking ask is not a worse delegation — it is the
-only shape that works, and the cheap one: one ``client.prompt()`` and a ledger
-row, against a detached task with an event sidecar, a transcript and a bell.
+only shape that works, and the cheap one: one prompt stream and a ledger row,
+against a detached task with an event sidecar, a transcript and a bell.
 
 Every run here is **unattended**: no ``permission_callback`` is built, so an ACP
 agent auto-approves its own tool calls. See :mod:`condor.runtime.confirmations`,
@@ -39,16 +39,25 @@ import logging
 import os
 import time
 import uuid
+from typing import Any
 
 from condor.acp.pydantic_ai_client import (
     healthcheck_local_backend,
     is_pydantic_ai_model,
 )
 from condor.agents.agent import AgentStore
+from condor.agents.risk import (
+    RefusalLog,
+    RiskEngine,
+    RiskLimits,
+    RiskState,
+    auto_approve_with_risk_check,
+)
 from condor.agents.run_records import KIND_CONSULT, record_run
 from condor.preferences import resolve_custom_endpoint
 from condor.runtime import context as runtime_context
 from condor.runtime import toolsets
+from config_manager import resolve_stored_server
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +66,66 @@ log = logging.getLogger(__name__)
 # because it bounds a different thing: a record is a row in a list, not a second
 # copy of the answer. The answer itself is returned to the caller uncut.
 MAX_RECORDED_RESULT = 2000
+
+# The terminal ``PromptDone`` reasons that mean the session failed rather than
+# answered. Both clients end a turn this way instead of raising, so the engine
+# turns them into an exception its callers already record as an error. Every
+# other reason (end_turn, max_tokens, refusal, cancelled) returns the text.
+FAILED_STOP_REASONS = frozenset({"error", "disconnected", "timeout"})
+
+
+def _delegated_envelope() -> tuple[RiskEngine, RiskState]:
+    """The risk envelope a delegated run trades inside (MM-1).
+
+    ``RiskLimits()``' own defaults — the same $500 position ceiling and
+    five-executor cap an unconfigured loop gets — because a delegation has
+    nowhere else to read them from: it is not a session, it has no strategy,
+    and the ``Agent`` record carries no limits of its own. Inventing a looser
+    envelope for the one seat nobody is watching would defeat the point;
+    borrowing some loop's would bind this run to limits chosen for a different
+    job. Making it configurable per agent is the obvious next step and a
+    product decision, not this fix.
+
+    The state is a bare :class:`RiskState`, which starts at zero and then
+    accumulates: ``check_executor_action`` adds each approved create to it, so
+    a run's own creates do sum against the envelope and the executor cap.
+
+    What it cannot see is what was already out there. A tick recomputes its
+    state from the venue every tick; a delegation has no tracker, so exposure
+    the agent opened *before* this run — or in another run alongside it — reads
+    as zero. The envelope therefore bounds this run's own appetite, not the
+    agent's total position. Stated plainly because the gap is easy to mistake
+    for a guarantee it does not make.
+    """
+    return RiskEngine(RiskLimits()), RiskState()
+
+
+async def _price_client(resolved_server: str | None, slug: str) -> Any:
+    """The API client the gate prices a create with, or ``None``.
+
+    Takes the server the run ALREADY resolved rather than resolving its own: the
+    gate has to price a call against the same book the call will land on, and
+    two resolutions of one question are two chances to disagree.
+
+    Best-effort by design: a delegation that cannot reach a server should fail
+    on the tools that need one, not on the gate that guards them. ``None`` only
+    costs the gate the ability to value a *base*-denominated create, which it
+    then refuses as unpriced — the same answer a tick gives, and the safe one.
+    """
+    from config_manager import get_config_manager
+
+    if not resolved_server:
+        return None
+    try:
+        return await get_config_manager().get_client(resolved_server)
+    except Exception:
+        log.warning(
+            "Delegation to %s: no API client for the risk gate; a create it "
+            "cannot price will be refused",
+            slug,
+            exc_info=True,
+        )
+        return None
 
 
 async def run_agent_to_completion(
@@ -73,14 +142,17 @@ async def run_agent_to_completion(
     """Load the Agent ``slug``, run its brain to completion on ``task``, return text.
 
     The run is unattended: no ``permission_callback`` is built, so an ACP agent
-    auto-approves its own tool calls and ``client.prompt()`` returning IS the
-    "task done" signal. No strategy is involved — the Agent's identity + shared
+    auto-approves its own tool calls and the stream ending IS the "task done"
+    signal — unless its terminal ``PromptDone`` says the session failed
+    (:data:`FAILED_STOP_REASONS`), which raises ``RuntimeError`` carrying any
+    text the client streamed before it (the pydantic client's formatted error). No strategy is involved — the Agent's identity + shared
     memory/skills drive the run.
 
     If ``event_sink`` is provided, it is called with every streamed
     :data:`condor.acp.client.ACPEvent` (thoughts, tool calls, text) as they arrive,
-    so a caller can persist the full session transcript. When ``None`` the cheaper
-    one-shot ``client.prompt()`` is used.
+    so a caller can persist the full session transcript. Either way the run reads
+    ``client.prompt_stream()``; ``client.prompt()`` is the same stream joined, and
+    it hides the terminal event.
 
     ``delegate_worker`` is DELEGATE's flag (FEAT-032): it tells the subprocess it
     is the detached background seat rather than the interactive one. Every agent
@@ -156,14 +228,43 @@ async def run_agent_to_completion(
     # agent_slug the condor MCP tools would target the CHAT's stores.
     effective_server = agent.server_name or server_name
 
-    mcp_servers = toolsets.build_mcp_servers_for_session(
-        user_id,
-        chat_id,
-        server_name=effective_server if agent.server_required else None,
-        agent_slug=slug,
-        delegate_worker=delegate_worker,
-        ask_target=ask_target,
-    )
+    # A server pinned on the Agent itself is chosen, not inherited: it resolves
+    # or this run refuses, naming it, instead of answering on another server's
+    # accounts (CORR-729). The caller's ambient server stays a fallback.
+    from config_manager import ServerUnavailable, get_config_manager
+
+    try:
+        # Resolved ONCE, for the tools AND the risk gate's price client
+        # (CORR-737's rule, applied to this seat). They used to resolve
+        # separately on different inputs — the builder with ``chat_id``, the
+        # price client without — so a run whose owner had no explicit server
+        # could price a create against the first accessible server while the
+        # create itself landed on the chat's default. A gate checking the wrong
+        # book can refuse a valid call, or approve one that is over the limit
+        # on the book that matters.
+        resolved = resolve_stored_server(
+            get_config_manager(),
+            user_id,
+            effective_server if agent.server_required else None,
+            pinned=agent.server_required and bool(agent.server_name),
+            chat_id=chat_id,
+        )
+        mcp_servers = toolsets.build_mcp_servers_for_session(
+            user_id,
+            chat_id,
+            # Handed back with ``server_pinned`` so the builder resolves this
+            # name to itself instead of running the chain a second time.
+            server_name=resolved,
+            agent_slug=slug,
+            delegate_worker=delegate_worker,
+            ask_target=ask_target,
+            server_pinned=bool(resolved),
+        )
+    except ServerUnavailable as exc:
+        return (
+            f"The '{slug}' agent is pinned to a server it cannot use: {exc}\n\n"
+            "Re-point the agent at a server you can reach, or clear its pin."
+        )
 
     # Build the client for the (possibly fallback) model through the shared
     # factory (ARCH-192). A pydantic-ai model also filters by the agent's tool
@@ -174,35 +275,111 @@ async def run_agent_to_completion(
     # fallback model never inherits the original's credentials.
     from condor.runtime.llm_client import build_llm_client
 
+    # Unattended, and therefore GATED (MM-1). "Nobody is watching" used to be
+    # the argument for building no permission callback at all, which read as
+    # "there is no one to ask" and meant "nothing is asked": every delegated
+    # deploy, create and swap reached the venue with no risk check, no ledger
+    # and no refusal record, while the identical call from a tick was bounded.
+    # QA deployed a live pmm_mister through this door with no platform loss cap
+    # at all. Nobody watching is the reason to gate it, not the reason not to.
+    refusals = RefusalLog()
+    risk_engine, risk_state = _delegated_envelope()
+    # The same server the tools above resolved onto, for the same reason a tick
+    # resolves once for both (CORR-737): a gate pricing a create on fleet A
+    # while the create lands on fleet B is checking the wrong book.
+    price_client = await _price_client(resolved, slug)
+    permission_cb = auto_approve_with_risk_check(
+        risk_engine,
+        risk_state,
+        # A delegation is a live seat: it may trade, and only the named writes
+        # the gate bounds are bounded. Not "dry_run" — that mode is a rehearsal
+        # this is not — and not "shutdown".
+        execution_mode="loop",
+        # No session tag and no bot ledger: a delegation is not a session, so
+        # per-session attribution and namespace ownership have nothing to key
+        # on. Both empty keep exactly today's behaviour on those two checks
+        # (see ``auto_approve_with_risk_check``), so this adds bounds without
+        # inventing an identity the run does not have.
+        agent_id="",
+        ledger=None,
+        price_client=price_client,
+        refusals=refusals,
+    )
+
     client = build_llm_client(
         model_key,
         mcp_servers=mcp_servers,
-        # Unattended: nobody is watching, so there is no one to ask. An ACP
-        # agent auto-approves its own tool calls.
-        permission_callback=None,
+        permission_callback=permission_cb,
         allowed_tools=agent.tools or None,
         user_id=user_id,
     )
 
     prompt = runtime_context.build_agent_context(agent, user_id, task, context)
 
+    from condor.acp.client import PromptDone, TextChunk
+
+    chunks: list[str] = []
+    stop_reason = ""
     await client.start()
     try:
-        if event_sink is None:
-            answer = await client.prompt(prompt)
-        else:
-            from condor.acp.client import TextChunk
-
-            chunks: list[str] = []
-            async for event in client.prompt_stream(prompt):
+        async for event in client.prompt_stream(prompt):
+            if event_sink is not None:
                 event_sink(event)
-                if isinstance(event, TextChunk):
-                    chunks.append(event.text)
-            answer = "".join(chunks)
+            if isinstance(event, TextChunk):
+                chunks.append(event.text)
+            elif isinstance(event, PromptDone):
+                stop_reason = event.stop_reason
     finally:
         await client.stop()
 
-    return fallback_note + (answer or "(the agent returned no answer)")
+    answer = "".join(chunks)
+    # Neither client raises when the session dies: the turn just ends on a
+    # terminal PromptDone. Without this check a disconnected subprocess, a failed
+    # request or the client's own hard stop would come back as the placeholder
+    # (or a provider error message) and every door would record it as "done".
+    if stop_reason in FAILED_STOP_REASONS:
+        # The refusals go out on the failure too. They are collected during the
+        # run, and a session that dies afterwards does not make them less true:
+        # without this the caller — and the error record this raise becomes —
+        # lost the only account of why those calls were blocked, which is
+        # exactly the silence the gate's refusal log exists to end.
+        detail = (answer.strip() + _refusal_note(refusals)).strip()
+        raise RuntimeError(
+            f"agent session ended: {stop_reason}" + (f" — {detail}" if detail else "")
+        )
+
+    return (
+        fallback_note
+        + (answer or "(the agent returned no answer)")
+        + _refusal_note(refusals)
+    )
+
+
+def _refusal_note(refusals: RefusalLog) -> str:
+    """What the gate refused during this run, for the caller — or nothing.
+
+    A delegation answers a caller who was not watching it, and a refusal
+    otherwise reaches nobody at all: the ACP bridge carries only the outcome,
+    never the reason (``RequestPermissionResponse`` has no field for it), so a
+    gated call reads to the agent as an approval that never came and to the
+    caller as an answer with an unexplained hole in it. A tick has a journal
+    and a next prompt to carry this; a delegation has one return value.
+
+    Appended rather than raised: the run still answered, and the answer is
+    still worth having — the refusal is a caveat on it, not a failure of it.
+    """
+    noted = refusals.drain()
+    if not noted:
+        return ""
+    lines = "\n".join(
+        f"- `{row.get('tool') or '<unknown tool>'}`: {row.get('reason') or ''}".rstrip()
+        for row in noted
+    )
+    return (
+        "\n\n---\n**The risk gate refused "
+        f"{len(noted)} call{'s' if len(noted) != 1 else ''} during this run:**\n"
+        f"{lines}"
+    )
 
 
 def _clip(text: str) -> str:

@@ -6,6 +6,7 @@ import {
   ChevronUp,
   Database,
   Layers,
+  Stethoscope,
   Loader2,
   Rocket,
   ScrollText,
@@ -22,6 +23,13 @@ import { useSearchParams } from "react-router-dom";
 import { EditorModal } from "@/components/editor/EditorModal";
 import { ControllerPnlChart } from "@/components/bots/ControllerPnlChart";
 import { DeployBotDialog } from "@/components/bots/DeployBotDialog";
+import { FleetDiagnostics } from "@/components/bots/FleetDiagnostics";
+import {
+  UNKNOWN_DIAGNOSTICS,
+  UNKNOWN_EXECUTOR_HYGIENE,
+  buildSignalGroups,
+  flaggedCount,
+} from "@/components/bots/fleet-diagnostics";
 import { LogsSection } from "@/components/bots/LogsSection";
 import { PnlEvolutionChart } from "@/components/bots/PnlEvolutionChart";
 import { ExecutorChart } from "@/components/charts/ExecutorChart";
@@ -56,7 +64,9 @@ import {
   type ControllerInfo,
   type BotRunInfo,
   type ControllerPerformanceSnapshot,
+  type ExecutorHygiene,
   type ExecutorInfo,
+  type FleetDiagnostics as FleetDiagnosticsData,
 } from "@/lib/api";
 import { useCoarseClock } from "@/hooks/useCoarseClock";
 import { controllerKey } from "@/lib/controller-identity";
@@ -120,6 +130,7 @@ import { aggregatePnlSeries, snapshotsFromRunHistory } from "@/lib/pnl-chart";
 import { buildAttributor, runWindows } from "@/lib/run-attribution";
 import { dropDeletedRunQueries } from "@/lib/run-deletion";
 import type { ConvertFn } from "@/lib/rates";
+import { unavailableLabel } from "@/lib/strategy-unavailable";
 import { useViewFacts } from "@/lib/viewFacts";
 import {
   attributionIndex,
@@ -355,6 +366,16 @@ interface PerfBrowserProps {
    * say about itself.
    */
   deeds?: DeedIndex | null;
+  /**
+   * The host, lag and throttle signals the fleet map carries (FEAT-141).
+   *
+   * Off the map the page already polls, never a fetch of this component's own:
+   * the diagnostics drawer may add no polling cost to a dashboard that already
+   * polls per server. An unpassed prop reads as every signal unknown.
+   */
+  diagnostics?: FleetDiagnosticsData;
+  /** This host's executor hygiene, off the bots payload (FEAT-141). */
+  hygiene?: ExecutorHygiene;
   rateFormatPnl?: (val: number, quote: string) => string;
   rateFormatValue?: (val: number, quote: string) => string;
   rateFormatDetailed?: (val: number, quote: string) => string;
@@ -539,6 +560,8 @@ export function PerfBrowser({
   terminatedControllers = EMPTY_TERMINATED,
   owners = EMPTY_OWNERS,
   deeds = null,
+  diagnostics = UNKNOWN_DIAGNOSTICS,
+  hygiene = UNKNOWN_EXECUTOR_HYGIENE,
   rateFormatPnl,
   rateFormatValue,
   rateFormatDetailed,
@@ -558,7 +581,7 @@ export function PerfBrowser({
   // drawer the scope stops supporting simply stops being drawn (see
   // `openDrawer`). Closed by default: a drawer is a thing you occasionally
   // open, and the chart is the thing you came for.
-  const [drawer, setDrawer] = useState<null | "config" | "logs">(null);
+  const [drawer, setDrawer] = useState<null | "config" | "logs" | "diagnostics">(null);
   // Which rows have their children drawn. An allow-list, not a deny-list: the
   // tree is flat now, so a fleet of fourteen controllers holding a hundred and
   // nineteen executors would open on all hundred and nineteen if shut had to be
@@ -781,6 +804,12 @@ export function PerfBrowser({
     () => (runQueryOn ? runRecords(runLedger?.deployments) : null),
     [runQueryOn, runLedger],
   );
+  // Why the run filters to nothing when its server could not be read (CORR-430):
+  // an empty ledger then means "unread", not "deployed nothing".
+  const runUnavailable = runQueryOn ? unavailableLabel(runLedger?.unavailable) : "";
+  // The run's figures are withheld, not zero (CORR-433): the KPI strip reads
+  // "—" rather than folding the empty set into a strip of `$0.00`.
+  const runWithheld = runUnavailable !== "";
   const clearRun = useCallback(
     () => (onClearRun ? onClearRun() : setParam("run", "", "")),
     [onClearRun, setParam],
@@ -1269,10 +1298,24 @@ export function PerfBrowser({
    *
    * A bot row selects it outright; a fleet row narrowed to one bot by the
    * bubbles still *is* that bot's report, and keeps the actions it had before
-   * the row came back (a single-bot fleet draws no bot level at all).
+   * the row came back (a single-bot fleet draws no bot level at all). An agent
+   * row is the same case one level down: an agent running one bot collapses its
+   * bot level away, so the agent row *is* that bot's report — and on the agent
+   * workspace's fleet, where the agent row is the root, it is the only place
+   * that bot's Stop and Logs could ever be drawn.
    */
+  const soloScopeBot = useMemo(() => {
+    if (scope.kind !== "agent") return undefined;
+    const seen = new Set(scope.leaves.map((leaf) => leaf.bot));
+    const only = seen.size === 1 ? [...seen][0] : undefined;
+    return only && only !== UNATTACHED_BOT ? only : undefined;
+  }, [scope]);
   const scopeBotName =
-    scope.kind === "bot" ? botOfNodeId(scope.id) : scope.kind === "fleet" ? soloRealBot : undefined;
+    scope.kind === "bot"
+      ? botOfNodeId(scope.id)
+      : scope.kind === "fleet"
+        ? soloRealBot
+        : soloScopeBot;
 
   /**
    * The one agent this scope is about, whichever way it got there.
@@ -1733,6 +1776,27 @@ export function PerfBrowser({
   }, [activeBot]);
 
   /**
+   * The diagnostics fold, once (FEAT-141).
+   *
+   * Folded here rather than inside the drawer because the *count* is wanted on
+   * the button that opens it, and folding twice would let the badge and the
+   * rows disagree. Nothing in it fetches — every input is a prop the page
+   * already holds.
+   */
+  const diagnosticInput = useMemo(
+    () => ({ bots, owners, deeds, diagnostics, hygiene, nowMs: now }),
+    [bots, owners, deeds, diagnostics, hygiene, now],
+  );
+  const diagnosticGroups = useMemo(
+    () => buildSignalGroups(diagnosticInput),
+    [diagnosticInput],
+  );
+  const diagnosticsFlagged = useMemo(
+    () => flaggedCount(diagnosticGroups),
+    [diagnosticGroups],
+  );
+
+  /**
    * Which drawer the current scope actually supports.
    *
    * Derived rather than reset from an effect: a `logs` drawer means nothing at
@@ -1741,7 +1805,16 @@ export function PerfBrowser({
    * support it finds it open again, which is the preference the user expressed.
    */
   const openDrawer =
-    drawer === "config" && liveCtrl ? "config" : drawer === "logs" && activeBot ? "logs" : null;
+    drawer === "config" && liveCtrl
+      ? "config"
+      : drawer === "logs" && activeBot
+        ? "logs"
+        : // Diagnostics is the one occupant every scope supports: it is about
+          // the fleet, and the operator who needs it has not yet worked out
+          // which bot to click on.
+          drawer === "diagnostics"
+          ? "diagnostics"
+          : null;
 
   // ── Keyboard navigation over the picker, in the order it is drawn ──
 
@@ -1838,7 +1911,7 @@ export function PerfBrowser({
   // Scroll active into view
   useEffect(() => {
     const el = sidebarRef.current?.querySelector("[data-active-scope]");
-    el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    if (typeof el?.scrollIntoView === "function") el.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }, [effectiveScopeId]);
 
   // ── What the scope adds up to, in display currency ──
@@ -2408,7 +2481,7 @@ export function PerfBrowser({
               {filterOptions.agents.length > 1 && (
                 <BubbleGroup
                   title="Agent"
-                  hint="Which agent's strategy owns each record — by the bot's namespace, or by the session an executor was tagged with. Unattributed is everything the fleet map credits to nobody, which on most servers is nearly all of it."
+                  hint="Which agent's loop owns each record — by the bot's namespace, or by the session an executor was tagged with. Unattributed is everything the fleet map credits to nobody, which on most servers is nearly all of it."
                   options={filterOptions.agents}
                   selected={filters.agents}
                   onChange={(v) => setFilters((f) => ({ ...f, agents: v }))}
@@ -2715,6 +2788,11 @@ export function PerfBrowser({
                 </button>
               </span>
             )}
+            {runUnavailable && (
+              <span data-run-unavailable className="shrink-0 text-[10px] text-amber-500/90">
+                {runUnavailable}
+              </span>
+            )}
             <div className="flex items-center border border-[var(--color-border)] rounded overflow-hidden mr-1">
               <button
                 onClick={goUp}
@@ -2815,6 +2893,38 @@ export function PerfBrowser({
                 </button>
               </>
             )}
+
+            {/* Outside the bot block on purpose: the operator who needs this
+                has not yet worked out which bot to click on, and the whole
+                point of FEAT-141 is that the diagnosis is the conjunction of
+                signals across the fleet. The count rides on the button so it
+                is visible without opening the drawer — the race's symptoms went
+                unnoticed for hours because they were somewhere you had to go
+                and look. */}
+            <button
+              onClick={() => setDrawer((d) => (d === "diagnostics" ? null : "diagnostics"))}
+              className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium transition-colors ${
+                openDrawer === "diagnostics"
+                  ? "bg-[var(--color-primary)]/15 text-[var(--color-primary)]"
+                  : "text-[var(--color-text-muted)] hover:bg-[var(--color-surface-hover)]"
+              }`}
+              title={
+                openDrawer === "diagnostics"
+                  ? "Hide diagnostics"
+                  : "Liveness, idle and drift flags, host capacity, executor hygiene and throttling"
+              }
+            >
+              <Stethoscope className="h-3.5 w-3.5" />
+              Diagnostics
+              {diagnosticsFlagged > 0 && (
+                <span
+                  data-diagnostics-flagged={diagnosticsFlagged}
+                  className="text-[10px] text-[var(--color-red)]"
+                >
+                  {diagnosticsFlagged}
+                </span>
+              )}
+            </button>
 
             {activeRun?.archive_db_path && (
               <button
@@ -2983,6 +3093,22 @@ export function PerfBrowser({
                   <code className="font-mono">make doctor</code> names it.
                 </p>
               </div>
+            ) : runWithheld ? (
+              // A run whose server could not be read filters to nothing, and a
+              // fold of nothing is a strip of `$0.00` (CORR-433). Said here, in
+              // the same idiom as an empty fleet, because the 10px line beside
+              // the run chip is not where anyone looks for why the numbers are
+              // zero — and the tiles below read "—" rather than a measurement.
+              <div
+                data-run-withheld
+                className="shrink-0 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-3"
+              >
+                <p className="text-sm font-medium">{runUnavailable}</p>
+                <p className="mt-1 text-xs text-[var(--color-text-muted)]">
+                  This run's ledger could not be read, so the figures below are withheld rather than a
+                  result — the run may well have traded.
+                </p>
+              </div>
             ) : emptyPopulation ? (
               <div className="shrink-0 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-4 py-3">
                 <p className="text-sm font-medium">No bots running</p>
@@ -3021,13 +3147,13 @@ export function PerfBrowser({
               <div className="grid grid-cols-[repeat(auto-fit,minmax(104px,1fr))] gap-4">
                 <Kpi
                   label="Net PnL"
-                  value={formatCurrencyPnl(totals.net, currencySymbol)}
-                  color={pnlColor(totals.net)}
+                  value={runWithheld ? "—" : formatCurrencyPnl(totals.net, currencySymbol)}
+                  color={runWithheld ? undefined : pnlColor(totals.net)}
                   // The return % is per-leaf — each is measured against its own
                   // notional — so it rides along only where it means something.
                   // Summing or averaging them across a fold would report a
                   // return nobody earned.
-                  sub={[
+                  sub={runWithheld ? undefined : [
                     perHour(totals.net, formatCurrencyPnl),
                     totals.returnPct !== undefined
                       ? `${totals.returnPct >= 0 ? "+" : ""}${totals.returnPct.toFixed(2)}%`
@@ -3038,19 +3164,21 @@ export function PerfBrowser({
                 />
                 <Kpi
                   label="Realized"
-                  value={formatCurrencyPnl(totals.realized, currencySymbol)}
-                  color={pnlColor(totals.realized)}
-                  sub={perHour(totals.realized, formatCurrencyPnl)}
+                  value={runWithheld ? "—" : formatCurrencyPnl(totals.realized, currencySymbol)}
+                  color={runWithheld ? undefined : pnlColor(totals.realized)}
+                  sub={runWithheld ? undefined : perHour(totals.realized, formatCurrencyPnl)}
                 />
                 <Kpi
                   label="Unrealized"
-                  value={formatCurrencyPnl(totals.unrealized, currencySymbol)}
-                  color={pnlColor(totals.unrealized)}
+                  value={runWithheld ? "—" : formatCurrencyPnl(totals.unrealized, currencySymbol)}
+                  color={runWithheld ? undefined : pnlColor(totals.unrealized)}
                   // What the unrealized figure is *of*: with no open position
                   // there is nothing for it to be, and a stale non-zero reading
                   // beside "no open positions" is worth seeing.
                   sub={
-                    totals.positions === 0
+                    runWithheld
+                      ? undefined
+                      : totals.positions === 0
                       ? "no open positions"
                       : `${totals.positions} position${totals.positions !== 1 ? "s" : ""}`
                   }
@@ -3062,21 +3190,29 @@ export function PerfBrowser({
                     over rather than pretending the open ones lost. */}
                 <Kpi
                   label="Win rate"
-                  value={totals.winRate === undefined ? "—" : `${(totals.winRate * 100).toFixed(1)}%`}
+                  value={
+                    runWithheld || totals.winRate === undefined
+                      ? "—"
+                      : `${(totals.winRate * 100).toFixed(1)}%`
+                  }
                   sub={
-                    totals.closed > 0
+                    runWithheld
+                      ? undefined
+                      : totals.closed > 0
                       ? `${totals.wins.toLocaleString()} of ${totals.closed.toLocaleString()} closed`
                       : "nothing closed yet"
                   }
                 />
                 <Kpi
                   label="Volume"
-                  value={formatCurrencyVolume(totals.volume, currencySymbol)}
-                  sub={perHour(totals.volume, formatCurrencyVolume)}
+                  value={runWithheld ? "—" : formatCurrencyVolume(totals.volume, currencySymbol)}
+                  sub={runWithheld ? undefined : perHour(totals.volume, formatCurrencyVolume)}
                 />
                 <Kpi
                   label="Fees"
-                  value={totals.fees > 0 ? formatCurrencyVolume(totals.fees, currencySymbol) : "—"}
+                  value={
+                    !runWithheld && totals.fees > 0 ? formatCurrencyVolume(totals.fees, currencySymbol) : "—"
+                  }
                   // A floor and not a total: `leafFromController` hardcodes
                   // `fees: 0` because the controllers payload reports no fee
                   // total of its own, so what is measurable here is the
@@ -3087,19 +3223,25 @@ export function PerfBrowser({
                   // What the fees ate: the share of gross the venue took, which
                   // is the thing an absolute fee total cannot say on its own.
                   sub={
-                    totals.fees > 0 && totals.net + totals.fees !== 0
+                    !runWithheld && totals.fees > 0 && totals.net + totals.fees !== 0
                       ? `${((totals.fees / Math.abs(totals.net + totals.fees)) * 100).toFixed(1)}% of gross`
                       : undefined
                   }
                 />
                 <Kpi
                   label="Capital"
-                  value={totals.capital > 0 ? formatCurrencyVolume(totals.capital, currencySymbol) : "—"}
+                  value={
+                    !runWithheld && totals.capital > 0
+                      ? formatCurrencyVolume(totals.capital, currencySymbol)
+                      : "—"
+                  }
                   // Turnover rather than a controller count: how hard the
                   // capital is working is the thing the two numbers beside it
                   // do not already say, and the count is on the Runtime tile.
                   sub={
-                    totals.capital > 0 ? `${(totals.volume / totals.capital).toFixed(1)}x turnover` : undefined
+                    !runWithheld && totals.capital > 0
+                      ? `${(totals.volume / totals.capital).toFixed(1)}x turnover`
+                      : undefined
                   }
                 />
                 <Kpi
@@ -3356,9 +3498,11 @@ export function PerfBrowser({
             )}
           </div>
 
-          {/* The right drawer: one column, whichever of the two the scope
-              supports. A controller's config, or a bot's logs — never both,
-              and never one belonging to a scope the user has left. */}
+          {/* The right drawer: one column, whichever occupant the scope
+              supports. A controller's config, a bot's logs, or the fleet
+              diagnostics — never two, and never one belonging to a scope the
+              user has left. Diagnostics is the one every scope supports: it is
+              about the fleet, not about the row you happen to be standing on. */}
           {openDrawer && (
             <div className="w-[380px] xl:w-[440px] shrink-0 border-l border-[var(--color-border)] flex flex-col bg-[var(--color-surface)]">
               {openDrawer === "config" && activeCtrl ? (
@@ -3379,16 +3523,20 @@ export function PerfBrowser({
                     <button
                       onClick={() => setDrawer(null)}
                       className="rounded p-0.5 text-[var(--color-text-muted)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]"
-                      title="Hide logs"
+                      title={openDrawer === "diagnostics" ? "Hide diagnostics" : "Hide logs"}
                     >
                       <ChevronRight className="h-3.5 w-3.5" />
                     </button>
                     <h3 className="text-xs font-medium uppercase tracking-wider text-[var(--color-text-muted)]">
-                      Logs
+                      {openDrawer === "diagnostics" ? "Diagnostics" : "Logs"}
                     </h3>
                   </div>
                   <div className="flex-1 min-h-0 p-3">
-                    <LogsSection logs={botLogs} />
+                    {openDrawer === "diagnostics" ? (
+                      <FleetDiagnostics groups={diagnosticGroups} />
+                    ) : (
+                      <LogsSection logs={botLogs} />
+                    )}
                   </div>
                 </div>
               )}

@@ -124,36 +124,111 @@ export function escapeHtml(val: string): string {
     .replace(/'/g, "&#39;");
 }
 
+/**
+ * Drop the handful of markdown marks a one-line agent description shows up
+ * with (`**bold**`, `_italic_`, `` `code` ``), rather than rendering them.
+ *
+ * Every other agent description in the app (the chat header, the catalogue
+ * card's subtitle, `EntityCard`) is shown as plain text, never through a
+ * markdown renderer — so a hub agent's description should read the same way
+ * instead of leaving literal asterisks on screen.
+ */
+export function stripMarkdown(val: string): string {
+  return val
+    .replace(/(\*\*|__)(.+?)\1/g, "$2")
+    .replace(/(\*|_)(.+?)\1/g, "$2")
+    .replace(/`([^`]+)`/g, "$1");
+}
+
+/**
+ * Render a magnitude under a currency symbol and put the minus sign, if any,
+ * *before* the symbol: `-$1.2K`, not `$-1.2K`.
+ *
+ * Every currency formatter below goes through this, because they used to each
+ * build `symbol + <signed number>` by hand and only `formatCurrency`'s `$`
+ * branch — the one that delegates to `Intl` — got it right, so the same loss
+ * rendered `-$12.34` under $10K and `$-12.3K` above it (CORR-419). `render`
+ * therefore only ever sees a non-negative number, which is also why the
+ * `Math.abs` guards the callers used for tier selection collapse into plain
+ * comparisons here.
+ *
+ * `val < 0` is false for `-0`, so a negative zero prints `$0.00` rather than
+ * `Intl`'s `-$0.00` — the placement the `toFixed` branches already gave it.
+ */
+function withSign(val: number, render: (abs: number) => string): string {
+  return (val < 0 ? "-" : "") + render(Math.abs(val));
+}
+
 export function formatCurrency(val: number, symbol = "$") {
-  if (Math.abs(val) >= 1_000_000) return symbol + (val / 1_000_000).toFixed(2) + "M";
-  if (Math.abs(val) >= 10_000) return symbol + (val / 1_000).toFixed(1) + "K";
-  if (symbol === "$") {
-    return val.toLocaleString("en-US", {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 2,
-    });
-  }
-  // Adaptive precision for small values (e.g. BTC)
-  if (Math.abs(val) < 0.01 && val !== 0) return symbol + val.toPrecision(4);
-  return symbol + val.toFixed(2);
+  return withSign(val, (abs) => {
+    if (abs >= 1_000_000) return symbol + (abs / 1_000_000).toFixed(2) + "M";
+    if (abs >= 10_000) return symbol + (abs / 1_000).toFixed(1) + "K";
+    if (symbol === "$") {
+      return abs.toLocaleString("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+      });
+    }
+    // Adaptive precision for small values (e.g. BTC)
+    if (abs < 0.01 && abs !== 0) return symbol + abs.toPrecision(4);
+    return symbol + abs.toFixed(2);
+  });
+}
+
+/**
+ * Quote assets a `$` renders correctly, mirroring `DOLLAR_QUOTES` in
+ * `condor/agents/quote_render.py`. The two have to agree: an operator reads the
+ * dashboard's limits and the agent's own journal about the same ceiling.
+ */
+const DOLLAR_QUOTES = new Set(["USD", "USDT", "USDC", "DAI", "BUSD", "FDUSD"]);
+
+/**
+ * A quote-denominated figure in the token it is actually measured in (LP-2).
+ *
+ * A strategy's limits are denominated in "quote", and quote is whatever it
+ * trades against — USDT for the CEX market makers, SOL for the Solana LP
+ * operator. Rendering them all with `formatCurrency` showed the LP operator's
+ * 0.5 SOL position ceiling as `$0.50`, which is both the wrong unit and, read
+ * as dollars, three orders of magnitude out.
+ *
+ * An unset or dollar-stablecoin quote keeps `formatCurrency` exactly, so every
+ * CEX strategy renders as it always did. Four decimals for a token for the same
+ * reason the Python side uses four: an LP slot is a fraction of one SOL, and two
+ * places render 0.0275 as `0.03`.
+ */
+export function formatQuoteAmount(val: number, quoteAsset?: string | null): string {
+  const unit = (quoteAsset ?? "").trim().toUpperCase();
+  if (!unit || DOLLAR_QUOTES.has(unit)) return formatCurrency(val);
+  return (
+    withSign(val, (abs) =>
+      abs.toLocaleString("en-US", {
+        minimumFractionDigits: 4,
+        maximumFractionDigits: 4,
+      }),
+    ) + ` ${unit}`
+  );
 }
 
 /**
  * Compact USD for chart tooltips / stat strips: `>=1M → "$N.NNM"`, `>=10K → "$N.NK"`,
  * else plain `"$" + toFixed(2)` (no locale grouping). Kept distinct from `formatCurrency`,
- * which uses `Intl` grouping/sign placement below 10K — switching would change rendered values.
+ * which uses `Intl` grouping below 10K — switching would change rendered values.
  */
 export function formatCompactUsd(val: number): string {
-  if (Math.abs(val) >= 1_000_000) return "$" + (val / 1_000_000).toFixed(2) + "M";
-  if (Math.abs(val) >= 10_000) return "$" + (val / 1_000).toFixed(1) + "K";
-  return "$" + val.toFixed(2);
+  return withSign(val, (abs) => {
+    if (abs >= 1_000_000) return "$" + (abs / 1_000_000).toFixed(2) + "M";
+    if (abs >= 10_000) return "$" + (abs / 1_000).toFixed(1) + "K";
+    return "$" + abs.toFixed(2);
+  });
 }
 
 export function formatCurrencyVolume(val: number, symbol = "$") {
-  if (Math.abs(val) >= 1_000_000) return symbol + (val / 1_000_000).toFixed(1) + "M";
-  if (Math.abs(val) >= 1_000) return symbol + (val / 1_000).toFixed(1) + "K";
-  return symbol + val.toFixed(Math.abs(val) < 100 ? 2 : 0);
+  return withSign(val, (abs) => {
+    if (abs >= 1_000_000) return symbol + (abs / 1_000_000).toFixed(1) + "M";
+    if (abs >= 1_000) return symbol + (abs / 1_000).toFixed(1) + "K";
+    return symbol + abs.toFixed(abs < 100 ? 2 : 0);
+  });
 }
 
 export function formatCurrencyPnl(val: number, symbol = "$") {
@@ -164,8 +239,7 @@ export function formatCurrencyPnl(val: number, symbol = "$") {
 // Single source of truth for the PnL sign encoding (>= 0 green, < 0 red), in the
 // two forms the codebase consumes. They are NOT interchangeable — both are
 // `string`, so handing one to the other's consumer renders an unstyled or
-// invisible number with no TS or build error. Same split as `MODE_STYLES` in
-// components/agent/modeStyles.ts: one source of truth, one variant per sink.
+// invisible number with no TS or build error.
 
 /** CSS color value — for `style={{ color: pnlColor(x) }}` and chart/theme options. */
 export function pnlColor(val: number) {
@@ -191,11 +265,12 @@ export function formatVolume(val: number) {
  * where `formatCurrencyVolume` would render an unreadable "2400.0M".
  */
 export function formatCompactVolume(val: number, symbol = "$"): string {
-  const abs = Math.abs(val);
-  if (abs >= 1_000_000_000) return symbol + (val / 1_000_000_000).toFixed(2) + "B";
-  if (abs >= 1_000_000) return symbol + (val / 1_000_000).toFixed(1) + "M";
-  if (abs >= 1_000) return symbol + (val / 1_000).toFixed(1) + "K";
-  return symbol + val.toFixed(0);
+  return withSign(val, (abs) => {
+    if (abs >= 1_000_000_000) return symbol + (abs / 1_000_000_000).toFixed(2) + "B";
+    if (abs >= 1_000_000) return symbol + (abs / 1_000_000).toFixed(1) + "M";
+    if (abs >= 1_000) return symbol + (abs / 1_000).toFixed(1) + "K";
+    return symbol + abs.toFixed(0);
+  });
 }
 
 /**
@@ -213,11 +288,12 @@ export function formatCompactVolume(val: number, symbol = "$"): string {
  * dollars, and a decimal there only costs width).
  */
 export function formatAxisCurrency(val: number, symbol = "$", kind: "pnl" | "volume" = "volume"): string {
-  const abs = Math.abs(val);
-  if (abs >= 1_000_000_000) return symbol + (val / 1_000_000_000).toFixed(2) + "B";
-  if (abs >= 1_000_000) return symbol + (val / 1_000_000).toFixed(1) + "M";
-  if (abs >= 1_000) return symbol + (val / 1_000).toFixed(1) + "K";
-  return symbol + val.toFixed(kind === "pnl" && abs < 10 ? 2 : 0);
+  return withSign(val, (abs) => {
+    if (abs >= 1_000_000_000) return symbol + (abs / 1_000_000_000).toFixed(2) + "B";
+    if (abs >= 1_000_000) return symbol + (abs / 1_000_000).toFixed(1) + "M";
+    if (abs >= 1_000) return symbol + (abs / 1_000).toFixed(1) + "K";
+    return symbol + abs.toFixed(kind === "pnl" && abs < 10 ? 2 : 0);
+  });
 }
 
 export function formatPnl(val: number) {
@@ -305,6 +381,40 @@ export function formatRuntimeHours(hours: number): string {
   if (hours >= 1) return `${hours.toFixed(1)}h`;
   const mins = Math.round(hours * 60);
   return mins >= 1 ? `${mins}m` : "<1m";
+}
+
+/**
+ * A length of time, compactly: `45s`, `12m`, `4h12m`, `1d1h`.
+ *
+ * The one seconds-to-string rule for a duration (ARCH-404), the counterpart of
+ * `formatAge`/`formatRelativeTime` for a *span* rather than a moment. It floors,
+ * so a run never reads longer than it was, and returns `""` for anything that is
+ * not a real length (null, negative, non-finite) so a caller can skip the span.
+ *
+ * `{ ms: true }` is for a measured run whose common case is sub-minute — a code
+ * snippet — and changes only that branch: under a second it prints
+ * milliseconds (a 340ms run would otherwise read `0s`), and up to a minute one
+ * decimal with a trailing `.0` trimmed (`1.5s`, `30s`). The feed row and the
+ * sheet it opens both go through this, so they agree by construction.
+ */
+export function formatDuration(
+  seconds: number | null,
+  opts: { ms?: boolean } = {},
+): string {
+  if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return "";
+  if (opts.ms && seconds < 60) {
+    if (seconds < 1) return `${Math.round(seconds * 1000)}ms`;
+    return `${seconds.toFixed(1).replace(/\.0$/, "")}s`;
+  }
+  const s = Math.floor(seconds);
+  if (s >= 86400) {
+    const days = Math.floor(s / 86400);
+    return `${days}d${Math.floor((s % 86400) / 3600)}h`;
+  }
+  if (s >= 3600)
+    return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m`;
+  return `${s}s`;
 }
 
 export function formatAge(timestamp: number): string {

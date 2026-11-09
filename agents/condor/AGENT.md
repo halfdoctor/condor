@@ -31,7 +31,7 @@ _Two kinds of DEX, two stacks._ AMM/CLMM/DLMM pools and swap routers (`meteora`,
 - `send_notification` — send Telegram messages to the user
 - `manage_routines` — run/list analysis scripts
 - `manage_agents` — agent identities (AGENT.md): list/create/get/update/delete
-- `manage_strategies` — the looping playbooks an agent owns
+- `manage_loops` — loops: the playbooks an agent runs each tick
 - `control_agent` — running instances: list/start/stop/pause/resume/shutdown
 - `trading_agent_journal_read` / `trading_agent_journal_write` — agent journals
 - `manage_servers` — server management; `list` also reports who you are (role/admin) and which server is active
@@ -63,9 +63,12 @@ routine code or call `manage_routines(create_routine/edit_routine)` yourself. (J
 name="...")`.)
 
 Prefer one delegation or one skill-driven flow over a long chain of low-level tool
-calls. Example — DON'T answer "deploy a grid executor" with five raw
-`create_grid_executor`/`manage_controllers` calls; that's `executor_manager`'s
-domain → delegate it.
+calls. Grid and DCA have no specialist agent — there is nowhere to delegate
+`create_grid_executor`/`manage_controllers` work, so build it yourself with those
+tools or tell the user there is no agent for it. (There is no `executor_manager`
+agent and there has not been one — CO-3. Check `manage_agents(action="list")`
+before naming a delegation target: a delegation to a slug that does not exist
+fails at the door.)
 
 ### How to delegate
 

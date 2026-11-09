@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from urllib.parse import urlsplit
 
+import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
+from condor.fetchers.api_server import (
+    ApiServerSettingsUnsupported,
+    fetch_client_config,
+    fetch_system_info,
+    fetch_upgrade_preflight,
+    fetch_upgrade_status,
+    start_upgrade,
+    update_client_config,
+)
 from condor.server_data_service import (
     CREDENTIAL_DERIVED,
     ServerDataType,
@@ -19,7 +31,8 @@ from condor.web.auth import (
 from condor.web.models import (
     AddCredentialRequest,
     AddServerRequest,
-    CredentialInfo,
+    ApiClientConfigUpdateRequest,
+    ApiUpgradeRequest,
     GatewayNetworkUpdateRequest,
     GatewayPullRequest,
     GatewayStartRequest,
@@ -153,6 +166,21 @@ async def set_default_server(name: str, user: WebUser = Depends(get_current_user
 _gateway_was_running: dict[str, bool] = {}
 
 
+def _raise_if_container_op_failed(action: str, result: dict) -> None:
+    """Turn the Hummingbot API's in-band failure into an HTTP error.
+
+    The container endpoints answer 200 with ``{"success": false, "message": ...}``
+    for "already running", a Docker error or a missing container. Treating that
+    200 as success made the tab close its form and show nothing while no
+    container started. The message is the API's own text, not a raw exception.
+    """
+    if isinstance(result, dict) and result.get("success") is False:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{action}: {result.get('message', 'no message returned')}",
+        )
+
+
 @router.get("/gateway/status")
 async def gateway_status(
     server: str = Query(...),
@@ -240,10 +268,11 @@ async def gateway_start(
                 "port": req.port,
             }
         )
-        return {"started": True, "result": result}
     except Exception as e:
         logger.exception("Failed to start gateway on '%s'", server)
         raise upstream_error("Failed to start gateway", e)
+    _raise_if_container_op_failed("Failed to start gateway", result)
+    return {"started": True, "result": result}
 
 
 @router.post("/gateway/stop")
@@ -261,6 +290,7 @@ async def gateway_stop(
     except Exception as e:
         logger.exception("Failed to stop gateway on '%s'", server)
         raise upstream_error("Failed to stop gateway", e)
+    _raise_if_container_op_failed("Failed to stop gateway", result)
     # Outside the try: the stop already succeeded — `container.stop()` blocks,
     # so the new answer (no venues) is already true — and an invalidation
     # error here must not be reported as a failed stop (CORR-614).
@@ -281,10 +311,11 @@ async def gateway_restart(
     # catches the real transition once the container is back up (CORR-614).
     try:
         result = await client.gateway.restart()
-        return {"restarted": True, "result": result}
     except Exception as e:
         logger.exception("Failed to restart gateway on '%s'", server)
         raise upstream_error("Failed to restart gateway", e)
+    _raise_if_container_op_failed("Failed to restart gateway", result)
+    return {"restarted": True, "result": result}
 
 
 @router.get("/gateway/logs")
@@ -552,6 +583,241 @@ async def gateway_wallet_remove(
         raise upstream_error("Failed to remove wallet", e)
 
 
+# ── Hummingbot API server (FEAT-121) ──
+#
+# Scoped to the server the navbar points at, exactly like the Gateway routes above: the
+# ``?server=`` query param is the only picker, so the panel and the rest of the app can
+# never disagree about which server is "the" server.
+#
+# These three reach past ``hummingbot-api-client``, which is pinned to a released PyPI
+# version with no method for either route — see ``condor.fetchers.raw_api``. The one
+# consequence visible here is ``ApiServerSettingsUnsupported``: a server whose API
+# predates the routes answers 404, and that is a capability answer, not an outage, so it
+# becomes a 501 the panel can turn into "upgrade this server's API" rather than a 502
+# that reads as "the server is down".
+
+
+def _api_too_old(server: str, exc: Exception) -> HTTPException:
+    """A 501 that names the upgrade, for a server whose API predates these routes."""
+    logger.info("Server '%s' does not serve the API settings routes: %s", server, exc)
+    return HTTPException(
+        status_code=501,
+        detail=(
+            "This server's hummingbot-api is older than this panel. "
+            "Upgrade it to read its version and bot defaults."
+        ),
+    )
+
+
+@router.get("/api/info")
+async def api_server_info(
+    server: str = Query(...),
+    user: WebUser = Depends(require_server_access_query),
+):
+    """Versions, image provenance and market-data tunables of the selected server.
+
+    TRADER: it reports what the server runs, which is server state, and carries no
+    credential — ``MarketDataSettings`` is intervals and timeouts by construction.
+    """
+    cm = get_config_manager()
+    client = await _get_client(cm, server)
+    try:
+        return await fetch_system_info(client)
+    except ApiServerSettingsUnsupported as e:
+        raise _api_too_old(server, e)
+    except Exception as e:
+        logger.exception("Failed to fetch API server info from '%s'", server)
+        raise upstream_error("Failed to fetch API server info", e)
+
+
+@router.get("/api/client-config")
+async def api_client_config(
+    server: str = Query(...),
+    user: WebUser = Depends(require_server_access_query),
+):
+    """The client defaults bots deployed from this server will inherit.
+
+    TRADER: a rate oracle source and a display token are not secrets, and a trader who
+    can deploy a bot should be able to see what that bot will be built with. Writing
+    them is OWNER, below.
+    """
+    cm = get_config_manager()
+    client = await _get_client(cm, server)
+    try:
+        return await fetch_client_config(client)
+    except ApiServerSettingsUnsupported as e:
+        raise _api_too_old(server, e)
+    except Exception as e:
+        logger.exception("Failed to fetch bot client defaults from '%s'", server)
+        raise upstream_error("Failed to fetch bot client defaults", e)
+
+
+@router.put("/api/client-config")
+async def api_client_config_update(
+    req: ApiClientConfigUpdateRequest,
+    server: str = Query(...),
+    user: WebUser = Depends(require_server_access_query),
+):
+    """Change the client defaults new bot deploys inherit. OWNER only.
+
+    This rewrites a file on the owner's host that decides how every bot deployed there
+    next is configured — infrastructure, not trading, which is the same line the gateway
+    pull and wallet routes draw.
+
+    Running bots are untouched: a deploy copies ``conf_client.yml`` into the instance, so
+    a bot keeps the copy it was built with until it is redeployed.
+    """
+    cm = get_config_manager()
+    _require_owner(cm, user.id, server)
+    client = await _get_client(cm, server)
+    try:
+        return await update_client_config(
+            client,
+            rate_oracle_source=req.rate_oracle_source,
+            global_token_name=req.global_token_name,
+            global_token_symbol=req.global_token_symbol,
+            rate_limits_share_pct=req.rate_limits_share_pct,
+        )
+    except ApiServerSettingsUnsupported as e:
+        raise _api_too_old(server, e)
+    except Exception as e:
+        # Includes the upstream 400/422 naming an invalid oracle source or share, which
+        # upstream_error forwards as a 400 with the API's own message.
+        logger.exception("Failed to update bot client defaults on '%s'", server)
+        raise upstream_error("Failed to update bot client defaults", e)
+
+
+# ── Upgrading a server's hummingbot-api (FEAT-122) ──
+#
+# The dangerous half of this lives on the server (``services/self_upgrade.py``): it
+# re-runs its own preflight before starting, refuses a pinned deployment outright, and
+# treats a fact it could not establish as a refusal. These routes add the two things
+# that are Condor's to decide.
+#
+# **Who may.** Reading the preflight is TRADER — "this server is two versions behind and
+# has 4 executors running" is server state, the same class of fact the Version card
+# already shows. Starting it is OWNER, the same bar as the gateway pull: it replaces the
+# code running on the owner's host, and it closes every executor on the way.
+#
+# **A restarting server is not a broken one.** The upgrade's whole purpose is to replace
+# the container answering these calls, so for a minute the status poll cannot connect.
+# Reported as a 502 the operator reads "the upgrade broke my server" at the exact moment
+# nothing is wrong, so a *transport* failure on the status route — no HTTP answer at all —
+# becomes ``phase: "restarting"``. An HTTP answer keeps its status: a 500 from a server
+# that is up is a real failure and has to look like one.
+
+
+def _upgrade_route_missing(server: str, exc: Exception) -> HTTPException:
+    """A 501 for a server whose API has no upgrade routes — which it upgrades over SSH."""
+    logger.info("Server '%s' does not serve the self-upgrade routes: %s", server, exc)
+    return HTTPException(
+        status_code=501,
+        detail=(
+            "This server's hummingbot-api cannot upgrade itself. "
+            "Upgrade it over SSH once; later upgrades can be done from here."
+        ),
+    )
+
+
+@router.get("/api/upgrade/preflight")
+async def api_upgrade_preflight(
+    server: str = Query(...),
+    user: WebUser = Depends(require_server_access_query),
+):
+    """Whether this server can replace its own hummingbot-api, and what it would cost.
+
+    TRADER: it reports what the server is running and how far behind it is, which is the
+    same kind of fact the Version card already shows. Acting on it is OWNER, below.
+
+    A refusal is a 200 with ``can_upgrade: false`` and a reason, not an error — that is
+    the normal answer for a pinned server and the panel renders it as such.
+    """
+    cm = get_config_manager()
+    client = await _get_client(cm, server)
+    try:
+        return await fetch_upgrade_preflight(client)
+    except ApiServerSettingsUnsupported as e:
+        raise _upgrade_route_missing(server, e)
+    except Exception as e:
+        logger.exception("Failed to fetch the upgrade preflight from '%s'", server)
+        raise upstream_error("Failed to check for an upgrade", e)
+
+
+@router.post("/api/upgrade")
+async def api_upgrade_start(
+    req: ApiUpgradeRequest,
+    server: str = Query(...),
+    user: WebUser = Depends(require_server_access_query),
+):
+    """Start replacing this server's hummingbot-api with the published image. OWNER only.
+
+    The same line the gateway pull draws, for a stronger reason: this rewrites what code
+    runs on the owner's host *and* restarts it, closing every running executor as
+    SYSTEM_CLEANUP. Bot containers are separate and keep running.
+
+    The server re-runs its own preflight, so a 409 here means it refused — and a refusal
+    means nothing was pulled and nothing was changed. ``upstream_error`` forwards it as a
+    400 carrying the server's own reason.
+    """
+    cm = get_config_manager()
+    _require_owner(cm, user.id, server)
+    client = await _get_client(cm, server)
+    try:
+        return await start_upgrade(
+            client, acknowledge_executor_loss=req.acknowledge_executor_loss
+        )
+    except ApiServerSettingsUnsupported as e:
+        raise _upgrade_route_missing(server, e)
+    except Exception as e:
+        logger.exception("Failed to start the hummingbot-api upgrade on '%s'", server)
+        raise upstream_error("Failed to start the upgrade", e)
+
+
+@router.get("/api/upgrade/status")
+async def api_upgrade_status(
+    server: str = Query(...),
+    user: WebUser = Depends(require_server_access_query),
+):
+    """Follow an upgrade, across the restart it causes. OWNER only.
+
+    Owner rather than trader because the log tail is the helper container's output from
+    the owner's own host, which is closer to a server log than to server state.
+
+    A transport failure — a refused connection, a timeout, a client that cannot be built
+    because the server is not answering — is reported as ``phase: "restarting"``, because
+    during this particular operation that is the expected state and not a fault. Anything
+    that did answer over HTTP keeps its status.
+    """
+    cm = get_config_manager()
+    _require_owner(cm, user.id, server)
+    try:
+        client = await cm.get_client(server)
+        return await fetch_upgrade_status(client)
+    except ApiServerSettingsUnsupported as e:
+        raise _upgrade_route_missing(server, e)
+    except ValueError as e:
+        # The config manager's own rejection ("no such server"): not a restart.
+        raise HTTPException(status_code=502, detail=f"Cannot connect to server: {e}")
+    except aiohttp.ClientResponseError as e:
+        # It answered, so it is up; whatever it said keeps its own status.
+        logger.exception("Failed to fetch the upgrade status from '%s'", server)
+        raise upstream_error("Failed to fetch the upgrade status", e)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        logger.info("Server '%s' is not answering while upgrading: %s", server, e)
+        return {
+            "run_id": None,
+            "phase": "restarting",
+            "detail": (
+                "The server is not answering. It is being replaced; this is expected for "
+                "a minute or two."
+            ),
+            "log_tail": [],
+        }
+    except Exception as e:
+        logger.exception("Failed to fetch the upgrade status from '%s'", server)
+        raise upstream_error("Failed to fetch the upgrade status", e)
+
+
 # ── Voice Preferences ──
 
 
@@ -700,6 +966,21 @@ async def connector_config_map(
         raise upstream_error("Failed to fetch connector config map", e)
 
 
+def _restart_required(result: object) -> bool:
+    """Whether an upstream connector write says a restart is needed to apply it.
+
+    hummingbot-api answers a credential write with ``restart_required`` when the
+    new key only reaches already-running bots after a restart. Condor returned
+    the upstream body verbatim under ``result`` and nothing ever read it, so the
+    operator was told "added" and never told the running bots were still on the
+    old key — the same gap as a strategy config write reporting ``updated`` and
+    not reaching a live session (CORR-732). Lifted to the top level so the flag
+    is part of Condor's own answer rather than something every caller has to go
+    digging for; a server that does not send it reads as no restart needed.
+    """
+    return bool(isinstance(result, dict) and result.get("restart_required"))
+
+
 @router.post("/credentials")
 async def add_credential(
     req: AddCredentialRequest,
@@ -725,7 +1006,11 @@ async def add_credential(
     # Outside the try: the credential write already succeeded, and an
     # exception here must not be swallowed and re-reported as a failed add.
     get_server_data_service().invalidate(server, *CREDENTIAL_DERIVED)
-    return {"added": True, "result": result}
+    return {
+        "added": True,
+        "restart_required": _restart_required(result),
+        "result": result,
+    }
 
 
 @router.delete("/credentials/{connector}")
@@ -746,7 +1031,11 @@ async def delete_credential(
         # Invalidate every credential-derived cache so the removed key
         # disappears immediately (including VENUES' `credentialed` trait).
         get_server_data_service().invalidate(server, *CREDENTIAL_DERIVED)
-        return {"deleted": True, "result": result}
+        return {
+            "deleted": True,
+            "restart_required": _restart_required(result),
+            "result": result,
+        }
     except Exception as e:
         logger.exception(
             "Failed to delete credentials for '%s' on '%s'", connector, server
@@ -965,3 +1254,199 @@ async def set_telemetry_settings(
 
     applied = consent.deny() if level == consent.OFF else consent.set_level(level)
     return {"level": applied, "consent": consent.state()}
+
+
+# ── The agent hub's publish token (FEAT-146) ──
+
+
+class HubTokenRequest(BaseModel):
+    """The Botcamp token, pasted. An empty string clears it.
+
+    Pasted and not negotiated: Condor's own accounts are Telegram-derived
+    (``create_jwt``) and there is no external identity provider anywhere in the
+    product, while the dashboard is served on a configurable ``WEB_PORT`` so an
+    OAuth redirect URI would differ per install. Taking an outside credential
+    as a value the operator pastes is how this product already does it —
+    ``ApiKeysSettings``, ``ConnectHyperliquid``, ``ImportGatewayWallet``.
+    """
+
+    token: str = ""
+
+
+@router.get("/hub-token")
+async def get_hub_token(user: WebUser = Depends(get_current_user)):
+    """Whether a publish token is set. **Never its value.**
+
+    There is no route, here or anywhere, that reads the token back out. A
+    "reveal" control would be a second copy of the credential on a screen and
+    in an HTTP response for no capability the operator does not already have —
+    they can paste a new one. ``can_change`` mirrors the sharing veto's shape
+    so the panel disables the field rather than offering a write that 403s.
+    """
+    from condor import hub
+
+    cm = get_config_manager()
+    return {"set": bool(hub.token()), "can_change": cm.is_admin(user.id)}
+
+
+@router.put("/hub-token")
+async def update_hub_token(
+    req: HubTokenRequest, user: WebUser = Depends(get_current_user)
+):
+    """Store or clear the token. Admin-only, and the answer carries no value.
+
+    Install-wide, like the telemetry level above and for the same reason: there
+    is one token, every publish from this box is made with it, and a claim
+    created under it is made in the admin's name at an outside service.
+    """
+    from condor import hub
+
+    cm = get_config_manager()
+    if not cm.is_admin(user.id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "The hub token is an install-wide credential; only the admin "
+                "can change it"
+            ),
+        )
+    return {"set": hub.set_token(req.token)}
+
+
+# ── Connecting to a Botcamp profile with a pasted code (botcamp-site PR #137) ──
+#
+# Replaces the OAuth2 device flow (PR #111), deleted outright by #137's own
+# `/api/condor/device/*` removal, with the paste-a-code flow #137 built
+# instead: the admin generates a code signed in on Botcamp's `/connect` page —
+# Condor is not involved in minting it — and pastes it here. See
+# ``condor/hub.py``'s ``redeem_connect_code``/``connection_state``/
+# ``disconnect`` for the protocol and the one place the resulting credential
+# is ever read.
+
+
+class ConnectCodeRequest(BaseModel):
+    """The code pasted from Botcamp's ``/connect`` page."""
+
+    code: str = ""
+
+
+def _hub_device_refusal(exc: Exception) -> HTTPException:
+    """A hub failure while connecting or disconnecting Botcamp, as HTTP — the
+    same mapping ``agents.py``'s hub router uses, kept local here since the
+    two routers do not import from each other.
+    """
+    from condor.hub import HubError, NoTokenError
+
+    if isinstance(exc, NoTokenError):
+        return HTTPException(status_code=400, detail=str(exc))
+    status = getattr(exc, "status", 0) if isinstance(exc, HubError) else 0
+    return HTTPException(
+        status_code=status if 400 <= status < 500 else 502, detail=str(exc)
+    )
+
+
+def _require_hub_admin(user: WebUser) -> None:
+    cm = get_config_manager()
+    if not cm.is_admin(user.id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Connecting to Botcamp is install-wide; only the admin can " "change it"
+            ),
+        )
+
+
+@router.post("/hub-device/connect")
+async def connect_hub_device(
+    req: ConnectCodeRequest, user: WebUser = Depends(get_current_user)
+):
+    """Redeem a code pasted from Botcamp's ``/connect`` page for this
+    install's token. Admin-only, like every other write in this section: the
+    resulting credential acts for the whole install under one Botcamp
+    account.
+    """
+    from condor import hub
+    from condor.hub import HubError
+
+    _require_hub_admin(user)
+    try:
+        state = await asyncio.to_thread(hub.redeem_connect_code, req.code)
+    except HubError as exc:
+        raise _hub_device_refusal(exc) from exc
+    return state.model_dump()
+
+
+@router.get("/hub-device")
+async def get_hub_device(user: WebUser = Depends(get_current_user)):
+    """Where this install's Botcamp link stands right now.
+
+    ``"none"`` or ``"linked"`` (with the profile handle and scope — never the
+    credential, which this route can never answer with; see
+    ``condor.hub.connection_state``). ``connect_url`` is always set, so the
+    "Sign in to Botcamp" link renders with no extra round trip.
+    """
+    from condor import hub
+
+    _require_hub_admin(user)
+    return hub.connection_state().model_dump()
+
+
+@router.get("/hub-device/linked")
+async def get_hub_device_linked(user: WebUser = Depends(get_current_user)):
+    """Whether this install is linked to Botcamp. Nothing else.
+
+    `/hub`'s Pull agents gate (FEAT-153) needs this for every signed-in seat,
+    not just the admin who can act on it — Pull is unlocked install-wide once
+    someone connects a profile. The full state above stays admin-only on
+    purpose (profile handle); this route answers with neither, so a
+    non-admin learns only the one bit that unlocks their own Pull section.
+
+    Reads local config only, through :func:`condor.hub.is_linked`.
+    """
+    from condor import hub
+
+    return {"linked": hub.is_linked()}
+
+
+@router.delete("/hub-device")
+async def disconnect_hub_device(user: WebUser = Depends(get_current_user)):
+    """Disconnect this install's linked Botcamp profile.
+
+    ``condor.hub.disconnect`` asks the hub to revoke the presented token
+    (``DELETE /api/condor/me``, PR #111) before clearing it locally. The
+    local credential is cleared either way; ``revoked`` says whether the hub
+    actually confirmed the revoke (``true``), refused or could not be reached
+    (``false``, with ``error`` set), or there was nothing to revoke
+    (``null``) — this must never claim a revoke that did not happen.
+    """
+    from condor import hub
+    from condor.hub import HubError
+
+    _require_hub_admin(user)
+    try:
+        result = await asyncio.to_thread(hub.disconnect)
+    except HubError as exc:
+        raise _hub_device_refusal(exc) from exc
+    return {"status": "none", "revoked": result.revoked, "error": result.error}
+
+
+@router.get("/hub-me")
+async def get_hub_me(user: WebUser = Depends(get_current_user)):
+    """Who the linked Botcamp token identifies right now, read fresh from the
+    hub (PR #111's ``GET /api/condor/me``) — not the ``profile_handle`` the
+    device-login poll cached once, at link time.
+
+    A 401 means Botcamp revoked the token from the profile's own token list;
+    ``condor.hub.me`` has already cleared this install's copy by the time
+    this route answers with it, so the client's next ``GET /hub-device``
+    already reads back ``"none"`` rather than a stale ``"linked"``.
+    """
+    from condor import hub
+    from condor.hub import HubError
+
+    _require_hub_admin(user)
+    try:
+        info = await asyncio.to_thread(hub.me, hub.token())
+    except HubError as exc:
+        raise _hub_device_refusal(exc) from exc
+    return info.model_dump()

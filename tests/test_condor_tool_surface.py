@@ -5,7 +5,8 @@ FEAT-067 dropped four leftovers: ``manage_notes`` (a declared-dead alias over
 ``list_routines``/``run_routine`` actions on the agent tool (strict duplicates
 of ``manage_routines``), and the ``strategy_id`` alias. FEAT-068 then split the
 ``manage_trading_agent`` funnel into ``manage_agents`` / ``manage_strategies`` /
-``control_agent``. Every docstring costs context on every session, so the
+``control_agent``, and FEAT-128 renamed ``manage_strategies`` to ``manage_loops``
+with no alias. Every docstring costs context on every session, so the
 surface is pinned here.
 """
 
@@ -28,9 +29,10 @@ EXPECTED_TOOLS = {
     "manage_agents",
     "manage_memory",
     "manage_routines",
+    "manage_agent_controllers",
     "manage_servers",
     "manage_skill",
-    "manage_strategies",
+    "manage_loops",
     "run_code",
     "send_notification",
     "trading_agent_journal_read",
@@ -53,6 +55,7 @@ def test_the_dropped_tools_are_not_registered():
             "manage_notes",
             "get_user_context",
             "manage_trading_agent",
+            "manage_strategies",
         }
         & _registered()
     )
@@ -165,7 +168,7 @@ def _manage_routines_calls(text: str) -> list[str]:
 def test_no_committed_playbook_targets_a_routine_by_strategy_id():
     """Routines are per-agent: playbooks must say ``agent=``, never the dead alias.
 
-    FastMCP's argument model has no ``extra="forbid"``, so a stray
+    MCPServer's argument model has no ``extra="forbid"``, so a stray
     ``strategy_id=`` is dropped in silence — the owning agent's own tick still
     resolves via CONDOR_AGENT_SLUG while every other seat gets 'routine not
     found'. Nothing but this guard notices the drift.
@@ -197,10 +200,10 @@ def test_every_agent_action_reaches_manage_agents(action):
 
 
 @pytest.mark.parametrize("action", ["list", "get", "create", "update", "delete"])
-def test_every_strategy_action_reaches_manage_strategies(action):
+def test_every_loop_action_reaches_manage_loops(action):
     from mcp_servers.condor.tools import trading_agent
 
-    result = trading_agent.manage_strategies(action)
+    result = trading_agent.manage_loops(action)
     assert "Unknown action" not in result.get("error", "")
 
 
@@ -221,7 +224,7 @@ def test_every_control_action_reaches_control_agent(action):
     [
         ("start_agent", "control_agent"),
         ("list_agents", "control_agent"),
-        ("create_strategy", "manage_strategies"),
+        ("create_strategy", "manage_loops"),
         ("agent_tracker", "trading_agent_journal_read"),
     ],
 )
@@ -312,9 +315,9 @@ def test_the_agent_builder_skill_calls_only_registered_tools():
     """CORR-306: the routing rule sends every agent-building request here.
 
     A skill naming a dead TOOL fails harder than READ-290's dead *parameter*:
-    FastMCP silently drops an unknown kwarg, but an unknown tool name is an
+    MCPServer silently drops an unknown kwarg, but an unknown tool name is an
     error at the host. The skill was migrated to ``manage_agents`` /
-    ``manage_strategies`` for create/list/start, while its edit-and-repair
+    ``manage_loops`` for create/list/start, while its edit-and-repair
     paragraph still said ``update_agent`` / ``delete_agent`` / ``get_agent`` /
     ``delete_strategy`` — funnel-era ACTION names that are not tools. So the
     Step 2 "the persona is off, fix the AGENT.md" path blew up at exactly the
@@ -339,11 +342,31 @@ def test_no_condor_skill_names_a_funnel_era_action_as_a_tool():
     rather than a hand-copied deny-list that would rot the same way the skill
     did. Bare mentions count too: prose saying "``delete_agent`` refuses while
     the agent owns strategies" reads as a tool name even without parentheses.
-    """
-    from mcp_servers.condor.tools.trading_agent import _ACTION_OWNER
 
-    dead = set(_ACTION_OWNER) - _every_registered_tool()
+    The three short tables are subtracted because ``_ACTION_OWNER`` holds two
+    kinds of entry and only one of them is dead. Most are the funnel-era
+    *prefixed* spellings (``export_agent``), which no table admits and which a
+    skill must never write. But an action whose sanctioned spelling simply is
+    prefix-shaped — ``hub_get``, ``hub_install``, ``publish_hub``
+    (FEAT-146), named that way because "get" alone reads as a local verb and
+    ``publish`` was already taken by publish-to-stock — appears in
+    ``_AGENT_ACTIONS`` *and* here, so that a sibling family answers it with the
+    call that works instead of a bare "unknown action". Those are current
+    vocabulary, and a skill naming one is doing the right thing.
+    """
+    from mcp_servers.condor.tools.trading_agent import (
+        _ACTION_OWNER,
+        _AGENT_ACTIONS,
+        _CONTROL_ACTIONS,
+        _STRATEGY_ACTIONS,
+    )
+
+    live = set(_AGENT_ACTIONS) | set(_STRATEGY_ACTIONS) | set(_CONTROL_ACTIONS)
+    dead = set(_ACTION_OWNER) - _every_registered_tool() - live
     assert dead, "the compatibility map named no dead actions — did it move?"
+    # The exemption is narrow by construction: it covers only a name a tool
+    # still answers to today, so every funnel-era spelling stays in `dead`.
+    assert {"export_agent", "import_agent", "delete_agent"} <= dead
 
     skills = _committed_condor_skills()
     assert skills, "found no committed condor skills — the guard would pass vacuously"
@@ -355,7 +378,7 @@ def test_no_condor_skill_names_a_funnel_era_action_as_a_tool():
         for match in pattern.finditer(path.read_text(encoding="utf-8"))
     ]
     assert not offenders, (
-        "these are actions on manage_agents/manage_strategies/control_agent, "
+        "these are actions on manage_agents/manage_loops/control_agent, "
         "not tools: " + "; ".join(offenders)
     )
 

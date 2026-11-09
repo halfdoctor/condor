@@ -2,7 +2,7 @@
 
 A leaf module on purpose: strings and nothing else. ``server.py`` cannot be
 imported to ask what it registers — importing it parses argv and builds a
-``FastMCP`` singleton as an import side effect — so the web process, which has
+``MCPServer`` singleton as an import side effect — so the web process, which has
 to render a switch per tool, reads the tables from here instead.
 
 ``server.py`` resolves every name below in its own module namespace at import
@@ -45,6 +45,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "quote_swap": "Price a DEX swap — free, signs nothing",
     "execute_swap": "Sign and submit a DEX swap — spends funds",
     "get_swap_status": "Resolve a submitted swap by transaction hash",
+    "resolve_swap": "Exit a swap stuck SUBMITTED and unverifiable",
     "search_swaps": "Query swap history with filters",
     "explore_geckoterminal": "Explore GeckoTerminal DEX market data",
     "manage_amm": "Direct AMM pool operations and pool creation",
@@ -97,6 +98,7 @@ TRADING_TOOLS: tuple[str, ...] = (
     "quote_swap",
     "execute_swap",
     "get_swap_status",
+    "resolve_swap",
     "search_swaps",
     "explore_geckoterminal",
 )
@@ -124,6 +126,15 @@ ADMIN_TOOLS: tuple[str, ...] = (
     "configure_server",
     "manage_gateway_config",
 )
+
+#: The profiles an *agent* seat runs on: a tick, and an attended or background
+#: specialist (see ``condor.runtime.toolsets.seat_profile``). ``full`` is the
+#: operator and the chat coordinator. On these two, ``manage_controllers``
+#: refuses to upsert controller *code* (SEC-713): agents own controller source
+#: through Condor's ``manage_agent_controllers``, which checks the server copy
+#: for drift and backs it up, and a delegated or consulted run has no permission
+#: gate of its own to stop the raw call. Saved configs are unaffected.
+AGENT_SEAT_PROFILES: frozenset[str] = frozenset({"tick", "agent"})
 
 #: profile name → the tools it registers. ``full`` is the default because this
 #: server is also run standalone (uvx, external hosts, `.mcp.json`).

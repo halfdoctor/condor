@@ -36,7 +36,7 @@ def _seed_suspended(
 ) -> Path:
     """A session dir as the *previous* process's shutdown left it."""
     session_dir = (
-        agents_root / agent_slug / "strategies" / sslug / "sessions" / f"session_{num}"
+        agents_root / agent_slug / "loops" / sslug / "sessions" / f"session_{num}"
     )
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "journal.md").write_text("# Journal\n\n## Decisions\n\n")
@@ -64,6 +64,7 @@ class _StoppableEngine(SimpleNamespace):
 
     async def stop(self):
         self.supervisor.unregister(self.agent_id, LoopState.STOPPED)
+        return True
 
 
 def _engine(supervisor, session_dir: Path) -> _StoppableEngine:
@@ -128,7 +129,7 @@ def test_boot_resumes_an_opted_in_run_after_a_clean_restart(tmp_path, monkeypatc
 
     started = []
 
-    async def fake_restart(status):
+    async def fake_restart(status, session_dir=None):
         started.append(status["session_num"])
         return True
 
@@ -153,7 +154,9 @@ def test_boot_retires_a_run_that_did_not_opt_in(tmp_path, monkeypatch):
     supervisor = LoopSupervisor()
 
     called = []
-    monkeypatch.setattr(supervisor, "_restart", lambda status: called.append(status))
+    monkeypatch.setattr(
+        supervisor, "_restart", lambda status, session_dir=None: called.append(status)
+    )
 
     report = asyncio.run(supervisor.reconcile_boot(agents_root=tmp_path))
 
@@ -170,7 +173,7 @@ def test_a_resume_happens_once_not_on_every_later_boot(tmp_path, monkeypatch):
 
     started = []
 
-    async def fake_restart(status):
+    async def fake_restart(status, session_dir=None):
         started.append(status["session_num"])
         return True
 
@@ -187,7 +190,7 @@ def test_a_failed_resume_does_not_stay_pending(tmp_path, monkeypatch):
     session_dir = _seed_suspended(tmp_path, restart_on_boot=True)
     supervisor = LoopSupervisor()
 
-    async def boom(status):
+    async def boom(status, session_dir=None):
         raise RuntimeError("config no longer valid")
 
     monkeypatch.setattr(supervisor, "_restart", boom)
@@ -205,7 +208,7 @@ def test_a_crash_is_still_reported_as_interrupted(tmp_path, monkeypatch):
     )
     supervisor = LoopSupervisor()
 
-    async def fake_restart(status):
+    async def fake_restart(status, session_dir=None):
         return True
 
     monkeypatch.setattr(supervisor, "_restart", fake_restart)

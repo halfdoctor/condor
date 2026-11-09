@@ -55,10 +55,12 @@ def _delegate(monkeypatch, req: DelegateRequest):
     """Drive the route with the agent lookup and the runner stubbed out."""
     monkeypatch.setattr(agents_routes, "_get_agent", lambda slug: SimpleNamespace())
 
-    async def _no_conversation(session_key: str) -> str:
+    async def _no_conversation(session_key: str, user) -> str:
         return ""
 
-    monkeypatch.setattr(agents_routes, "_conversation_for_session", _no_conversation)
+    monkeypatch.setattr(
+        agents_routes, "_owned_conversation_for_session", _no_conversation
+    )
     started: list[dict] = []
 
     async def fake_start(**kw):
@@ -201,7 +203,7 @@ def test_the_declared_tool_lets_a_model_pass_a_budget():
     from mcp_servers.condor import server
 
     tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
-    schema = tools["delegate"].inputSchema
+    schema = tools["delegate"].input_schema
 
     assert "timeout_sec" in schema["properties"]
     doc = server.delegate.__doc__ or ""

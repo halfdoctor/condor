@@ -1,23 +1,25 @@
-"""Agent CRUD, strategy CRUD, instance lifecycle, and the journal."""
+"""Agent CRUD, loop CRUD, instance lifecycle, and the journal."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 
+from condor.fsutil import atomic_write_text
 from mcp_servers.condor.condor_client import agent_strategy_from_agent_id, call_main_api
 from mcp_servers.condor.exceptions import APIError
 from mcp_servers.condor.settings import settings
 
 # ---------------------------------------------------------------------------
-# Strategy CRUD (sub-resource of an Agent)
+# Loop CRUD (sub-resource of an Agent; ``Strategy`` in the Python names)
 #
-# ``strategy_id`` is the opaque composite key ``"{agent_slug}.{strategy_slug}"``
-# returned by list_strategies/create_strategy — the LLM just passes it back.
-# ``agent_slug`` (the owning Agent) is required to create a strategy.
+# ``loop_id`` is the opaque composite key ``"{agent_slug}.{strategy_slug}"``
+# returned by list/create — the LLM just passes it back.
+# ``agent_slug`` (the owning Agent) is required to create a loop.
 # ---------------------------------------------------------------------------
 
 
 def _manage_strategy(
     action: str,
-    strategy_id: str | None,
+    loop_id: str | None,
     agent_slug: str | None,
     name: str | None,
     description: str | None,
@@ -33,7 +35,7 @@ def _manage_strategy(
     if action == "list_strategies":
         strategies = store.list_all()
         return {
-            "strategies": [
+            "loops": [
                 {
                     "id": s.key,
                     "agent_slug": s.agent_slug,
@@ -48,11 +50,11 @@ def _manage_strategy(
         }
 
     elif action == "get_strategy":
-        if not strategy_id:
-            return {"error": "strategy_id is required"}
-        s = store.get_by_key(strategy_id)
+        if not loop_id:
+            return {"error": "loop_id is required"}
+        s = store.get_by_key(loop_id)
         if not s:
-            return {"error": f"Strategy '{strategy_id}' not found"}
+            return {"error": f"Loop '{loop_id}' not found"}
         return {
             "id": s.key,
             "agent_slug": s.agent_slug,
@@ -71,30 +73,33 @@ def _manage_strategy(
             return {"error": "name and instructions are required"}
         if not agent_slug:
             return {
-                "error": "agent_slug (the owning Agent) is required to create a strategy"
+                "error": "agent_slug (the owning Agent) is required to create a loop"
             }
         from condor.agents.agent import AgentStore
 
         if AgentStore().get(agent_slug) is None:
             return {"error": f"Agent '{agent_slug}' not found"}
-        strategy = store.create(
-            agent_slug=agent_slug,
-            name=name,
-            description=description or "",
-            agent_key=agent_key,
-            instructions=instructions,
-            skills=skills,
-            default_config=config,
-            created_by=settings.user_id,
-        )
-        return {"created": True, "strategy_id": strategy.key, "name": strategy.name}
+        try:
+            strategy = store.create(
+                agent_slug=agent_slug,
+                name=name,
+                description=description or "",
+                agent_key=agent_key,
+                instructions=instructions,
+                skills=skills,
+                default_config=config,
+                created_by=settings.user_id,
+            )
+        except ValueError as exc:  # taken or reserved name (CORR-635)
+            return {"error": str(exc)}
+        return {"created": True, "loop_id": strategy.key, "name": strategy.name}
 
     elif action == "update_strategy":
-        if not strategy_id:
-            return {"error": "strategy_id is required"}
-        s = store.get_by_key(strategy_id)
+        if not loop_id:
+            return {"error": "loop_id is required"}
+        s = store.get_by_key(loop_id)
         if not s:
-            return {"error": f"Strategy '{strategy_id}' not found"}
+            return {"error": f"Loop '{loop_id}' not found"}
         if name:
             s.name = name
         if description:
@@ -108,22 +113,22 @@ def _manage_strategy(
         if config:
             s.default_config = config
         store.update(s)
-        return {"updated": True, "strategy_id": s.key, "name": s.name}
+        return {"updated": True, "loop_id": s.key, "name": s.name}
 
     elif action == "delete_strategy":
-        if not strategy_id:
-            return {"error": "strategy_id is required"}
-        parts = split_key(strategy_id)
+        if not loop_id:
+            return {"error": "loop_id is required"}
+        parts = split_key(loop_id)
         if not parts:
-            return {"error": f"Invalid strategy_id '{strategy_id}'"}
+            return {"error": f"Invalid loop_id '{loop_id}'"}
         deleted = store.delete(parts[0], parts[1])
         return {"deleted": deleted}
 
-    return {"error": f"Unknown strategy action: {action}"}
+    return {"error": f"Unknown loop action: {action}"}
 
 
 # ---------------------------------------------------------------------------
-# Agent definitions (the AGENT.md identities — distinct from strategies/instances)
+# Agent definitions (the AGENT.md identities — distinct from loops/instances)
 # ---------------------------------------------------------------------------
 
 
@@ -131,8 +136,8 @@ def _list_agent_definitions() -> dict:
     """List the Agent identities (``*/AGENT.md`` across both agent roots).
 
     An *agent* (e.g. ``executor_manager``, ``brigado``) is distinct from a
-    *strategy* (a looping playbook it owns) and from a running *instance*. This
-    surfaces agents that ``list_strategies`` / ``list_agents`` (instances) never
+    *loop* (a looping playbook it owns) and from a running *instance*. This
+    surfaces agents that ``manage_loops`` / ``control_agent`` (instances) never
     show. No capability flags: every agent listed here can be delegated to,
     delegated to and looped.
     """
@@ -153,7 +158,7 @@ def _list_agent_definitions() -> dict:
                 "description": a.description,
                 "agent_key": a.agent_key,
                 "when_to_consult": a.consult_hint,
-                "strategies": owned,
+                "loops": owned,
                 "tools": a.tools,
             }
         )
@@ -163,10 +168,10 @@ def _list_agent_definitions() -> dict:
 # ---------------------------------------------------------------------------
 # Agent CRUD (the AGENT.md identity itself — the primary artifact)
 #
-# An Agent is the brain/identity. It is created FIRST; routines and strategies
+# An Agent is the brain/identity. It is created FIRST; routines and loops
 # are sub-resources that hang off an existing agent_slug. There are no capability
 # flags: the moment an agent exists it can be delegated to and looped.
-# ``when_to_consult`` is a routing hint; a bespoke strategy is an optimization
+# ``when_to_consult`` is a routing hint; a bespoke loop is an optimization
 # over the default playbook every agent already loops.
 # ---------------------------------------------------------------------------
 
@@ -185,6 +190,16 @@ def _creator_agent_key() -> str:
         return ""
 
 
+def _caller_is_admin() -> bool:
+    """Whether this seat's user is an admin; no config is not a licence."""
+    try:
+        from config_manager import get_config_manager
+
+        return bool(get_config_manager().is_admin(settings.user_id))
+    except Exception:  # noqa: BLE001 - no config is not a licence to publish
+        return False
+
+
 def _publish_agent(agent_slug: str, path: str) -> dict:
     """Copy a local agent into the shipped library. Admin only.
 
@@ -199,13 +214,7 @@ def _publish_agent(agent_slug: str, path: str) -> dict:
     """
     from condor.layering import publish_to_stock
 
-    try:
-        from config_manager import get_config_manager
-
-        is_admin = get_config_manager().is_admin(settings.user_id)
-    except Exception:  # noqa: BLE001 - no config is not a licence to publish
-        is_admin = False
-    if not is_admin:
+    if not _caller_is_admin():
         return {
             "error": (
                 "Publishing writes into the tracked library the repo ships, so "
@@ -215,6 +224,371 @@ def _publish_agent(agent_slug: str, path: str) -> dict:
         }
 
     return publish_to_stock(agent_slug, path)
+
+
+def _possible_keys_answer(exc) -> dict:
+    """A stop on possible keys, as the tool says it (SEC review C2)."""
+    return {
+        "error": str(exc),
+        "possible_keys": [key._asdict() for key in exc.pending],
+        "next": (
+            "Show the user each possible key's file and line and ask which are "
+            "not keys. Call again with `acknowledge` set to only the "
+            "fingerprints they confirm; never acknowledge one yourself."
+        ),
+    }
+
+
+def _export_agent(
+    agent_slug: str, notes: str = "", author_name: str = "", acknowledge: list[str] = ()
+) -> dict:
+    """Write this agent out as one portable file, and say where it landed.
+
+    Into ``data/exports/``, which is gitignored and is already this install's
+    own scratch space — the chat then offers the file with ``send_document``.
+    Not a return of the bundle text: an agent's library is tens of kilobytes of
+    JSON, and pushing that through a tool result would fill the model's context
+    with the very thing it is only meant to hand over.
+
+    ``notes`` is the changelog for this version — what changed since the last
+    bundle of this agent — and ``author_name`` is a claim nothing verifies
+    (FEAT-143). Both are optional, and the version in the result is bumped only
+    when the agent's content actually changed since the last export.
+
+    ``findings`` is FEAT-144's review of what the files themselves carry — a
+    key-shaped value, a host the agent reaches, a money-moving tool its prose
+    names, a door onto arbitrary code, the risk limits it brings. An export is
+    refused outright for a value that can only be a secret, because a published
+    bundle cannot be unpublished out of somebody's download; everything else is
+    reported here with its file and line, and the operator decides. It warns; it
+    does not prevent.
+    """
+    from condor.agents import bundle as agent_bundle
+    from condor.agents import bundle_review
+    from condor.paths import data_dir
+
+    try:
+        bundle = agent_bundle.build(
+            agent_slug, notes=notes, author_name=author_name, acknowledged=acknowledge
+        )
+    except agent_bundle.PossibleKeysError as exc:
+        return _possible_keys_answer(exc)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    text = agent_bundle.render(bundle)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    target = (
+        data_dir()
+        / "exports"
+        / f"{bundle.agent.slug}-{stamp}{agent_bundle.FILENAME_SUFFIX}"
+    )
+    atomic_write_text(target, text)
+    return {
+        "exported": True,
+        "agent_slug": bundle.agent.slug,
+        "agent_uid": bundle.agent.agent_uid,
+        "version": bundle.version,
+        "notes": bundle.notes,
+        "author": bundle.author.model_dump(),
+        "requires": bundle.requires.model_dump(),
+        "path": str(target),
+        "bytes": len(text.encode("utf-8")),
+        "files": [f.path for f in bundle.files],
+        "findings": [f._asdict() for f in bundle_review.review(bundle)],
+    }
+
+
+def _import_agent(path: str, as_slug: str) -> dict:
+    """Register the agent in a bundle file, with its code switched off.
+
+    ``as_slug`` (passed as ``agent_slug``) renames it on the way in, which is
+    the answer to a collision — import creates and never replaces, because
+    updating an agent from a bundle is a different verb and conflating the two
+    is how a tuned local agent gets silently reset.
+
+    The preview is the plan this returns on refusal: every executable file is
+    named before anything is written, because an imported routine runs inside
+    the Condor process and that review is the only gate there is.
+
+    Both the success and the refusal carry ``unmet`` — what this install cannot
+    supply the agent (FEAT-143) — and ``findings``, the review of what the files
+    themselves carry (FEAT-144). Neither is a reason the import did not happen,
+    and nothing here is refused for a finding: the protection on this side is
+    that the code arrives muted and unstarted, and the findings are what to read
+    before unmuting any of it.
+
+    Connectors are left unasked on this door: resolving them needs an async
+    Hummingbot client and this is a synchronous tool, so the chat's answer
+    covers tools, shared skills and the model, and the dashboard's preview is
+    the one that also checks the exchange.
+    """
+    from condor.agents import bundle as agent_bundle
+    from condor.runtime.toolsets import every_tool_name
+
+    try:
+        data = Path(path).expanduser().read_bytes()
+    except OSError as exc:
+        return {"error": f"Could not read '{path}': {exc}"}
+
+    try:
+        bundle = agent_bundle.parse(data)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    plan = agent_bundle.plan(
+        bundle,
+        as_slug=as_slug,
+        user_id=settings.user_id,
+        available_tools=sorted(every_tool_name()),
+    )
+    try:
+        return agent_bundle.apply(plan, user_id=settings.user_id)
+    except ValueError as exc:
+        return {"error": str(exc), "preview": plan.summary()}
+
+
+def _upgrade_agent(agent_slug: str, path: str) -> dict:
+    """Replace an installed agent's library from a newer bundle (FEAT-145).
+
+    The verb beside ``import``, which creates and never replaces: a newer
+    bundle of an agent this install already has lands here instead of beside
+    the old one as ``<slug>_2`` with the memory forked.
+
+    Spelled ``upgrade`` and not ``update`` only because ``update_agent`` already
+    means editing an agent's instructions on this tool, and two actions with
+    one name would be a coin flip about whether a bundle or a sentence was
+    meant.
+
+    What comes back is the plan either way. On a refusal the blockers say why —
+    a different agent, no basis for claiming this bundle as upstream, an older
+    version, a shipped agent, a loop running right now — and nothing was
+    written. On success, ``files`` is the per-path diff: replaced, added,
+    deleted, and the ones that kept your copy because you had edited them.
+    Read those out rather than summarising them away; a conflict is the only
+    content in the home nobody else can reproduce.
+
+    Connectors are left unasked here for the same reason the import leaves
+    them: resolving them needs an async Hummingbot client and this is a
+    synchronous tool.
+    """
+    from condor.agents import bundle as agent_bundle
+    from condor.runtime.toolsets import every_tool_name
+
+    try:
+        data = Path(path).expanduser().read_bytes()
+    except OSError as exc:
+        return {"error": f"Could not read '{path}': {exc}"}
+
+    try:
+        bundle = agent_bundle.parse(data)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    plan = agent_bundle.plan_update(
+        bundle, agent_slug, available_tools=sorted(every_tool_name())
+    )
+    try:
+        return agent_bundle.apply_update(plan, user_id=settings.user_id)
+    except ValueError as exc:
+        return {"error": str(exc), "preview": plan.summary()}
+
+
+def _hub_browse(query: str, page: int) -> dict:
+    """One page of Botcamp's published agents, newest first (BUG-7).
+
+    The PR #111 catalogue endpoint this calls through (``condor.hub.browse``)
+    came after ``_hub_get``'s docstring was written, which is why that one
+    still says "there is no browse or search" — this is the missing other
+    half, the same ``GET /hub/catalogue`` the web dashboard's Hub tab reads.
+    Pulling one of the results up is still ``hub_get`` by slug; this only
+    says which slugs exist. Installing one is the Hub page's job, not
+    chat's — tell the user to open Agent Hub and install it there.
+    """
+    from condor import hub
+
+    try:
+        # The admin's token only for the admin (SEC review C4): it carries
+        # whatever their Botcamp account bought or joined.
+        entries = hub.browse(query, page, hub.token() if _caller_is_admin() else "")
+    except (RuntimeError, ValueError) as exc:
+        return {"error": str(exc)}
+    return {
+        "listings": [e.model_dump() for e in entries],
+        "page": page,
+        "trust": (
+            "Only an approved version is ever listed here, but that is a gate "
+            "on the catalogue, not a security boundary for code. Its declared "
+            "skills, tools and routines install enabled, exactly as reviewed; "
+            "a routine is still code, but here the review is the control — "
+            "installing from the hub grants execution consent for that exact "
+            "version and digest, so nothing further is asked before it can "
+            "run. Editing the routine's file afterwards, or importing it from "
+            "anywhere else, keeps the ordinary per-file gate. Installing is "
+            "only available from the Hub page, not from chat."
+        ),
+    }
+
+
+def _hub_get(slug: str) -> dict:
+    """One Botcamp agent's catalogue entry, as rows to read out (FEAT-146).
+
+    PR #111 ships no browse — only a lookup by a slug the caller must
+    already know, so this is a lookup and not a search. This install's own
+    Botcamp token rides along if one is linked (optional on this endpoint),
+    which is what lets a membership/purchase-gated agent an account actually
+    has access to resolve at all; omitted, this is the anonymous read a free
+    agent answers.
+
+    Only an ``APPROVED`` version is ever listed. That is a gate on what
+    reaches the catalogue, never a verdict this tool should repeat back to
+    the user as a reason something is safe to run — the review on install is
+    the gate.
+    """
+    from condor import hub
+
+    try:
+        # The admin's token only for the admin (SEC review C4): it carries
+        # whatever their Botcamp account bought or joined.
+        listing = hub.get(slug, hub.token() if _caller_is_admin() else "")
+    except (RuntimeError, ValueError) as exc:
+        return {"error": str(exc)}
+    return {
+        "listing": listing.model_dump(),
+        "trust": (
+            "Only an approved version is ever listed here, but that is a gate "
+            "on the catalogue, not a security boundary for code. Its declared "
+            "skills, tools and routines install enabled, exactly as reviewed; "
+            "a routine is still code, but here the review is the control — "
+            "installing from the hub grants execution consent for that exact "
+            "version and digest, so nothing further is asked before it can "
+            "run. Editing the routine's file afterwards, or importing it from "
+            "anywhere else, keeps the ordinary per-file gate. Installing is "
+            "only available from the Hub page, not from chat."
+        ),
+    }
+
+
+def _hub_install(slug: str, as_slug: str = "", version: str = "latest") -> dict:
+    """Refuse — installing from the hub is the Hub page's job, not chat's.
+
+    The web install route (``condor/web/routes/agents.py``'s
+    ``install_from_hub``) only ever runs after the owner ticks the Hub
+    page's own consent checkbox — "I understand this agent can run code on
+    my machine, and I want to install it." This chat door had no such
+    checkpoint: a human confirming the tool call (``hub_install`` was one of
+    ``condor.runtime.danger.DANGEROUS_AGENT_ACTIONS``) is not the owner
+    reading that sentence, so the install's own code-execution consent was
+    being recorded for a pinned version and digest the owner never actually
+    agreed to. The fix is to remove the door, not to re-add the checkbox
+    here: this always refuses, unconditionally, and ``as_slug``/``version``
+    are accepted and ignored so the call stays valid.
+    """
+    del as_slug, version
+    named = f"'{slug}'" if slug else "an agent"
+    return {
+        "error": (
+            f"Installing {named} from the Botcamp hub is not available from "
+            "chat. Open Agent Hub from the bottom of the conversation "
+            "sidebar and install it there."
+        )
+    }
+
+
+def _publish_hub(
+    agent_slug: str, notes: str = "", author_name: str = "", acknowledge: list[str] = ()
+) -> dict:
+    """Upload this agent to the hub, as the file an export would hand over.
+
+    The bytes are built by FEAT-133's ``build`` and rendered by its ``render``,
+    which is to say they are byte-identical to what ``action="export"`` writes
+    to disk — there is no second serializer. It therefore inherits the export's
+    FEAT-144 refusal: an agent carrying a value that can only be a secret stops
+    here, and nothing is sent, because a published bundle cannot be unpublished
+    out of somebody's download.
+
+    It needs the install's Botcamp token, which lives in ``config.yml`` and is
+    set in the Agent Hub (Agents → Hub). There is no way to pass one in here and there
+    should not be: a token in a tool argument is a token in a transcript.
+
+    Publishing sends content off this box and is irreversible in practice —
+    ``unpublish`` removes the listing, it does not recall a download. Confirm
+    with the user before calling it, and read the receipt back rather than
+    summarising it.
+
+    Admin only, like ``publish_agent`` and the web route: it publishes under
+    the install's one Botcamp account, and the "ADMIN ONLY" in the tool's
+    description is read only by the model. A human confirms it on top of that
+    (``condor.runtime.danger.DANGEROUS_AGENT_ACTIONS``), and an unattended
+    loop is refused it outright (``condor.agents.risk``).
+    """
+    from condor import hub
+    from condor.agents import bundle as agent_bundle
+
+    if not _caller_is_admin():
+        return {
+            "error": (
+                "Publishing to the Botcamp hub sends this agent out under the "
+                "install's Botcamp account, so it is admin-only."
+            )
+        }
+
+    try:
+        receipt = hub.publish(
+            agent_slug, hub.token(), notes or "", author_name or "", acknowledge
+        )
+    except agent_bundle.PossibleKeysError as exc:
+        return _possible_keys_answer(exc)
+    except (RuntimeError, ValueError) as exc:
+        return {"error": str(exc)}
+    # A submission is not a listing (FEAT-150): the hub answering the upload
+    # does not by itself mean this is published, only that it is on file as
+    # pending, rejected or published — ``receipt.status`` is the hub's own
+    # word on which.
+    return {"published": receipt.status == "published", **receipt.model_dump()}
+
+
+def _refuse_unreachable_pin(new: str | None, stored: str) -> dict | None:
+    """The MCP mirror of the web layer's ``_gate_pin_change`` (SEC-698).
+
+    An Agent's server pin decides which account its tools trade on, so every
+    writer of that field answers the same way: ``POST /agents`` and ``PATCH
+    /config`` gate it (SEC-594), a raw ``AGENT.md`` write gates it (SEC-693),
+    and this tool — the third door onto the same field, and the one the web
+    routes' own docstring names as performing "the same write" — did not.
+
+    Credentials never actually leaked, because every site that turns a stored
+    name into a client re-checks reach (``config_manager.may_use_stored_server``
+    at each of its five call sites). What leaked was the *label*: an Agent
+    pinned over MCP to a server the caller cannot reach reports that name
+    verbatim in ``AgentSummary`` and in the chat header's
+    ``SessionBinding.server_name``, so the UI names a foreign account as the one
+    at risk — exactly the mislabel SEC-594 and SEC-693 were shipped to prevent.
+
+    The predicate is ``may_use_stored_server`` rather than the web layer's
+    ``check_server_access``: the two apply the same TRADER floor to the same
+    ``has_server_access``, but the web one lives in ``condor/web/auth.py`` and
+    signals by raising ``HTTPException``, which this layer cannot import (it
+    sits below the web app) and could not answer with anyway — an MCP tool
+    reports refusal as ``{"error": ...}``, the shape ``manage_servers`` already
+    uses for this exact sentence. ``may_use_stored_server`` is the boolean
+    sibling that ARCH-587 gave the callers below the web layer, and it also
+    checks existence, so an admin — for whom ``has_server_access`` answers True
+    on any string at all (SEC-164) — cannot pin an Agent to a name that
+    resolves to no server.
+
+    An empty pin needs no access, and re-sending the value already stored is
+    the ordinary round-trip of a pin someone else legitimately set, so only a
+    *change* is checked — the same two exemptions ``_gate_pin_change`` makes.
+    """
+    if not new or new == stored:
+        return None
+
+    from config_manager import get_config_manager, may_use_stored_server
+
+    if not may_use_stored_server(get_config_manager(), settings.user_id, new):
+        return {"error": f"No access to server '{new}'"}
+    return None
 
 
 def _manage_agent(
@@ -229,6 +603,11 @@ def _manage_agent(
     server_required: bool | None,
     server_name: str | None,
     path: str | None = None,
+    notes: str | None = None,
+    author_name: str | None = None,
+    acknowledge: list[str] | None = None,
+    query: str | None = None,
+    page: int | None = None,
 ) -> dict:
     from condor.agents.agent import AgentStore
 
@@ -237,22 +616,30 @@ def _manage_agent(
     if action == "create_agent":
         if not name:
             return {"error": "name is required to create an agent"}
+        # Creating an Agent already pinned to an unreachable server is the edit
+        # that is refused below, so it is refused here too.
+        refusal = _refuse_unreachable_pin(server_name, "")
+        if refusal:
+            return refusal
         # Default to the model the creator is actually running. Guessing here
         # produces agents pinned to a backend the user never configured — the
         # coordinator has no way to know which models are reachable, so an
         # invented agent_key is a coin flip that only surfaces on the first run.
         resolved_key = agent_key or _creator_agent_key()
-        agent = store.create(
-            name=name,
-            description=description or "",
-            instructions=instructions or "",
-            agent_key=resolved_key,
-            tools=tools,
-            when_to_consult=when_to_consult or "",
-            server_required=True if server_required is None else server_required,
-            server_name=server_name or "",
-            created_by=settings.user_id,
-        )
+        try:
+            agent = store.create(
+                name=name,
+                description=description or "",
+                instructions=instructions or "",
+                agent_key=resolved_key,
+                tools=tools,
+                when_to_consult=when_to_consult or "",
+                server_required=True if server_required is None else server_required,
+                server_name=server_name or "",
+                created_by=settings.user_id,
+            )
+        except ValueError as exc:  # taken or reserved name (CORR-635)
+            return {"error": str(exc)}
         return {
             "created": True,
             "agent_slug": agent.slug,
@@ -287,6 +674,11 @@ def _manage_agent(
         a = store.get(agent_slug)
         if not a:
             return {"error": f"Agent '{agent_slug}' not found"}
+        # Ahead of every assignment, so a refused pin leaves the record whole
+        # rather than persisting the fields that happened to be listed first.
+        refusal = _refuse_unreachable_pin(server_name, a.server_name)
+        if refusal:
+            return refusal
         if name:
             a.name = name
         if description is not None:
@@ -311,6 +703,46 @@ def _manage_agent(
             return {"error": "agent_slug is required"}
         return _publish_agent(agent_slug, path or "")
 
+    if action == "export_agent":
+        if not agent_slug:
+            return {"error": "agent_slug is required"}
+        return _export_agent(
+            agent_slug, notes or "", author_name or "", acknowledge or []
+        )
+
+    if action == "import_agent":
+        if not path:
+            return {"error": "path (the bundle file to import) is required"}
+        # ``agent_slug`` is the name to land under, not one to look up: the
+        # bundle already carries its own, and this is how a collision is
+        # answered.
+        return _import_agent(path, agent_slug or "")
+
+    if action == "upgrade_agent":
+        if not agent_slug:
+            return {"error": "agent_slug (the installed agent to update) is required"}
+        if not path:
+            return {"error": "path (the newer bundle file) is required"}
+        return _upgrade_agent(agent_slug, path)
+
+    if action == "hub_browse":
+        return _hub_browse(query or "", page or 1)
+
+    if action == "hub_get":
+        if not path:
+            return {"error": "path (the Botcamp agent slug to look up) is required"}
+        return _hub_get(path)
+
+    if action == "hub_install":
+        return _hub_install(path or "", agent_slug or "")
+
+    if action == "publish_hub":
+        if not agent_slug:
+            return {"error": "agent_slug is required"}
+        return _publish_hub(
+            agent_slug, notes or "", author_name or "", acknowledge or []
+        )
+
     if action == "delete_agent":
         if not agent_slug:
             return {"error": "agent_slug is required"}
@@ -320,8 +752,8 @@ def _manage_agent(
         if owned:
             return {
                 "error": (
-                    f"Agent '{agent_slug}' still owns {len(owned)} strategy(ies). "
-                    "Delete its strategies first."
+                    f"Agent '{agent_slug}' still owns {len(owned)} loop(s). "
+                    "Delete its loops first."
                 )
             }
         return {"deleted": store.delete(agent_slug)}
@@ -336,7 +768,7 @@ def _manage_agent(
 
 async def _agent_lifecycle(
     action: str,
-    strategy_id: str | None,
+    loop_id: str | None,
     agent_id: str | None,
     config: dict | None,
 ) -> dict:
@@ -354,18 +786,18 @@ async def _agent_lifecycle(
             return {"agents": agents}
 
         if action == "start_agent":
-            if not strategy_id:
-                return {"error": "strategy_id is required"}
+            if not loop_id:
+                return {"error": "loop_id is required"}
 
             from condor.agents.strategy import StrategyStore
 
             store = StrategyStore()
             # Accepts a composite key OR a bare agent slug: every agent is
-            # loopable, so a slug resolves to its only strategy or to a default
+            # loopable, so a slug resolves to its only loop or to a default
             # playbook materialized from its identity on first start.
-            strategy = store.resolve_for_loop(strategy_id)
+            strategy = store.resolve_for_loop(loop_id)
             if not strategy:
-                return {"error": f"No strategy or agent matches '{strategy_id}'"}
+                return {"error": f"No loop or agent matches '{loop_id}'"}
 
             from condor.agents.config import load_full_config
             from config_manager import get_config_manager, get_effective_server
@@ -402,7 +834,6 @@ async def _agent_lifecycle(
                     "config": config_dict,
                     "trading_context": trading_context,
                     "chat_id": settings.chat_id,
-                    "user_id": settings.user_id,
                 },
             )
 
@@ -418,9 +849,18 @@ async def _agent_lifecycle(
                 "shutdown_agent": "shutdown",
             }[action]
             aslug, sslug = agent_strategy_from_agent_id(agent_id)
+            # A shutdown is not a question, it is a winddown waited on: the
+            # route runs the whole thing before answering, so the default
+            # 15-second budget expired every time and the tool reported the
+            # main process unreachable while the kill switch was still firing
+            # behind it (MM-3).
+            from condor.runtime.timeouts import TIMEOUTS
+
+            timeout = TIMEOUTS.mcp_shutdown if verb == "shutdown" else None
             return await call_main_api(
                 "POST",
                 f"/agents/{aslug}/strategies/{sslug}/{verb}?agent_id={agent_id}",
+                timeout=timeout,
             )
 
         return {"error": f"Unknown lifecycle action: {action}"}
@@ -463,27 +903,20 @@ def _resolve_experiment_file(agent_id: str):
     (path | None, num | None); num is set even when the file isn't on disk yet
     so callers can distinguish "experiment in progress" from "not an experiment".
     """
-    from condor.agents.journal import resolve_agent_dirs
+    from condor.agents.sessions_index import (
+        find_experiment_file,
+        parse_agent_id,
+        strategy_dir_for_run_key,
+    )
 
-    last_sep = agent_id.rfind("_")
-    if last_sep == -1:
+    parsed = parse_agent_id(agent_id)
+    if parsed is None or parsed[2] != "experiment":
         return None, None
-    num_part = agent_id[last_sep + 1 :]
-    if not num_part.startswith("e"):
-        return None, None
-    try:
-        num = int(num_part[1:])
-    except ValueError:
-        return None, None
-
-    _, base_dir = resolve_agent_dirs(agent_id)
-    if base_dir is None:
+    run_key, num, _ = parsed
+    base_dir = strategy_dir_for_run_key(run_key)
+    if base_dir is None or not base_dir.is_dir():
         return None, num
-    for dirname in ("dry_runs", "experiments"):
-        path = base_dir / dirname / f"experiment_{num}.md"
-        if path.exists():
-            return path, num
-    return None, num
+    return find_experiment_file(base_dir, num), num
 
 
 def journal_read(agent_id: str, section: str = "recent", max_entries: int = 30) -> dict:
@@ -534,6 +967,24 @@ def journal_read(agent_id: str, section: str = "recent", max_entries: int = 30) 
         return {"content": jm.read_recent(max_entries=max_entries)}
 
 
+def _may_feed_run(engine) -> bool:
+    """Whether this seat may write what ``engine`` reads back each tick (SEC-638).
+
+    The tick's own MCP subprocess runs as the engine's owner, so the loop's
+    writes pass; a foreign chat session's agent is refused unless its user is
+    an admin. An unowned restored loop (``user_id == 0``) is left as it was.
+    """
+    owner = getattr(engine, "user_id", 0) or 0
+    if not owner or owner == settings.user_id:
+        return True
+    try:
+        from config_manager import get_config_manager
+
+        return bool(get_config_manager().is_admin(settings.user_id))
+    except Exception:  # noqa: BLE001 - no config is not a licence to write
+        return False
+
+
 def journal_write(
     agent_id: str,
     entry_type: str,
@@ -573,6 +1024,10 @@ def journal_write(
             return {
                 "skipped": "experiment mode — no journal; the tick is saved as a dry-run snapshot"
             }
+        # Every entry type is read back by the loop: learnings, state and the
+        # canvas directly, actions as the prompt's recent decisions.
+        if not _may_feed_run(engine):
+            return {"error": "Not your agent"}
         session_dir = engine.session_dir
         agent_dir = engine.strategy.home
     else:
@@ -658,25 +1113,47 @@ _ACTION_OWNER: dict[str, tuple[str, str]] = {
         "manage_agents",
         'manage_agents(action="publish", agent_slug=...)',
     ),
-    "list_strategies": ("manage_strategies", 'manage_strategies(action="list")'),
-    "get_strategy": (
-        "manage_strategies",
-        'manage_strategies(action="get", strategy_id=...)',
+    "export_agent": (
+        "manage_agents",
+        'manage_agents(action="export", agent_slug=...)',
     ),
+    "import_agent": ("manage_agents", 'manage_agents(action="import", path=...)'),
+    "upgrade_agent": (
+        "manage_agents",
+        'manage_agents(action="upgrade", agent_slug=..., path=...)',
+    ),
+    "hub_browse": (
+        "manage_agents",
+        'manage_agents(action="hub_browse", query=..., page=...)',
+    ),
+    "hub_get": (
+        "manage_agents",
+        'manage_agents(action="hub_get", path=<agent slug>)',
+    ),
+    "hub_install": (
+        "manage_agents",
+        'manage_agents(action="hub_install", path=<agent slug>)',
+    ),
+    "publish_hub": (
+        "manage_agents",
+        'manage_agents(action="publish_hub", agent_slug=...)',
+    ),
+    "list_strategies": ("manage_loops", 'manage_loops(action="list")'),
+    "get_strategy": ("manage_loops", 'manage_loops(action="get", loop_id=...)'),
     "create_strategy": (
-        "manage_strategies",
-        'manage_strategies(action="create", agent_slug=..., name=..., instructions=...)',
+        "manage_loops",
+        'manage_loops(action="create", agent_slug=..., name=..., instructions=...)',
     ),
     "update_strategy": (
-        "manage_strategies",
-        'manage_strategies(action="update", strategy_id=...)',
+        "manage_loops",
+        'manage_loops(action="update", loop_id=...)',
     ),
     "delete_strategy": (
-        "manage_strategies",
-        'manage_strategies(action="delete", strategy_id=...)',
+        "manage_loops",
+        'manage_loops(action="delete", loop_id=...)',
     ),
     "list_agents": ("control_agent", 'control_agent(action="list")'),
-    "start_agent": ("control_agent", 'control_agent(action="start", strategy_id=...)'),
+    "start_agent": ("control_agent", 'control_agent(action="start", loop_id=...)'),
     "stop_agent": ("control_agent", 'control_agent(action="stop", agent_id=...)'),
     "pause_agent": ("control_agent", 'control_agent(action="pause", agent_id=...)'),
     "resume_agent": ("control_agent", 'control_agent(action="resume", agent_id=...)'),
@@ -706,6 +1183,18 @@ _AGENT_ACTIONS = {
     "update": "update_agent",
     "delete": "delete_agent",
     "publish": "publish_agent",
+    "export": "export_agent",
+    "import": "import_agent",
+    "upgrade": "upgrade_agent",
+    # The hub's four (FEAT-146, BUG-7). Spelled with their prefix even in the
+    # short table: "get"/"install"/"browse" on their own would read as local
+    # verbs, and ``publish`` is already taken by the publish-to-stock action
+    # — which is a different act entirely, writing into this repo's tracked
+    # library.
+    "hub_browse": "hub_browse",
+    "hub_get": "hub_get",
+    "hub_install": "hub_install",
+    "publish_hub": "publish_hub",
 }
 
 _STRATEGY_ACTIONS = {
@@ -759,6 +1248,11 @@ def manage_agents(
     server_required: bool | None = None,
     server_name: str | None = None,
     path: str | None = None,
+    notes: str | None = None,
+    author_name: str | None = None,
+    acknowledge: list[str] | None = None,
+    query: str | None = None,
+    page: int | None = None,
 ) -> dict:
     resolved, err = _resolve_action("manage_agents", action, _AGENT_ACTIONS)
     if err:
@@ -777,12 +1271,17 @@ def manage_agents(
         server_required,
         server_name,
         path,
+        notes,
+        author_name,
+        acknowledge,
+        query,
+        page,
     )
 
 
-def manage_strategies(
+def manage_loops(
     action: str,
-    strategy_id: str | None = None,
+    loop_id: str | None = None,
     agent_slug: str | None = None,
     name: str | None = None,
     description: str | None = None,
@@ -791,12 +1290,12 @@ def manage_strategies(
     skills: list[str] | None = None,
     config: dict | None = None,
 ) -> dict:
-    resolved, err = _resolve_action("manage_strategies", action, _STRATEGY_ACTIONS)
+    resolved, err = _resolve_action("manage_loops", action, _STRATEGY_ACTIONS)
     if err:
         return err
     return _manage_strategy(
         resolved,
-        strategy_id,
+        loop_id,
         agent_slug,
         name,
         description,
@@ -810,7 +1309,7 @@ def manage_strategies(
 async def control_agent(
     action: str,
     agent_id: str | None = None,
-    strategy_id: str | None = None,
+    loop_id: str | None = None,
     config: dict | None = None,
     key: str | None = None,
     value=None,
@@ -824,4 +1323,4 @@ async def control_agent(
         # The namespace is derived from agent_id, never taken from the caller,
         # so an agent cannot read another's cursors by guessing a key.
         return await _agent_state(resolved, agent_id, key, value, expires_in, clear)
-    return await _agent_lifecycle(resolved, strategy_id, agent_id, config)
+    return await _agent_lifecycle(resolved, loop_id, agent_id, config)

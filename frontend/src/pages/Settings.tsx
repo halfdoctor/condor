@@ -1,11 +1,13 @@
 import {
   Bell,
+  Brain,
   Download,
   KeyRound,
   LogOut,
   Mic,
   Network,
   Server,
+  ServerCog,
   Shield,
   ShieldCheck,
   Sparkles,
@@ -14,7 +16,9 @@ import {
 import { useSearchParams } from "react-router-dom";
 
 import { AdminSettings } from "@/components/settings/AdminSettings";
+import { AgentsSettings } from "@/components/settings/AgentsSettings";
 import { ApiKeysSettings } from "@/components/settings/ApiKeysSettings";
+import { ApiServerSettings } from "@/components/settings/ApiServerSettings";
 import { CustomProvidersSettings } from "@/components/settings/CustomProvidersSettings";
 import { GatewaySettings } from "@/components/settings/GatewaySettings";
 import { NotificationsSettings } from "@/components/settings/NotificationsSettings";
@@ -28,6 +32,8 @@ import { useServer } from "@/hooks/useServer";
 import { useAuth } from "@/lib/auth";
 
 type TabKey =
+  | "agents"
+  | "api"
   | "gateway"
   | "keys"
   | "servers"
@@ -59,6 +65,7 @@ function buildGroups(server: string | null, isAdmin: boolean): TabGroup[] {
     {
       label: server ? `Server · ${server}` : "Server",
       tabs: [
+        { key: "api", label: "Hummingbot API", icon: ServerCog },
         { key: "gateway", label: "Gateway", icon: Network },
         { key: "keys", label: "Keys and Wallets", icon: KeyRound },
       ],
@@ -67,6 +74,7 @@ function buildGroups(server: string | null, isAdmin: boolean): TabGroup[] {
       label: "Condor",
       tabs: [
         { key: "servers", label: "Servers", icon: Server },
+        { key: "agents", label: "Agents", icon: Brain },
         { key: "llm", label: "LLM Endpoints", icon: Sparkles },
         { key: "voice", label: "Voice & AI", icon: Mic },
       ],
@@ -107,9 +115,19 @@ export function Settings() {
   const groups = buildGroups(server, isAdmin);
   const tabs = groups.flatMap((g) => g.tabs);
   const requested = (params.get("tab") as TabKey) || "servers";
+  const available = tabs.some((t) => t.key === requested);
   // A deep link to ?tab=admin or ?tab=updates from a seat that is not (or no
   // longer) an admin falls back rather than rendering an empty page.
-  const tab = tabs.some((t) => t.key === requested) ? requested : "servers";
+  const tab = available ? requested : "servers";
+  // ...but silently is the wrong way to fall back when the product itself
+  // sent the link. The "Updates available" notice links to ?tab=updates, so a
+  // non-admin seat clicks it, lands on Servers, and sees nothing happen at
+  // all — the tab is gone, the notice is still there, and nothing anywhere
+  // says why. Say why.
+  const deniedTab =
+    !available && (requested === "updates" || requested === "admin")
+      ? requested
+      : null;
 
   return (
     <div className="mx-auto max-w-6xl">
@@ -183,6 +201,8 @@ export function Settings() {
         <div className="min-w-0 flex-1">
           {/* Tab content */}
           {tab === "servers" && <ServersSettings />}
+          {tab === "agents" && <AgentsSettings />}
+          {tab === "api" && <ApiServerSettings />}
           {tab === "gateway" && <GatewaySettings />}
           {tab === "keys" && <ApiKeysSettings />}
           {tab === "llm" && <CustomProvidersSettings />}
@@ -202,8 +222,36 @@ export function Settings() {
           )}
           {tab === "admin" && <AdminSettings />}
           {tab === "updates" && <UpdatesSettings />}
+          {deniedTab && <AdminOnlyNotice tab={deniedTab} />}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Why a tab the reader was linked to is not on their screen.
+ *
+ * Reachable the ordinary way: the hourly update check posts an "Updates
+ * available" notification whose link is `?tab=updates`, and it goes to
+ * `ADMIN_USER_ID` — which in local mode is the id the dashboard signs in as,
+ * whether or not `config.yml` gives that id the admin role. When it does not,
+ * the click used to do nothing observable.
+ */
+function AdminOnlyNotice({ tab }: { tab: "updates" | "admin" }) {
+  const what = tab === "updates" ? "Updates" : "Admin";
+  return (
+    <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4">
+      <h2 className="mb-1 text-sm font-semibold text-[var(--color-text)]">
+        {what} is admin-only
+      </h2>
+      <p className="text-sm text-[var(--color-text-muted)]">
+        This seat is signed in without the admin role, so the {what} tab is not
+        shown and its API answers 403. Give this user{" "}
+        <code className="text-[var(--color-text)]">role: admin</code> in{" "}
+        <code className="text-[var(--color-text)]">config.yml</code>, then
+        reload. <code className="text-[var(--color-text)]">make doctor</code>{" "}
+        names the id it signs in as.
+      </p>
     </div>
   );
 }

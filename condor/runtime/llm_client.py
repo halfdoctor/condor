@@ -67,11 +67,16 @@ def build_llm_client(
     keeps what it leaves out from ever being mounted.
     """
     if pydantic_ai.is_pydantic_ai_model(agent_key):
+        # The key's provenance is only known here: with an explicit URL in play
+        # only the user's own saved key may travel to it, never the install's
+        # env keys (SEC-630).
+        env_keys_allowed = not base_url_override
         custom_url, api_key = resolve_custom_endpoint(
             agent_key,
             user_data=user_data,
             user_id=user_id,
             strict=strict_custom_endpoint,
+            env_fallback=env_keys_allowed,
         )
         return pydantic_ai.PydanticAIClient(
             model=agent_key,
@@ -82,12 +87,14 @@ def build_llm_client(
             api_key=api_key,
             allowed_tools=allowed_tools,
             system_prompt=system_prompt,
+            env_keys_allowed=env_keys_allowed,
         )
 
     # ACP subprocess models: claude-code, gemini, codex. A Claude model can be
-    # pinned via a suffix ("claude-acp:opus"); ACPClient selects it over the
-    # protocol (session/set_model) after handshake — the bridge ignores
-    # ANTHROPIC_MODEL.
+    # pinned via a suffix ("claude-acp:opus"); resolve_acp carries it only as a
+    # model preference, and ACPClient applies it over the protocol
+    # (session/set_model) after the handshake, where a pin the bridge does not
+    # offer fails the session instead of running on its default (CORR-746).
     command, model_env, model_pref = acp_client.resolve_acp(agent_key)
     merged_env = {**(extra_env or {}), **model_env}
     return acp_client.ACPClient(
@@ -115,7 +122,9 @@ async def agent_key_error(
     out counts: a provider no client knows, a key with no model id, a custom key
     naming an endpoint this user never saved, a provider with no API key or base
     URL. Those are exactly what a tick raises from its first ``start()``, and
-    they are raised here by the same code, so the two cannot disagree. A local
+    they are raised here by the same code, so the two cannot disagree. One more
+    is refused here alone: an openrouter key with a caller-chosen base URL, whose
+    tick would run keyless rather than fail (SEC-630). A local
     server that is down, or a model the provider does not serve, still fails at
     run time: telling those apart takes a network call, and a server that is off
     now may well be on by the first tick.
@@ -134,6 +143,10 @@ async def agent_key_error(
             )
             return f"unknown model provider '{base}' (known: {', '.join(known)})"
         return None
+
+    if base_url_override and pydantic_ai.model_prefix(key) == "openrouter":
+        # OpenRouter's key is the install's; it only ever goes to OpenRouter.
+        return "a base URL cannot be set for openrouter models (remove model_base_url)"
 
     from condor.llm.readiness import LOCAL_PREFIXES
 

@@ -103,9 +103,39 @@ export interface ChatMessage {
    * always drew — the reasoning, then the calls.
    */
   events?: RunStep[];
-  /** System: "switch" | "error" | "delegation" | "resume" | "notification" |
-   * "routine" | "secret_notice". */
+  /** System: "switch" | "error" | "start_error" | "delegation" | "resume" |
+   * "notification" | "routine" | "secret_notice". */
   kind?: string;
+  /**
+   * The model (and, for a bound Agent, the identity) a `start_error` note's
+   * dead spawn was trying to use — stamped once, when the note is created,
+   * from the slot's own `agent_key`/`agent_slug` at that moment. A later
+   * retry on the same note updates it to whatever that retry just attempted,
+   * so the note always names the attempt its own text is about, even after
+   * the slot's live info has moved on to a successful switch. Only
+   * `start_error` carries these; everything else reads `undefined`.
+   */
+  attemptedAgentKey?: string;
+  attemptedAgentSlug?: string;
+  /**
+   * A retry from this `start_error` note is in flight: the respawn has not
+   * answered yet. `retryTargetKey` names what it is trying, so the note can
+   * say so instead of sitting on the stale failure while it waits.
+   */
+  retrying?: boolean;
+  retryTargetKey?: string;
+  /**
+   * A retry from this `start_error` note succeeded — `resolvedAgentKey`/
+   * `resolvedAgentSlug` name whoever answered, for the renderer to resolve
+   * through `useBrainLabel` itself (the same resolution the picker's own
+   * trigger uses, rather than a label baked in here). Set, the note reads as
+   * one quiet resolved line instead of the failure and its picker; a later
+   * retry that fails again clears it, so the note falls back to the plain
+   * failure state with the new error.
+   */
+  resolved?: boolean;
+  resolvedAgentKey?: string;
+  resolvedAgentSlug?: string;
   /**
    * The user redirected the agent while this answer was being written. The
    * partial stays on screen — its context survives into the next turn, so
@@ -218,6 +248,9 @@ export interface PermissionRequest {
   summary: string;
   /** Which agent, on which server, raised it. Empty when unattributable. */
   origin?: string;
+  /** What the call leaves behind beyond its summary (a controller
+   *  overwrite's impact preview). Empty for most calls. */
+  detail?: string;
   /** The bare tool name, previewed like the command it is. */
   tool?: string;
   /** Its arguments; null when the backend could not read them. */
@@ -1080,6 +1113,7 @@ export function useChatSocket() {
             request_id: p.id,
             summary: p.summary,
             origin: p.origin || "",
+            detail: p.detail || undefined,
             tool: p.tool,
             input: p.input,
             deadline: deadlineFrom(p.expires_in),
@@ -1702,6 +1736,8 @@ export function useChatSocket() {
               request_id: data.request_id as string,
               summary: data.summary as string,
               origin: (data.origin as string) || "",
+              detail:
+                typeof data.detail === "string" && data.detail ? data.detail : undefined,
               tool: typeof data.tool === "string" ? data.tool : undefined,
               input: (data.input as Record<string, unknown> | null | undefined) ?? null,
               deadline: deadlineFrom(data.expires_in),
@@ -1847,20 +1883,65 @@ export function useChatSocket() {
           // kind now, so the glyph and the label come from the renderer and
           // the text is the backend's own message, unadorned.
           const errMsg = (data.message as string) || "Unknown error";
+          // A spawn failure (`_start`'s except in chat_ws.py) stands up no
+          // subprocess at all — commonly a missing provider key for the model
+          // the slot was about to use. `switchBrain` already respawns a slot
+          // with no live session behind it (the same path a detached-after-
+          // restart tab uses), so this is the one failure the transcript can
+          // offer a model picker on instead of a dead end.
+          const noteKind = data.phase === "start" ? "start_error" : "error";
+          // `_handle_start_session` mints the conversation *before* trying to
+          // spawn it, so a start failure still names a real id the backend
+          // can find — `data.slot_id`, same field `session_started` renames
+          // the optimistic tab to on success. Without adopting it here the
+          // tab stays "new_N" forever, and `onRetryModel`'s "Use Sonnet"
+          // asks the backend to switch a conversation that id does not name,
+          // which 404s with "No session web:<user>:new_N".
+          const realSlotId =
+            noteKind === "start_error" ? (data.slot_id as string) || null : null;
           if (errSlotId) {
             // Nothing is coming for a tab whose spawn failed — dropping
             // `pending` stops the input pretending the queue will drain.
             delete outbox.current[errSlotId];
+            if (realSlotId && realSlotId !== errSlotId) {
+              refAliases.current[errSlotId] = realSlotId;
+            }
             setSlots((prev) =>
               prev.map((s) => {
                 if (s.info.slot_id !== errSlotId) return s;
                 return {
                   ...s,
+                  ...(realSlotId && realSlotId !== errSlotId
+                    ? {
+                        info: {
+                          ...s.info,
+                          slot_id: realSlotId,
+                          conversation_id: realSlotId,
+                        },
+                      }
+                    : {}),
                   pending: false,
-                  messages: [...s.messages, systemNote(errMsg, "error")],
+                  messages: [
+                    ...s.messages,
+                    {
+                      ...systemNote(errMsg, noteKind),
+                      // Stamped from the slot's own attempt, which a failed
+                      // start never overwrites — the one moment this is
+                      // knowable for this particular note.
+                      ...(noteKind === "start_error"
+                        ? {
+                            attemptedAgentKey: s.info.agent_key,
+                            attemptedAgentSlug: s.info.agent_slug,
+                          }
+                        : {}),
+                    },
+                  ],
                 };
               }),
             );
+            if (realSlotId && realSlotId !== errSlotId) {
+              setActiveSlotId((cur) => (cur === errSlotId ? realSlotId : cur));
+            }
             stopStreaming(errSlotId);
           }
           break;
@@ -2022,39 +2103,107 @@ export function useChatSocket() {
    * The subprocess is replaced — ACP has no identity hot-swap — but the
    * conversation is not: the backend respawns under the same key and replays
    * the transcript, and records the handover so it shows as a divider.
+   *
+   * `startErrorMessageId` names the `start_error` note this particular
+   * switch is a retry *from* — the one a picker inline in the transcript
+   * offered, rather than the identity strip's own picker. That note has no
+   * divider to earn (a model-only retry never sets `agentSlug`, so the
+   * divider above is already suppressed) — what it needs instead is its own
+   * three-state update: marked retrying before the request, resolved onto
+   * the new identity on success, or handed the new failure to display in
+   * place of the old one. Nothing here changes for a switch that does not
+   * name one.
    */
   const switchBrain = useCallback(
-    async (slotId: string, selection: { agentSlug?: string; agentKey?: string }) => {
+    async (
+      slotId: string,
+      selection: { agentSlug?: string; agentKey?: string },
+      startErrorMessageId?: string,
+    ) => {
       if (!user) return;
       const key = webSessionKey(user.id, slotId);
-      const { session } = await api.switchSession(key, {
-        agent_slug: selection.agentSlug,
-        agent_key: selection.agentKey,
-      });
-      // The outgoing brain's last words belong above the divider that retires
-      // it, not in a new bubble underneath it.
-      flushChunks();
-      applySwitch(slotId, (prev) => ({
-        info: {
-          ...prev,
-          agent_key: session.agent_key,
-          // A brain switch can move the server too: binding to an Agent that
-          // pins one overrides the chat's ambient choice, and unbinding
-          // hands it back. Both are read off the respawned session.
-          server_name: session.server_name || undefined,
-          server_pinned: session.server_pinned,
-          agent_slug: session.agent_slug,
-          label: session.label,
-        },
-        // Only a change of *who* divides the scrollback; a model swap under
-        // the same identity is not a handover the reader needs marked.
-        divider:
-          selection.agentSlug === undefined
-            ? undefined
-            : `Switched to ${session.label}`,
-      }));
+      if (startErrorMessageId) {
+        updateSlotMessages(slotId, (msgs) =>
+          msgs.map((m) =>
+            m.id === startErrorMessageId
+              ? { ...m, retrying: true, retryTargetKey: selection.agentKey }
+              : m,
+          ),
+        );
+      }
+      try {
+        const { session } = await api.switchSession(key, {
+          agent_slug: selection.agentSlug,
+          agent_key: selection.agentKey,
+        });
+        // The outgoing brain's last words belong above the divider that
+        // retires it, not in a new bubble underneath it.
+        flushChunks();
+        applySwitch(slotId, (prev) => ({
+          info: {
+            ...prev,
+            agent_key: session.agent_key,
+            // A brain switch can move the server too: binding to an Agent
+            // that pins one overrides the chat's ambient choice, and
+            // unbinding hands it back. Both are read off the respawned
+            // session.
+            server_name: session.server_name || undefined,
+            server_pinned: session.server_pinned,
+            agent_slug: session.agent_slug,
+            label: session.label,
+          },
+          // Only a change of *who* divides the scrollback; a model swap
+          // under the same identity is not a handover the reader needs
+          // marked.
+          divider:
+            selection.agentSlug === undefined
+              ? undefined
+              : `Switched to ${session.label}`,
+        }));
+        if (startErrorMessageId) {
+          updateSlotMessages(slotId, (msgs) =>
+            msgs.map((m) =>
+              m.id === startErrorMessageId
+                ? {
+                    ...m,
+                    retrying: false,
+                    retryTargetKey: undefined,
+                    resolved: true,
+                    resolvedAgentKey: session.agent_key,
+                    resolvedAgentSlug: session.agent_slug,
+                  }
+                : m,
+            ),
+          );
+        }
+      } catch (e) {
+        if (startErrorMessageId) {
+          // Still a failure, now on the model just tried — the note falls
+          // back to its plain failure shape with this one's text and
+          // picker, exactly as if this had been the first attempt.
+          const message = e instanceof Error ? e.message : String(e);
+          updateSlotMessages(slotId, (msgs) =>
+            msgs.map((m) =>
+              m.id === startErrorMessageId
+                ? {
+                    ...m,
+                    text: message || "Could not switch",
+                    retrying: false,
+                    retryTargetKey: undefined,
+                    resolved: false,
+                    resolvedAgentKey: undefined,
+                    resolvedAgentSlug: undefined,
+                    attemptedAgentKey: selection.agentKey ?? m.attemptedAgentKey,
+                    attemptedAgentSlug: selection.agentSlug ?? m.attemptedAgentSlug,
+                  }
+                : m,
+            ),
+          );
+        }
+        throw e;
+      }
     },
-    [applySwitch, flushChunks, user],
+    [applySwitch, flushChunks, updateSlotMessages, user],
   );
 
   /**

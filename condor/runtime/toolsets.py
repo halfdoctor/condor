@@ -17,6 +17,9 @@ from typing import Any
 
 from condor.acp.client import bot_process_marker
 from condor.paths import local_agents_root, stock_agents_root
+from mcp_servers.condor.profiles import RENAMED_TOOLS, canonical_tool_name
+
+__all__ = ["RENAMED_TOOLS", "canonical_tool_name"]
 
 log = logging.getLogger(__name__)
 
@@ -90,9 +93,9 @@ def seat_profile(agent_slug: str | None, tick: bool) -> str:
     - ``agent`` — an attended specialist (a chat bound to an agent, a
       background copy of one). Keeps its domain tools: the LP experts name
       ``manage_amm``, the shared ``recover_orphaned_position`` playbook closes a
-      stranded position with ``manage_clmm``, and ``strategy_builder`` — shared,
+      stranded position with ``manage_clmm``, and ``loop_builder`` — shared,
       so every agent inherits it — has the agent author and launch its own
-      strategy. It loses only the operator surface no agent's tool list names.
+      loop. It loses only the operator surface no agent's tool list names.
     - ``full`` — the chat coordinator, where a human confirms every dangerous
       call, and any launch with no seat at all.
 
@@ -125,7 +128,7 @@ def seat_tools(agent_slug: str | None, tick: bool = False) -> list[dict[str, Any
 
     Names come from ``mcp_servers.*.profiles`` rather than from the servers
     themselves on purpose: importing either ``server.py`` parses argv and builds
-    a ``FastMCP`` singleton, neither of which a web request has any business
+    a ``MCPServer`` singleton, neither of which a web request has any business
     doing. ``server.py`` resolves the same names against its own functions at
     import, so a table that drifts fails there, loudly, and not here.
 
@@ -154,8 +157,13 @@ def seat_tools(agent_slug: str | None, tick: bool = False) -> list[dict[str, Any
     ]
 
 
-def _every_tool_name() -> set[str]:
-    """Every tool name any ring of either server can mount."""
+def every_tool_name() -> set[str]:
+    """Every tool name any ring of either server can mount.
+
+    Public because it is also the answer to "what tools does this install have
+    at all", which is what an agent bundle's ``requires.tools`` is resolved
+    against (FEAT-143).
+    """
     from mcp_servers.condor import profiles as condor_profiles
     from mcp_servers.hummingbot_api import profiles as hummingbot_profiles
 
@@ -180,7 +188,8 @@ def allowlist_mutes(agent_slug: str | None) -> set[str]:
 
     An empty list means unrestricted, as it always has; so does an unknown slug.
     Names may be namespaced (``mcp__condor__delegate``), the form pydantic-ai
-    also accepts, and match on their last segment.
+    also accepts, and match on their last segment. A renamed tool's old name
+    (:data:`RENAMED_TOOLS`) allows the tool it now means.
     """
     if not agent_slug:
         return set()
@@ -189,8 +198,8 @@ def allowlist_mutes(agent_slug: str | None) -> set[str]:
     agent = AgentStore().get(agent_slug)
     if agent is None or not agent.tools:
         return set()
-    allowed = {str(name).rsplit("__", 1)[-1] for name in agent.tools}
-    return _every_tool_name() - allowed
+    allowed = {canonical_tool_name(name).rsplit("__", 1)[-1] for name in agent.tools}
+    return every_tool_name() - allowed
 
 
 def seat_mutes(agent_slug: str | None) -> list[str]:
@@ -221,6 +230,27 @@ def _muted_tool_args(muted_tools: Sequence[str]) -> list[str]:
     return ["--mute-tools", ",".join(muted_tools)] if muted_tools else []
 
 
+def _execution_mode_args(execution_mode: str) -> list[str]:
+    """``--execution-mode dry_run`` — or nothing at all for a live seat.
+
+    The same shape as :func:`_muted_tool_args` and for the same reason: only a
+    mode the subprocess would actually *restrict* reaches argv, so every live
+    seat — chat, delegation, run-once, loop — spawns the line it always did and
+    this flag can never be blamed for one of them behaving differently.
+
+    Which modes restrict is ``danger.MOUNT_ENFORCED_MODES``, asked here rather
+    than hardcoded: the spawner and the subprocess have to agree on which modes
+    are enforced, and reading the same table is how they cannot drift. Passing
+    an unenforced mode would be harmless — the subprocess maps it to no policy —
+    but it would put a flag on the line for a run nothing changes about.
+    """
+    from condor.runtime.danger import MOUNT_ENFORCED_MODES
+
+    if execution_mode not in MOUNT_ENFORCED_MODES:
+        return []
+    return ["--execution-mode", execution_mode]
+
+
 def _condor_mcp_args(
     chat_id: int | str,
     user_id: int,
@@ -231,6 +261,7 @@ def _condor_mcp_args(
     profile: str = "full",
     session_key: str = "",
     muted_tools: Sequence[str] = (),
+    execution_mode: str = "",
 ) -> list[str]:
     """Build CLI args for the condor MCP subprocess.
 
@@ -278,6 +309,7 @@ def _condor_mcp_args(
         args.extend(["--session-key", str(session_key)])
     args.extend(["--profile", profile])
     args.extend(_muted_tool_args(muted_tools))
+    args.extend(_execution_mode_args(execution_mode))
     return args
 
 
@@ -286,6 +318,8 @@ def _hummingbot_mcp_args(
     server_name: str,
     profile: str = "full",
     muted_tools: Sequence[str] = (),
+    agent_slug: str | None = None,
+    caller_id: str = "",
 ) -> list[str]:
     """Build CLI args for the hummingbot MCP subprocess.
 
@@ -294,8 +328,20 @@ def _hummingbot_mcp_args(
     (SEC-095). Every element is a string: YAML loads unquoted numerics as int
     (e.g. ``port: 8000``), and pydantic-ai's StdioServerParameters rejects
     non-string args when starting LM Studio / other local-model sessions.
+
+    ``agent_slug`` and ``caller_id`` are who to attribute this subprocess's
+    calls to (FEAT-138): the agent that spends a host's budget, and the session
+    whose ``RefusalLog`` a venue refusal belongs in. Labels, not credentials —
+    the server stamps them on a counter and still reads no agent registry — so
+    argv is the right channel, and omitting them (a chat seat with no agent, a
+    delegation) honestly leaves the counter unattributed.
     """
     api_url = f"http://{server['host']}:{server['port']}"
+    attribution: list[str] = []
+    if agent_slug:
+        attribution += ["--agent-slug", str(agent_slug)]
+    if caller_id:
+        attribution += ["--caller-id", str(caller_id)]
     return (
         [
             "run",
@@ -309,6 +355,7 @@ def _hummingbot_mcp_args(
             "--profile",
             profile,
         ]
+        + attribution
         + _muted_tool_args(muted_tools)
         + _bot_id_args()
     )
@@ -324,6 +371,10 @@ def build_mcp_servers_for_session(
     ask_target: bool = False,
     tick: bool = False,
     session_key: str = "",
+    server_pinned: bool = False,
+    server_required: bool = False,
+    caller_id: str = "",
+    execution_mode: str = "",
 ) -> list[dict[str, Any]]:
     """Build dynamic MCP server configs for an agent session.
 
@@ -336,6 +387,14 @@ def build_mcp_servers_for_session(
     from the user's preferences, then from the first accessible server. Each
     candidate must exist *and* be reachable by ``user_id`` — a name this user
     has no grant on resolves to the next candidate, never to its credentials.
+
+    ``server_pinned`` says ``server_name`` was *chosen* for this run rather than
+    inherited, and ``server_required`` that the seat cannot run without a
+    server; both raise ``ServerUnavailable`` instead of degrading quietly. The
+    rule itself is ``config_manager.resolve_stored_server`` — shared with
+    ``TickEngine._resolve_server``, which used to open-code the same chain
+    (CORR-729). Neither flag set is the previous lenient behaviour, which is why
+    a chat whose user has no grants still gets a serverless session.
 
     ``agent_slug`` scopes the condor MCP tools' memory/skills to that Agent's
     own stores (``agents/{slug}/``). Without it the tools target the chat
@@ -353,6 +412,22 @@ def build_mcp_servers_for_session(
     ``tick`` marks the unattended loop seat, which mounts the narrowest tool
     profile on both subprocesses (FEAT-066). See :func:`seat_profile`.
 
+    ``execution_mode`` is what *kind* of run this is, and the one restriction
+    here that is a property of the run rather than of the agent: one tick engine
+    builds a rehearsal and a live loop from the same config and the same seat.
+    ``dry_run`` reaches the condor subprocess, which then refuses to execute a
+    snippet or a routine while still answering every read (CORR-748). Empty —
+    the default, and what every caller but the tick engine passes — restricts
+    nothing and puts nothing on the spawn line. See :func:`_execution_mode_args`
+    for why it is enforced in the subprocess and not at the permission callback.
+
+    ``caller_id`` is the session's own ``agent_id``, stamped onto the
+    hummingbot subprocess so a venue refusal it counts lands in *this*
+    session's ``RefusalLog`` rather than being folded across two concurrent
+    sessions of the same agent (FEAT-138). Only the tick engine has one; empty
+    everywhere else, which leaves those calls counted per agent and per venue
+    but attributed to no session.
+
     ``session_key`` is the chat seat's canonical key, and only a chat has one:
     an ask target, a delegate worker and a tick run for nobody's conversation and
     pass nothing, which is what keeps their provenance honestly empty. It is also
@@ -363,8 +438,7 @@ def build_mcp_servers_for_session(
     from config_manager import (
         ServerPermission,
         get_config_manager,
-        get_effective_server,
-        may_use_stored_server,
+        resolve_stored_server,
     )
 
     cm = get_config_manager()
@@ -383,20 +457,17 @@ def build_mcp_servers_for_session(
     # subprocess env below. ``chat_id`` is not a principal — ``chat_defaults``
     # is a global map keyed by chat, so a caller who can name someone else's
     # chat could name their server too (SEC-178, the SEC-164 shape). The subject
-    # is always ``user_id``, the authenticated owner of the run; the same
-    # predicate guards TickEngine._resolve_server.
-    def usable(name: str | None) -> bool:
-        return may_use_stored_server(cm, user_id, name)
-
-    def candidates():
-        # Lazy on purpose: resolving the chat default writes back into
-        # ``user_data``, so it must not run when a pin already answered.
-        yield server_name
-        yield get_effective_server(chat_id, user_data)
-        accessible = cm.get_accessible_servers(user_id)
-        yield accessible[0] if accessible else None
-
-    server_name = next((name for name in candidates() if usable(name)), None)
+    # is always ``user_id``, the authenticated owner of the run; the same rule
+    # resolves TickEngine._resolve_server.
+    server_name = resolve_stored_server(
+        cm,
+        user_id,
+        server_name,
+        pinned=server_pinned,
+        required=server_required,
+        chat_id=chat_id,
+        user_data=user_data,
+    )
 
     # The admin ring belongs to the server's owner (SEC-252). ``full`` is the
     # only profile that mounts ADMIN_TOOLS on mcp-hummingbot — configure_server
@@ -432,6 +503,7 @@ def build_mcp_servers_for_session(
             profile=profile,
             session_key=session_key,
             muted_tools=muted_tools,
+            execution_mode=execution_mode,
         ),
         # Both agent roots travel *resolved* rather than as whatever the parent
         # happened to have in its environment. A stdio MCP child gets the ``env``
@@ -447,6 +519,9 @@ def build_mcp_servers_for_session(
         ),
     }
 
+    # Only a seat that did not declare ``server_required`` reaches either of
+    # these: the resolver above raises for one that did, rather than handing
+    # back a trading agent with no trading tools (CORR-729).
     if not server_name:
         log.warning(
             "No accessible server for user %s (chat %s) — "
@@ -458,6 +533,14 @@ def build_mcp_servers_for_session(
 
     server = cm.get_server(server_name)
     if not server:
+        if server_required:
+            from config_manager import ServerUnavailable
+
+            raise ServerUnavailable(
+                f"server '{server_name}' resolved for user {user_id} but is not "
+                "in the servers config",
+                server_name,
+            )
         log.warning(
             "Server '%s' resolved for user %s but not found in servers config — "
             "agent will start without mcp-hummingbot",
@@ -470,13 +553,24 @@ def build_mcp_servers_for_session(
     # the command line, where any local `ps` recovered them (SEC-095). The
     # non-secret coordinates (url, server name) stay on argv, where they make a
     # running subprocess identifiable.
+    #
+    # The throttle log travels resolved, for the same reason the agent roots do
+    # above: a child that recomputed the default could land on a different path
+    # than its parent whenever the parent derived one from an override. Handing
+    # it over is also what keeps the counter out of ``condor`` — the MCP server
+    # imports nothing to find its log (FEAT-138).
+    from condor.agents.throttle import throttle_log_path
+
     mcp_hummingbot = {
         "name": "mcp-hummingbot",
         "command": "uv",
-        "args": _hummingbot_mcp_args(server, server_name, profile, muted_tools),
+        "args": _hummingbot_mcp_args(
+            server, server_name, profile, muted_tools, agent_slug, caller_id
+        ),
         "env": _env_entries(
             HUMMINGBOT_API_USERNAME=server["username"],
             HUMMINGBOT_API_PASSWORD=server["password"],
+            CONDOR_THROTTLE_LOG=str(throttle_log_path()),
         ),
     }
 

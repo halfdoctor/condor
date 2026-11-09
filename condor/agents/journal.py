@@ -4,9 +4,9 @@ Data is organized by strategy (a playbook owned by an Agent) and session::
 
     agents/
         {agent_slug}/
-            strategies/
+            loops/
                 {strategy_slug}/
-                    strategy.md        # strategy definition (tactic + config)
+                    loop.md            # loop definition (tactic + config)
                     config.yml         # runtime config
                     learnings.md       # cross-session learnings
                     dry_runs/          # experiment snapshots (experiment_N.md)
@@ -29,58 +29,55 @@ from pathlib import Path
 from typing import Any
 
 from condor.fsutil import atomic_write_text
+from condor.memory.paths import safe_slug
 from condor.paths import local_agents_root
+
+from .quote_render import format_quote
+from .volume_render import format_volume_usd
 
 log = logging.getLogger(__name__)
 
 MAX_LEARNINGS = 20
 
 
-def _strategy_base_dir(prefix: str) -> Path:
-    """Resolve the per-strategy base dir from an agent_id prefix.
-
-    New format prefixes are ``"{agent_slug}.{strategy_slug}"`` →
-    ``{agent_slug}/strategies/{strategy_slug}/``. Legacy flat prefixes (no dot)
-    fall back to ``{slug}/`` so old ids still resolve.
-
-    Always the **local** root (FEAT-115): a journal is what this install's run
-    produced, so there is no shipped layer to resolve against.
-    """
-    root = local_agents_root()
-    if "." in prefix:
-        agent_slug, sslug = prefix.split(".", 1)
-        return root / agent_slug / "strategies" / sslug
-    return root / prefix
-
-
 def resolve_agent_dirs(agent_id: str) -> tuple[Path | None, Path | None]:
     """Derive (session_dir, base_dir) from an agent_id.
 
     agent_id format: ``"{agent_slug}.{strategy_slug}_{N}"`` (session) or
-    ``"..._e{N}"`` (experiment). ``base_dir`` is the strategy folder that holds
-    ``sessions/`` and ``learnings.md``.
+    ``"..._e{N}"`` (experiment), parsed by ``sessions_index.parse_agent_id``.
+    ``base_dir`` is the strategy folder (``Strategy.home``) that holds the
+    sessions and ``learnings.md``; the session dir is the one on disk under
+    either session layout. Experiments are flat files, so they get
+    ``(None, base_dir)``.
 
-    Returns (None, None) if the path doesn't exist on disk.
+    Always the **local** root (FEAT-115): a journal is what this install's run
+    produced, so there is no shipped layer to resolve against.
+
+    Returns (None, None) for a malformed id, a strategy dir not on disk, or a
+    session not on disk (CORR-654): the MCP journal tools resolve a
+    model-supplied id here, and a mistyped or stale session number must not
+    materialise a phantom ``sessions/session_N`` through ``JournalManager``'s
+    mkdir. A live run's engine creates its session dir before any tick.
     """
-    last_sep = agent_id.rfind("_")
-    if last_sep == -1:
-        return None, None
-    prefix = agent_id[:last_sep]
-    num_part = agent_id[last_sep + 1 :]
+    # Function-local: sessions_index imports this module.
+    from condor.agents.sessions_index import (
+        find_session_dir,
+        parse_agent_id,
+        strategy_dir_for_run_key,
+    )
 
-    base_dir = _strategy_base_dir(prefix)
-    if not base_dir.is_dir():
+    parsed = parse_agent_id(agent_id)
+    if parsed is None:
         return None, None
-
-    # Experiments (e.g. "e3") are flat files, not directories
-    if num_part.startswith("e"):
+    run_key, num, kind = parsed
+    base_dir = strategy_dir_for_run_key(run_key)
+    if base_dir is None or not base_dir.is_dir():
+        return None, None
+    if kind == "experiment":
         return None, base_dir
-
-    try:
-        session_num = int(num_part)
-    except ValueError:
+    session_dir = find_session_dir(base_dir, num)
+    if session_dir is None or not session_dir.is_dir():
         return None, None
-    session_dir = base_dir / "sessions" / f"session_{session_num}"
     return session_dir, base_dir
 
 
@@ -116,6 +113,14 @@ ARCHIVE_NAME = "journal_archive.md"
 # _parse_snapshots / _count_ticks skip it instead of parsing it as data.
 ARCHIVE_MARKER_PREFIX = "- archived "
 
+#: The one value of the reading tri-state ([[CORR-725]]) whose figures are a
+#: reading. A snapshot line stamped ``empty`` or ``missing`` carries the same
+#: ``$0.00`` as a flat book without being one, so every reader of the figures
+#: subtracts those lines (:meth:`JournalManager._reading_snapshots`). Absent
+#: from a line means ``ok``: that is what every snapshot written before the
+#: stamp existed is, and the only state the figures were ever usable in.
+READING_OK = "ok"
+
 JOURNAL_TEMPLATE = """\
 # Journal - {agent_id}
 
@@ -125,8 +130,6 @@ No ticks yet.
 ## Decisions
 
 ## Ticks
-
-## Executors
 
 ## Snapshots
 """
@@ -147,8 +150,12 @@ LEARNING_CATEGORIES = {
 }
 DEFAULT_LEARNING_CATEGORY = "market"
 
-SNAPSHOT_TEMPLATE = """\
-# Snapshot #{tick} — {timestamp}
+# One body for both snapshot writers (tick snapshots and dry-run experiments);
+# only the header differs. The title line inside ``{header}`` is parsed by
+# sessions_index, and the dashboard reads sections by their ``##`` headings
+# (frontend/src/lib/parse-agent.ts), so neither may change shape.
+_SNAPSHOT_BODY = """\
+{header}
 
 <details><summary>System Prompt ({prompt_len} chars)</summary>
 
@@ -173,24 +180,164 @@ SNAPSHOT_TEMPLATE = """\
 Duration: {duration:.1f}s
 """
 
+# Cap on a tool call's output in a snapshot.
+SNAPSHOT_TOOL_OUTPUT_CHARS = 2000
+
+
+def render_risk_lines(risk_state: dict[str, Any], bullet: str = "- ") -> list[str]:
+    """The risk block, one line per limit, shared by the tick prompt and snapshots.
+
+    Every value keeps a ``.get`` default: a failed dry run records
+    ``risk_state={}`` and must still render.
+    """
+    rs = risk_state
+    # What the gate's figures are actually denominated in (LP-2), shared with
+    # the gate's own refusals so the two cannot disagree about a limit they are
+    # both describing (``condor.agents.quote_render``).
+    unit = rs.get("quote_asset") or ""
+
+    def _amount(value: float) -> str:
+        return format_quote(value, unit)
+
+    max_dd = rs.get("max_drawdown_pct", -1)
+    if max_dd < 0:
+        dd_display = "disabled"
+    elif not rs.get("drawdown_known", True):
+        # A tick can now RUN with no drawdown on record: before its first
+        # deploy there is nothing to have fallen from, and a tick whose own
+        # providers answered is not flying blind even though the journal has
+        # not been written yet ([[CORR-750]]). Both used to block, so the
+        # "BLOCKED" line said as much; now the figure has to say it itself, or
+        # the agent reads a measured 0.0% and plans against a floor nobody has
+        # measured.
+        dd_display = f"not measured yet (no reading on record) / {max_dd:.1f}% limit"
+    else:
+        dd_display = f"{rs.get('drawdown_pct', 0):.1f}% / {max_dd:.1f}% limit"
+    lines = [
+        f"Position Size: {_amount(rs.get('total_exposure', 0))} / "
+        f"{_amount(rs.get('max_position_size', 500))} limit",
+        f"Open Executors: {rs.get('executor_count', 0)} / {rs.get('max_open_executors', 5)} limit",
+        f"Drawdown: {dd_display}",
+    ]
+    # Only when one is set: a leverage limit is off by default ([[SEC-558]]),
+    # and a line reading "disabled" invites the agent to go looking for the
+    # ceiling. When it IS set, it has to be here — a limit the agent is not
+    # told about is a limit it will trip, and every create it makes on a perp
+    # has to declare a leverage at or under it.
+    max_leverage = rs.get("max_leverage", -1)
+    if max_leverage >= 0:
+        lines.append(
+            f"Max Leverage: {max_leverage:g}x "
+            "(declare `leverage` on every create; omitting it is refused)"
+        )
+    # A limit the agent is NOT told about is a limit it will trip; a limit it is
+    # wrongly told it has is one it will rely on. ``min_wallet_sol_reserve`` and
+    # ``max_open_slots`` sat in lp_slot_operator's risk_limits bounding nothing,
+    # and the loop planned its slots around them (LP-3). Named here, in the same
+    # block as the real limits, because that is where the agent looks.
+    unrecognized = rs.get("unrecognized_limits") or []
+    if unrecognized:
+        lines.append(
+            f"NOT ENFORCED: {', '.join(unrecognized)} — set in this strategy's "
+            "risk_limits but unknown to the risk engine, so they bound nothing. "
+            "Do not plan around them."
+        )
+    # "Risk Check", not "Status": a snapshot outlives its session, and a stopped
+    # run's history reading "Status: ACTIVE" looked like the run was still live.
+    # This is the risk gate's verdict for this one tick, nothing more.
+    lines.append(
+        f"Risk Check: {'BLOCKED - ' + rs.get('block_reason', '') if rs.get('is_blocked') else 'passed'}"
+    )
+    return [bullet + line for line in lines]
+
+
+def render_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
+    """Markdown for a tick's folded tool calls, as every snapshot records them.
+
+    Inputs pass through the shared ``conversations._redact`` first: snapshots
+    are readable by any dashboard user and any journal seat, and a tick can
+    hand a routine a ``password``/``api_key`` config field. Redacting here is
+    the single choke point for every snapshot writer.
+    """
+    from condor.runtime.conversations import _redact
+
+    parts: list[str] = []
+    for i, tc in enumerate(tool_calls, 1):
+        tc_name = tc.get("name", tc.get("title", "unknown"))
+        tc_status = tc.get("status", "")
+        parts.append(f"### {i}. {tc_name} ({tc_status})")
+        if tc.get("input"):
+            tc_input = _redact(tc["input"])
+            input_str = (
+                json.dumps(tc_input, indent=2)
+                if isinstance(tc_input, dict)
+                else str(tc_input)
+            )
+            parts.append(f"**Input:**\n```json\n{input_str}\n```")
+        if tc.get("output"):
+            output_str = str(tc["output"])[:SNAPSHOT_TOOL_OUTPUT_CHARS]
+            parts.append(f"**Output:**\n```\n{output_str}\n```")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def render_snapshot(
+    header: str,
+    system_prompt: str,
+    response_text: str,
+    tool_calls: list[dict[str, Any]],
+    executors_data: str,
+    risk_state: dict[str, Any],
+    duration: float,
+) -> str:
+    """The full text of a snapshot file: ``header`` then the shared body."""
+    return _SNAPSHOT_BODY.format(
+        header=header,
+        prompt_len=len(system_prompt),
+        system_prompt=system_prompt,
+        executors_data=executors_data or "No executors.",
+        risk_state="\n".join(render_risk_lines(risk_state)),
+        response_text=response_text or "No response.",
+        tool_count=len(tool_calls),
+        tool_calls=render_tool_calls(tool_calls) or "No tool calls.",
+        duration=duration,
+    )
+
+
+# Session directory names, current first. A strategy that ran before the rename
+# can hold both, and the current name wins when both hold the same number.
+SESSION_DIRNAMES = ("sessions", "trading_sessions")
+
+
+def iter_session_dirs(strategy_dir: Path) -> list[tuple[int, Path]]:
+    """Every ``session_N`` directory of a strategy, as ``(N, dir)`` ascending by N.
+
+    The one walk over the session layout: each dirname of ``SESSION_DIRNAMES``
+    in order, the first one holding a number keeps it, and anything that is not
+    a directory named ``session_<int>`` is skipped. Counting, listing, settling
+    and numbering the next session all read this, so they cannot disagree about
+    which sessions exist.
+    """
+    found: dict[int, Path] = {}
+    for dirname in SESSION_DIRNAMES:
+        try:
+            children = list((strategy_dir / dirname).iterdir())
+        except OSError:  # absent, or not a directory
+            continue
+        for child in children:
+            if not child.name.startswith("session_") or not child.is_dir():
+                continue
+            try:
+                num = int(child.name.split("_", 1)[1])
+            except ValueError:
+                continue
+            found.setdefault(num, child)
+    return sorted(found.items())
+
 
 def next_session_number(agent_dir: Path) -> int:
-    """Determine the next session number by scanning existing session_* dirs."""
-    # Check new location first
-    sessions_dir = agent_dir / "sessions"
-    if not sessions_dir.exists():
-        # Check legacy location
-        legacy_dir = agent_dir / "trading_sessions"
-        if legacy_dir.exists():
-            sessions_dir = legacy_dir
-        else:
-            return 1
-    existing = [
-        int(d.name.split("_", 1)[1])
-        for d in sessions_dir.iterdir()
-        if d.is_dir() and d.name.startswith("session_")
-    ]
-    return max(existing, default=0) + 1
+    """One past the highest session number in any session directory."""
+    return max((num for num, _ in iter_session_dirs(agent_dir)), default=0) + 1
 
 
 def next_experiment_number(agent_dir: Path) -> int:
@@ -248,35 +395,6 @@ def count_journal_ticks(journal_path: Path) -> int:
     return highest_tick_number(journal_path.read_text(errors="replace"))
 
 
-EXPERIMENT_TEMPLATE = """\
-# Experiment #{num} — {timestamp}
-Mode: {execution_mode}
-Model: {agent_key}
-
-<details><summary>System Prompt ({prompt_len} chars)</summary>
-
-{system_prompt}
-
-</details>
-
-## Executor State
-{executors_data}
-
-## Risk State
-{risk_state}
-
-## Agent Response
-{response_text}
-
-## Tool Calls ({tool_count})
-
-{tool_calls}
-
-## Stats
-Duration: {duration:.1f}s
-"""
-
-
 def save_experiment_snapshot(
     agent_dir: Path,
     experiment_num: int,
@@ -294,52 +412,18 @@ def save_experiment_snapshot(
     experiments_dir = agent_dir / "dry_runs"
     experiments_dir.mkdir(parents=True, exist_ok=True)
 
-    # Format risk state
-    max_dd = risk_state.get("max_drawdown_pct", -1)
-    dd_display = (
-        f"{risk_state.get('drawdown_pct', 0):.1f}% / {max_dd:.1f}% limit"
-        if max_dd >= 0
-        else "disabled"
+    header = (
+        f"# Experiment #{experiment_num} — {timestamp}\n"
+        f"Mode: {execution_mode}\n"
+        f"Model: {agent_key or 'unknown'}"
     )
-    risk_lines = [
-        f"- Position Size: ${risk_state.get('total_exposure', 0):.2f} / ${risk_state.get('max_position_size', 500):.2f} limit",
-        f"- Open Executors: {risk_state.get('executor_count', 0)} / {risk_state.get('max_open_executors', 5)} limit",
-        f"- Drawdown: {dd_display}",
-        f"- Status: {'BLOCKED - ' + risk_state.get('block_reason', '') if risk_state.get('is_blocked') else 'ACTIVE'}",
-    ]
-
-    # Format tool calls
-    import json
-
-    tool_parts = []
-    for i, tc in enumerate(tool_calls, 1):
-        tc_name = tc.get("name", tc.get("title", "unknown"))
-        tc_status = tc.get("status", "")
-        tool_parts.append(f"### {i}. {tc_name} ({tc_status})")
-        if tc.get("input"):
-            input_str = (
-                json.dumps(tc["input"], indent=2)
-                if isinstance(tc["input"], dict)
-                else str(tc["input"])
-            )
-            tool_parts.append(f"**Input:**\n```json\n{input_str}\n```")
-        if tc.get("output"):
-            output_str = str(tc["output"])[:2000]
-            tool_parts.append(f"**Output:**\n```\n{output_str}\n```")
-        tool_parts.append("")
-
-    content = EXPERIMENT_TEMPLATE.format(
-        num=experiment_num,
-        timestamp=timestamp,
-        execution_mode=execution_mode,
-        agent_key=agent_key or "unknown",
-        prompt_len=len(system_prompt),
+    content = render_snapshot(
+        header,
         system_prompt=system_prompt,
-        executors_data=executors_data or "No executors.",
-        risk_state="\n".join(risk_lines),
-        response_text=response_text or "No response.",
-        tool_count=len(tool_calls),
-        tool_calls="\n".join(tool_parts) or "No tool calls.",
+        response_text=response_text,
+        tool_calls=tool_calls,
+        executors_data=executors_data,
+        risk_state=risk_state,
         duration=duration,
     )
 
@@ -369,8 +453,12 @@ class JournalManager:
         else:
             # Try to resolve from agent_id before falling back
             resolved_session, resolved_agent = resolve_agent_dirs(agent_id)
+            # The fallback joins the raw id, so it must be one segment
+            # (SEC-678): raises UnsafeIdError, a ValueError, before any mkdir.
             self._session_dir = (
-                resolved_session if resolved_session else local_agents_root() / agent_id
+                resolved_session
+                if resolved_session
+                else local_agents_root() / safe_slug(agent_id)
             )
             if not agent_dir and resolved_agent:
                 agent_dir = resolved_agent
@@ -665,48 +753,13 @@ class JournalManager:
         """Write a full snapshot capturing everything."""
         self._snapshots_dir.mkdir(parents=True, exist_ok=True)
 
-        # Format risk state
-        max_dd = risk_state.get("max_drawdown_pct", -1)
-        dd_display = (
-            f"{risk_state.get('drawdown_pct', 0):.1f}% / {max_dd:.1f}% limit"
-            if max_dd >= 0
-            else "disabled"
-        )
-        risk_lines = [
-            f"- Position Size: ${risk_state.get('total_exposure', 0):.2f} / ${risk_state.get('max_position_size', 500):.2f} limit",
-            f"- Open Executors: {risk_state.get('executor_count', 0)} / {risk_state.get('max_open_executors', 5)} limit",
-            f"- Drawdown: {dd_display}",
-            f"- Status: {'BLOCKED - ' + risk_state.get('block_reason', '') if risk_state.get('is_blocked') else 'ACTIVE'}",
-        ]
-
-        # Format tool calls
-        tool_parts = []
-        for i, tc in enumerate(tool_calls, 1):
-            tc_name = tc.get("name", tc.get("title", "unknown"))
-            tc_status = tc.get("status", "")
-            tool_parts.append(f"### {i}. {tc_name} ({tc_status})")
-            if tc.get("input"):
-                input_str = (
-                    json.dumps(tc["input"], indent=2)
-                    if isinstance(tc["input"], dict)
-                    else str(tc["input"])
-                )
-                tool_parts.append(f"**Input:**\n```json\n{input_str}\n```")
-            if tc.get("output"):
-                output_str = str(tc["output"])[:2000]
-                tool_parts.append(f"**Output:**\n```\n{output_str}\n```")
-            tool_parts.append("")
-
-        content = SNAPSHOT_TEMPLATE.format(
-            tick=tick,
-            timestamp=timestamp,
-            prompt_len=len(system_prompt),
+        content = render_snapshot(
+            f"# Snapshot #{tick} — {timestamp}",
             system_prompt=system_prompt,
-            executors_data=executors_data or "No executors.",
-            risk_state="\n".join(risk_lines),
-            response_text=response_text or "No response.",
-            tool_count=len(tool_calls),
-            tool_calls="\n".join(tool_parts) or "No tool calls.",
+            response_text=response_text,
+            tool_calls=tool_calls,
+            executors_data=executors_data,
+            risk_state=risk_state,
             duration=duration,
         )
 
@@ -769,12 +822,22 @@ class JournalManager:
         return "\n".join(lines[-count:])
 
     def _cleanup_old_snapshots(self) -> None:
-        """Remove oldest snapshots if over MAX_SNAPSHOTS."""
+        """Remove the lowest-tick snapshots if over MAX_SNAPSHOTS.
+
+        Ordered by the parsed tick, not the filename: ``snapshot_{tick}.md`` is
+        unpadded, so a lexicographic sort puts ``snapshot_100`` before
+        ``snapshot_2`` and would unlink the newest ticks. Names that are not
+        ``snapshot_<int>.md`` are neither counted nor removed.
+        """
         if not self._snapshots_dir.exists():
             return
-        files = sorted(self._snapshots_dir.glob("snapshot_*.md"))
-        if len(files) > MAX_SNAPSHOTS:
-            for f in files[: len(files) - MAX_SNAPSHOTS]:
+        ticked = sorted(
+            (int(m.group(1)), f)
+            for f in self._snapshots_dir.glob("snapshot_*.md")
+            if (m := re.match(r"snapshot_(\d+)\.md", f.name))
+        )
+        if len(ticked) > MAX_SNAPSHOTS:
+            for _, f in ticked[: len(ticked) - MAX_SNAPSHOTS]:
                 f.unlink()
 
     # ------------------------------------------------------------------
@@ -898,42 +961,6 @@ class JournalManager:
         return self._tick_count
 
     # ------------------------------------------------------------------
-    # Executor tracking
-    # ------------------------------------------------------------------
-
-    def track_executor(self, executor_id: str, ex_type: str, config: dict) -> None:
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-        connector = config.get("connector_name", "")
-        pair = config.get("trading_pair", "")
-        side = config.get("side", "")
-        amount = config.get("total_amount_quote", 0) or config.get("amount", 0) or 0
-        entry = (
-            f"- executor={executor_id} | type={ex_type} | {connector} {pair} {side} "
-            f"| amount=${float(amount):.2f} | created={now} | status=open | pnl=0 | volume=0"
-        )
-        self._append_to_section("Executors", entry)
-
-    def update_executor(
-        self, executor_id: str, pnl: float, volume: float, stopped: bool = False
-    ) -> None:
-        text = self.read_full()
-        pattern = rf"(- executor={re.escape(executor_id)} \|.*)"
-        m = re.search(pattern, text)
-        if not m:
-            return
-
-        old_line = m.group(1)
-        new_line = re.sub(r"pnl=[^ |]*", f"pnl={pnl:.2f}", old_line)
-        new_line = re.sub(r"volume=[^ |]*", f"volume={volume:.2f}", new_line)
-        if stopped:
-            new_line = re.sub(r"status=\w+", "status=closed", new_line)
-            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-            new_line += f" | stopped={now}"
-
-        text = text.replace(old_line, new_line)
-        self._write_journal(text)
-
-    # ------------------------------------------------------------------
     # Metric snapshots (inline in journal)
     # ------------------------------------------------------------------
 
@@ -943,36 +970,38 @@ class JournalManager:
         total_volume: float,
         open_count: int,
         position_size: float,
+        reading: str = "ok",
     ) -> None:
+        """Write this tick's figures, stamped with whether they are a reading.
+
+        ``reading`` is the tri-state the figures arrived with
+        (``ok``/``empty``/``missing``, [[CORR-725]]). Anything other than
+        ``ok`` is written onto the line, because the three produce the same
+        ``$0.00`` here and a reader cannot tell them apart afterwards: the
+        drawdown guard saw a zero snapshot, took it for a flat book, and
+        reported ``known=True`` at 0.0% — the exact confusion the tri-state
+        exists to end, re-entered through the journal
+        (:meth:`get_drawdown_pct_checked` subtracts these lines again).
+        """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        # A negative volume is not a reading, so it is written as a flagged data
+        # error rather than as a figure ([[CORR-731]]). The flag deliberately
+        # carries no ``$``, which is what keeps ``_parse_snapshot_line`` from
+        # reading it back as a number.
+        volume = format_volume_usd(total_volume, source="journal snapshot")
         entry = (
-            f"- {now} | pnl=${total_pnl:+.2f} | volume=${total_volume:,.0f} "
+            f"- {now} | pnl=${total_pnl:+.2f} | volume={volume} "
             f"| open={open_count} | exposure=${position_size:.2f}"
         )
+        # Only when it is not a reading, so the overwhelmingly common line is
+        # unchanged and every snapshot ever written still parses as ``ok``.
+        if reading and reading != READING_OK:
+            entry += f" | reading={reading}"
         self._append_bounded("Snapshots", entry, MAX_SNAPSHOT_LINES)
 
     # ------------------------------------------------------------------
     # Queries (used by RiskEngine)
     # ------------------------------------------------------------------
-
-    def _parse_executors(self) -> list[dict]:
-        self.read_full()  # refresh parsed cache if the file changed
-        cached = self._parsed_cache.get("executors")
-        if cached is not None:
-            return cached
-        section = self._get_section("Executors")
-        results = []
-        for line in section.splitlines():
-            if not line.startswith("- executor="):
-                continue
-            entry: dict[str, Any] = {}
-            for part in line[2:].split(" | "):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    entry[k.strip()] = v.strip()
-            results.append(entry)
-        self._parsed_cache["executors"] = results
-        return results
 
     def _parse_snapshots(self) -> list[dict]:
         self.read_full()  # refresh parsed cache if the file changed
@@ -988,36 +1017,51 @@ class JournalManager:
         self._parsed_cache["snapshots"] = results
         return results
 
-    def get_daily_pnl(self) -> float:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        total = 0.0
-        for ex in self._parse_executors():
-            created = ex.get("created", "")
-            if created.startswith(today):
-                try:
-                    total += float(ex.get("pnl", 0))
-                except (ValueError, TypeError):
-                    pass
-        return total
+    def _reading_snapshots(self) -> list[dict]:
+        """The snapshots that are *readings* — the only ones a figure may use.
 
-    def get_total_exposure(self) -> float:
-        total = 0.0
-        for ex in self._parse_executors():
-            if ex.get("status") == "open":
-                amount_str = ex.get("amount", "$0").lstrip("$")
-                try:
-                    total += float(amount_str)
-                except (ValueError, TypeError):
-                    pass
-        return total
-
-    def get_open_executor_count(self) -> int:
-        return sum(1 for ex in self._parse_executors() if ex.get("status") == "open")
+        A tick whose performance read came back ``empty`` or ``missing`` still
+        writes its line, so the journal records that the tick happened; its
+        ``$0.00`` is the absence of a reading rather than a flat book, and
+        every consumer that would otherwise take it for one subtracts it here
+        ([[CORR-725]]).
+        """
+        return [
+            s
+            for s in self._parse_snapshots()
+            if str(s.get("reading", READING_OK)) == READING_OK
+        ]
 
     def get_drawdown_pct(self) -> float:
-        snapshots = self._parse_snapshots()
+        return self.get_drawdown_pct_checked()[0]
+
+    def get_drawdown_pct_checked(self) -> tuple[float, bool]:
+        """The drawdown, and whether it is a reading at all.
+
+        ``known`` is False when the journal holds no snapshot even though the
+        session has already ticked. 0.0 is then the *absence* of a reading, not
+        a flat book, and a guard handed it is handed the one drawdown that
+        clears every limit ([[CORR-725]]) -- "no reading" is unknown, not zero.
+
+        Before the first tick there is nothing to have fallen from, so an empty
+        Snapshots section is the real answer and ``known`` stays True: a session
+        blocked on its own missing history could never take the tick that writes
+        the first snapshot.
+
+        A session that is genuinely flat has snapshots and reports ``True`` with
+        0.0 -- quiet and dead are told apart by whether anything was read, never
+        by the number.
+
+        Snapshots written for a tick that obtained no reading do not count as
+        snapshots here. They carry the same ``$0.00`` as a flat book, and a
+        zero *exposure* clears the drawdown outright (the division below is
+        skipped and 0.0 returned as known) -- so a strategy whose performance
+        reads had stopped answering read as one sitting safely at zero, which
+        is this function's own failure mode reached by another route.
+        """
+        snapshots = self._reading_snapshots()
         if not snapshots:
-            return 0.0
+            return 0.0, self.tick_count == 0
         pnls = [s.get("pnl", 0) for s in snapshots]
         current = pnls[-1]
         archived_peak = self._archived_peak_pnl()
@@ -1026,11 +1070,11 @@ class JournalManager:
         peak = max(pnls)
         drawdown = peak - current
         if drawdown <= 0:
-            return 0.0
+            return 0.0, True
         exposure = snapshots[-1].get("exposure", 0.0)
         if exposure <= 0:
-            return 0.0
-        return drawdown / exposure * 100
+            return 0.0, True
+        return drawdown / exposure * 100, True
 
     def get_pnl_series(self) -> list[dict]:
         """PnL points still held in journal.md (at most MAX_SNAPSHOT_LINES).
@@ -1038,14 +1082,19 @@ class JournalManager:
         Older points are in ``journal_archive.md``; this is the equity-curve
         fallback used when the bot's own series is empty, so a bounded tail is
         what it needs -- it must not re-read the whole history every tick.
+
+        Readings only, like the drawdown: a tick that read nothing would
+        otherwise draw the curve down to zero and back.
         """
         return [
             {"timestamp": s.get("timestamp", ""), "pnl": s.get("pnl", 0)}
-            for s in self._parse_snapshots()
+            for s in self._reading_snapshots()
         ]
 
     def get_total_volume(self) -> float:
-        snapshots = self._parse_snapshots()
+        # The last line that was a reading: an unread tick's ``$0`` is not a
+        # fleet that stopped trading.
+        snapshots = self._reading_snapshots()
         if not snapshots:
             return 0.0
         return snapshots[-1].get("volume", 0.0)
@@ -1054,10 +1103,7 @@ class JournalManager:
         """Overall summary for display."""
         return {
             "total_ticks": self._tick_count,
-            "daily_pnl": self.get_daily_pnl(),
             "total_volume": self.get_total_volume(),
-            "total_exposure": self.get_total_exposure(),
-            "open_executors": self.get_open_executor_count(),
             "drawdown_pct": self.get_drawdown_pct(),
         }
 
@@ -1154,22 +1200,6 @@ class JournalManager:
             return float(m.group(1)) if m else None
         return None
 
-    def _append_to_section(self, section: str, entry: str) -> None:
-        """Append a line to a section."""
-        text = self.read_full()
-        marker = f"## {section}\n"
-        idx = text.find(marker)
-        if idx == -1:
-            text += f"\n{marker}{entry}\n"
-        else:
-            insert_at = idx + len(marker)
-            next_section = text.find("\n## ", insert_at)
-            if next_section == -1:
-                text += entry + "\n"
-            else:
-                text = text[:next_section] + entry + "\n" + text[next_section:]
-        self._write_journal(text)
-
     # ------------------------------------------------------------------
     # Info
     # ------------------------------------------------------------------
@@ -1188,16 +1218,28 @@ def _parse_snapshot_line(line: str) -> dict[str, Any]:
     entry: dict[str, Any] = {}
     for part in line[2:].split(" | "):
         part = part.strip()
-        if part.startswith("pnl=$"):
-            entry["pnl"] = float(part.replace("pnl=$", "").replace("+", ""))
-        elif part.startswith("volume=$"):
-            entry["volume"] = float(part.replace("volume=$", "").replace(",", ""))
-        elif part.startswith("exposure=$"):
-            entry["exposure"] = float(part.replace("exposure=$", ""))
-        elif part.startswith("open="):
-            entry["open"] = int(part.replace("open=", ""))
-        elif re.match(r"\d{4}-\d{2}-\d{2}", part):
-            entry["timestamp"] = part
+        try:
+            if part.startswith("pnl=$"):
+                entry["pnl"] = float(part.replace("pnl=$", "").replace("+", ""))
+            elif part.startswith("volume=$"):
+                entry["volume"] = float(part.replace("volume=$", "").replace(",", ""))
+            elif part.startswith("exposure=$"):
+                entry["exposure"] = float(part.replace("exposure=$", ""))
+            elif part.startswith("open="):
+                entry["open"] = int(part.replace("open=", ""))
+            elif part.startswith("reading="):
+                # Absent on every line written for a real reading, which is
+                # why the default below is ``ok`` rather than "unknown".
+                entry["reading"] = part.replace("reading=", "").strip()
+            elif re.match(r"\d{4}-\d{2}-\d{2}", part):
+                entry["timestamp"] = part
+        except ValueError:
+            # A field written as a flagged data error, or a hand-edited line.
+            # The key stays absent, which readers already treat as "not here";
+            # raising would take every snapshot with it, and with them the
+            # drawdown guard ([[CORR-731]]).
+            log.debug("snapshot field is not a number: %r", part)
+            continue
     return entry
 
 

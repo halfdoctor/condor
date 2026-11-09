@@ -1,8 +1,31 @@
 """Risk engine -- pre-tick validation and guardrails.
 
-Enforces position limits, daily loss caps, drawdown limits, executor counts,
-and LLM cost caps.  Also provides a permission callback that auto-approves
-safe tool calls and blocks dangerous ones that violate risk limits.
+``RiskLimits`` carries six limits (the last four are disabled at -1):
+
+- ``max_position_size_quote`` -- the quote a create, bot deploy/update or
+  signing DEX call may put at stake;
+- ``max_open_executors`` -- how many executors may be open before a create;
+- ``max_drawdown_pct`` -- soft drawdown: breaching it pauses the tick;
+- ``shutdown_drawdown_pct`` -- hard drawdown: breaching it winds the session
+  down (see :mod:`condor.agents.shutdown`);
+- ``max_drift_quote`` -- book drift against the venue beyond which the book is
+  untrusted and new exposure is refused;
+- ``max_leverage`` -- the most leverage a create may ask for or an account may
+  be set to.
+
+``RiskEngine.get_state`` applies the two drawdown limits before a tick (the
+engine pauses or shuts down on its verdict), and the engine's venue check marks
+the book untrusted on drift; ``check_executor_action``, ``check_bot_action``,
+``check_dex_action`` and ``check_leverage_action`` apply the rest, and the book
+verdict, to individual tool calls.
+
+``auto_approve_with_risk_check`` builds the permission callback that runs those
+checks, auto-approves safe calls, and adds refusals of its own: an executor
+create must carry this session's ``controller_id``, ``stop_executor`` may only
+stop this session's executors, ``manage_bots`` mutations stay inside the bot
+ledger's namespace, dry-run mode refuses every mutation, shutdown mode lets
+only the brakes through, and ``place_order`` and a raw controller-code upsert
+(``manage_controllers`` ``target="controller"``, SEC-713) are always refused.
 """
 
 from __future__ import annotations
@@ -13,7 +36,9 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from condor.agents.quote_render import format_quote
 from condor.runtime.danger import (
+    AGENTS_TOOL,
     CREATE_EXECUTOR_TOOLS,
     DANGEROUS_AMM_ACTIONS,
     DANGEROUS_BOT_ACTIONS,
@@ -22,6 +47,8 @@ from condor.runtime.danger import (
     LEVERAGED_EXECUTOR_TOOLS,
     dry_run_refusal,
     is_dangerous_tool_call,
+    raw_controller_code_refusal,
+    shutdown_refusal,
     tool_call_input,
     tool_call_name,
 )
@@ -55,10 +82,42 @@ class RiskLimits:
     # upgrade. Deliberately NOT 1: a strategy whose owner approved a 5x default
     # at setup would otherwise stop trading the moment this shipped.
     max_leverage: float = -1.0
+    #: Keys the config asked for that this build has no limit for ([[LP-3]]).
+    #: Not a limit itself — it bounds nothing and is never read by a check. It
+    #: exists so that what was asked for and cannot be honoured is *sayable*,
+    #: which is the whole of the defect: ``from_dict`` used to drop an
+    #: unrecognised key on the floor, so ``min_wallet_sol_reserve: 0.3`` in a
+    #: loop's ``risk_limits`` read to its author as a configured reserve and to
+    #: the runtime as nothing at all. Populated by :meth:`from_dict`; surfaced
+    #: by ``RiskState.to_dict`` and the log line at engine start.
+    unrecognized: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> RiskLimits:
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        """Build the limits, keeping what could not be understood (LP-3).
+
+        Unknown keys are *recorded*, not raised on and not dropped. Raising
+        would be the louder answer and the wrong one: ``lp_slot_operator``
+        ships ``min_wallet_sol_reserve`` and ``max_open_slots`` in its
+        ``risk_limits`` today, and a build that refused them would stop a
+        shipped agent from starting at all — turning a limit that silently does
+        nothing into a loop that does nothing, which is worse. Dropping them is
+        what made the setting a no-op nobody could see.
+
+        So they ride along, visibly unenforced, until each is either implemented
+        as a real limit or moved to the strategy config the loop reads itself.
+        A typo (``max_postion_size_quote``) lands here too, and shows up in the
+        same place rather than passing for a limit that was set.
+        """
+        known, unknown = {}, {}
+        for key, value in d.items():
+            # ``unrecognized`` is a field but never a *setting*: accepting it
+            # from config would let a config describe its own leftovers.
+            if key in cls.__dataclass_fields__ and key != "unrecognized":
+                known[key] = value
+            else:
+                unknown[key] = value
+        return cls(**known, unrecognized=unknown)
 
 
 @dataclass
@@ -79,6 +138,23 @@ class RiskState:
     book_trusted: bool = True
     drift_quote: float | None = None  # None = nothing priced, never 0.0
     drift_reason: str = ""
+    # Whether ``drawdown_pct`` is a reading at all ([[CORR-725]]). False when
+    # the tracker reports it has nothing on record: 0.0 is then absence, not a
+    # flat book, and it is treated like a tracker that raised rather than
+    # compared against the limits.
+    drawdown_known: bool = True
+    # The limits these metrics are judged against, carried so ``to_dict`` can
+    # show them to the agent. A bare ``RiskState()`` reports ``RiskLimits``'
+    # own defaults; ``RiskEngine.get_state`` passes the engine's limits.
+    limits: RiskLimits = field(default_factory=RiskLimits)
+    #: The token every figure here is denominated in ([[LP-2]]). The gate's
+    #: limits have always been "quote", and quote is whatever the strategy
+    #: trades against -- SOL for the LP operator. Rendering them with a "$" was
+    #: therefore wrong wherever that is not a dollar: a 500 SOL ceiling was
+    #: shown to operators as ``$500``, three orders of magnitude out. Empty
+    #: keeps the dollar rendering, which is right for the CEX strategies that
+    #: quote in USDT and is what every caller that does not set this gets.
+    quote_asset: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,27 +168,21 @@ class RiskState:
             "book_trusted": self.book_trusted,
             "drift_quote": self.drift_quote,
             "drift_reason": self.drift_reason,
+            "drawdown_known": self.drawdown_known,
             # Include limits for prompt display
-            "max_position_size": (
-                self._limits.max_position_size_quote
-                if hasattr(self, "_limits")
-                else 500
-            ),
-            "max_open_executors": (
-                self._limits.max_open_executors if hasattr(self, "_limits") else 5
-            ),
-            "max_drawdown_pct": (
-                self._limits.max_drawdown_pct if hasattr(self, "_limits") else -1
-            ),
-            "shutdown_drawdown_pct": (
-                self._limits.shutdown_drawdown_pct if hasattr(self, "_limits") else -1
-            ),
-            "max_drift_quote": (
-                self._limits.max_drift_quote if hasattr(self, "_limits") else -1
-            ),
-            "max_leverage": (
-                self._limits.max_leverage if hasattr(self, "_limits") else -1
-            ),
+            "max_position_size": self.limits.max_position_size_quote,
+            "max_open_executors": self.limits.max_open_executors,
+            "max_drawdown_pct": self.limits.max_drawdown_pct,
+            "shutdown_drawdown_pct": self.limits.shutdown_drawdown_pct,
+            "max_drift_quote": self.limits.max_drift_quote,
+            "max_leverage": self.limits.max_leverage,
+            # What the config asked for and this build cannot enforce (LP-3).
+            # Carried into the prompt and every snapshot for the same reason
+            # the limits themselves are: an agent told a slot cap exists will
+            # plan around it, and one that is never told its reserve is a dead
+            # letter will spend the wallet it thought was held back.
+            "unrecognized_limits": sorted(self.limits.unrecognized),
+            "quote_asset": self.quote_asset,
         }
 
 
@@ -148,6 +218,30 @@ def _dex_call_label(tool_name: str, input_data: dict[str, Any]) -> str:
     return input_data.get("action", "") or tool_name
 
 
+def _finite_number(value: Any, name: str, *, positive: bool = False) -> float:
+    """``value`` as a finite float, or ``ValueError`` naming ``name``.
+
+    The one parser behind every figure the gate values (leverage, executor
+    amounts, ``manage_amm`` fields, reference prices), so a malformed input is
+    refused the same way and with the same reason whichever field carried it.
+    ``bool`` is refused rather than read as 1 or 0. ``positive`` rejects zero
+    too; otherwise only negatives are refused. Empty-value policy and string
+    trimming belong to the caller.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
+    if not math.isfinite(number) or (number <= 0 if positive else number < 0):
+        raise ValueError(
+            f"{name} must be a {'positive' if positive else 'non-negative'} "
+            f"finite number, got {value!r}"
+        )
+    return number
+
+
 def _requested_leverage(input_data: dict[str, Any]) -> float | None:
     """The leverage a call asks for, or ``None`` when it names none.
 
@@ -159,17 +253,9 @@ def _requested_leverage(input_data: dict[str, Any]) -> float | None:
     value = input_data.get("leverage")
     if value is None or value == "":
         return None
-    if isinstance(value, bool):
-        raise ValueError(f"got {value!r}")
     if isinstance(value, str):
         value = value.strip().removesuffix("x").removesuffix("X")
-    try:
-        leverage = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"got {value!r}") from exc
-    if not math.isfinite(leverage) or leverage <= 0:
-        raise ValueError(f"got {value!r}")
-    return leverage
+    return _finite_number(value, "leverage", positive=True)
 
 
 #: Signing actions that return capital instead of committing it. Allowed even
@@ -185,6 +271,35 @@ RISK_REDUCING_DEX_ACTIONS = frozenset({"remove_liquidity", "close", "collect_fee
 EXPOSURE_ADDING_BOT_ACTIONS = frozenset(
     {"deploy", "start_controllers", "update_config"}
 )
+
+
+#: The bot actions an emergency winddown may still take: the brakes.
+SHUTDOWN_BOT_ACTIONS = frozenset({"stop_bot", "stop_controllers"})
+
+
+def _shutdown_refusal(tool_name: str, input_data: dict[str, Any]) -> str:
+    """Why a dangerous call is refused during an emergency winddown, or "".
+
+    Called only for calls :func:`is_dangerous_tool_call` already flagged. What
+    passes is what reduces exposure — ``stop_executor``, a bot stop, and the
+    Gateway actions that return capital — and each still meets the ownership
+    checks the gate runs after this. Everything else is refused.
+    """
+    action = input_data.get("action", "")
+    action = action if isinstance(action, str) else ""
+    if tool_name == "stop_executor":
+        return ""
+    if tool_name == "manage_bots" and action in SHUTDOWN_BOT_ACTIONS:
+        return ""
+    if (
+        tool_name in _SIGNING_DEX_ACTIONS or tool_name in ALWAYS_SIGNING_DEX_TOOLS
+    ) and action in RISK_REDUCING_DEX_ACTIONS:
+        return ""
+    label = f"{tool_name}({action})" if action else tool_name
+    return (
+        f"{label} is not a winddown action — this session is shutting down after "
+        "a kill switch, so only stops and liquidity removals are allowed"
+    )
 
 
 def _book_refusal(current_state: "RiskState | None") -> tuple[bool, str] | None:
@@ -203,27 +318,123 @@ def _book_refusal(current_state: "RiskState | None") -> tuple[bool, str] | None:
 
 
 class RiskEngine:
-    """Evaluates risk state and can block snapshots or individual tool calls."""
+    """Evaluates risk state and individual tool calls against ``RiskLimits``.
 
-    def __init__(self, limits: RiskLimits | None = None):
+    Its state can pause a tick (soft drawdown) or escalate to a winddown (hard
+    drawdown); its ``check_*`` methods refuse individual tool calls.
+    """
+
+    def __init__(self, limits: RiskLimits | None = None, quote_asset: str = ""):
         self.limits = limits or RiskLimits()
+        #: What every figure this engine compares is denominated in (LP-2).
+        #: Stamped on the state ``get_state`` builds, which is what reaches the
+        #: prompt and the snapshots — and used by :meth:`_amount` below for the
+        #: refusals, which is the other half of the same fix: a gate that turns
+        #: a call back is the message the model reasons from when it decides
+        #: what to try instead, and it was telling an LP strategy it had
+        #: exceeded "$500.00" of a ceiling measured in SOL.
+        self.quote_asset = (quote_asset or "").strip().upper()
 
-    def get_state(self, tracker: Any) -> RiskState:
-        """Compute current risk metrics from tracker data."""
-        state = RiskState()
-        state._limits = self.limits
+    def _amount(self, value: float) -> str:
+        """One of this engine's figures, in the token it is denominated in.
+
+        Every refusal below goes through this rather than formatting a ``$``
+        itself, so adding a message cannot reintroduce the assumption. An engine
+        built without a ``quote_asset`` — the default, and what the CEX
+        strategies and every existing test get — renders dollars exactly as
+        before.
+        """
+        return format_quote(value, self.quote_asset)
+
+    def get_state(
+        self,
+        tracker: Any,
+        nothing_at_stake: bool = False,
+        reading_in_hand: bool = False,
+    ) -> RiskState:
+        """Compute current risk metrics from tracker data.
+
+        The tracker only supplies the drawdown. Exposure and the open executor
+        count come from the live executors provider, which the engine sets on
+        the returned state itself.
+
+        A tracker may report the drawdown two ways: ``get_drawdown_pct_checked``
+        returns ``(pct, known)`` and can say it has no reading on record, while
+        the flat ``get_drawdown_pct`` can only return a number. Both arrive at
+        the same fail-closed arm -- a tracker that raises and a tracker that
+        reports nothing are equally unable to tell us where the drawdown is
+        ([[CORR-725]]).
+
+        ``nothing_at_stake`` is the caller's statement that this session holds
+        no position for a drawdown to be unknown *about* -- the same exception
+        the tracker itself makes before the first tick, extended to the other
+        way a session can have nothing to have fallen from. Only a caller can
+        make it: it has to rest on something other than the performance read,
+        because a read that failed and a book that is empty both report zeros.
+        The engine rests it on the bot ledger, which records what the session
+        deployed and is written on the way out of a deploy rather than read
+        back from the API ([[CORR-750]]).
+
+        ``reading_in_hand`` is the caller's statement that *this* tick obtained a
+        reading the tracker has not been given yet. The tracker is the journal,
+        and the journal is written after the gate runs, so a tick whose
+        providers answered still reads its own history as empty: a block raised
+        on the strength of that emptiness costs a whole cycle to clear, and
+        Hummingbot is slow enough to record a new bot's first numbers that it
+        cost three. A single reading has no prior peak to have fallen from, so
+        0.0 is its true drawdown and not an absent one -- the same thing the
+        tracker says of its own first tick.
+
+        Both flags gate only the arm below, never a drawdown that *was* read: a
+        breach of the limits blocks whatever either of them says.
+        """
+        state = RiskState(limits=self.limits, quote_asset=self.quote_asset)
 
         try:
-            state.total_exposure = tracker.get_total_exposure()
-            state.executor_count = tracker.get_open_executor_count()
-            state.drawdown_pct = tracker.get_drawdown_pct()
+            checked = getattr(tracker, "get_drawdown_pct_checked", None)
+            if callable(checked):
+                state.drawdown_pct, state.drawdown_known = checked()
+            else:
+                # A tracker with no checked reading cannot report absence, so
+                # its number is taken as one: behavior unchanged for it.
+                state.drawdown_pct = tracker.get_drawdown_pct()
         except Exception as exc:
             log.exception("Failed to compute risk state from tracker")
             # Fail closed: without real metrics we must not approve creates
-            # against zeroed exposure/count. A blocked state makes the engine
+            # against a zeroed drawdown. A blocked state makes the engine
             # pause the tick and notify instead of trading blind.
             state.is_blocked = True
             state.block_reason = f"risk state unavailable: {exc}"
+            return state
+
+        if not state.drawdown_known and not (nothing_at_stake or reading_in_hand):
+            # The reporting path into the arm above. The drawdown the tracker
+            # would hand us here is 0.0 -- the one value that passes every
+            # limit -- so a strategy that has stopped producing readings would
+            # otherwise read as one sitting safely at zero.
+            #
+            # Two exemptions, both narrow by construction, both saying that
+            # 0.0 is a real drawdown here rather than an absent one
+            # ([[CORR-750]]).
+            #
+            # ``nothing_at_stake``: a session that has deployed nothing has no
+            # reading to be missing, and blocking it blocks the only tick that
+            # could ever deploy. A bot-mode read starts at ``missing`` and is
+            # raised per bot that answers, so before the first deploy there is
+            # nothing to raise it -- that is how a fresh bot-mode loop came to
+            # be held at "no drawdown reading on record" from its second tick
+            # onward. The moment the ledger confirms a bot it is gone, and a
+            # bot the API cannot see blocks as it should.
+            #
+            # ``reading_in_hand``: this tick read the book, and the tracker has
+            # not been told yet because the journal is written after this gate.
+            # Without it the first reading always arrives one tick too late to
+            # clear the block it would have cleared.
+            state.is_blocked = True
+            state.block_reason = (
+                "risk state unavailable: no drawdown reading on record, "
+                "so 0.0% cannot be compared against the drawdown limits"
+            )
             return state
 
         # Check blocking conditions
@@ -354,8 +565,9 @@ class RiskEngine:
 
         if current_state.total_exposure + amount > self.limits.max_position_size_quote:
             return False, (
-                f"Would exceed position limit: ${current_state.total_exposure + amount:.2f} > "
-                f"${self.limits.max_position_size_quote:.2f}"
+                "Would exceed position limit: "
+                f"{self._amount(current_state.total_exposure + amount)} > "
+                f"{self._amount(self.limits.max_position_size_quote)}"
             )
 
         # Approved: accumulate into the snapshot so the next create in this
@@ -366,16 +578,40 @@ class RiskEngine:
         return True, ""
 
     def check_bot_action(
-        self, tool_call: dict, current_state: RiskState | None = None
+        self,
+        tool_call: dict,
+        current_state: RiskState | None = None,
+        capital_quote: float | None = None,
     ) -> tuple[bool, str]:
         """Check a manage_bots call against risk limits.
 
-        A bot's capital lives in saved controller configs on the API server,
-        so exposure can't be computed from the tool inputs alone. Instead,
-        bound the loss: a deploy must declare ``max_global_drawdown_quote``
-        (the platform-enforced kill switch) no larger than the strategy's
-        position limit. Stops are risk-reducing and always allowed; an
-        ``update_config`` is only gated when it declares a
+        Two things are bounded on a deploy, and the difference is the whole of
+        DT-2. The *declared loss cap* (``max_global_drawdown_quote``, the
+        platform kill switch) is optional — omitting it deploys with no
+        platform-side cap, matching the hummingbot-api client's own default
+        (owner's call, GitHub condor#303: risk restrictions like this one are
+        not required of a delegated agent and default to none). A cap that
+        *is* declared is still bounded, no larger than the position limit —
+        that check never needed to leave the call. The *capital* the
+        bot will actually trade lives in saved controller configs on the API
+        server, so it arrives here as ``capital_quote``, resolved by
+        :func:`_deployed_capital_quote` the way ``check_executor_action`` is
+        handed ``planned_amount_quote``. Without it the gate bounded the stated
+        loss and nothing about the position: a $60 controller deployed cleanly
+        under a $10 position limit.
+
+        ``capital_quote`` also settles MM-4, which no single figure could — but
+        only when a cap was declared; an omitted cap has nothing to compare
+        against the capital and is not MM-4's concern. A cap at or above the
+        capital it guards is a kill switch that fires after everything is
+        gone: ``pmm_mister_operator`` shipped ``total_amount_quote: 500``
+        under ``max_position_size_quote: 600`` and passed the
+        cap-versus-limit check, because 600 was within the limit — it was
+        only wrong relative to the 500 it was supposed to protect.
+
+        ``None`` (older callers, tests, every non-deploy action) keeps the
+        call-only behaviour exactly. Stops are risk-reducing and always
+        allowed; an ``update_config`` is only gated when it declares a
         ``total_amount_quote`` above the position limit.
 
         ``current_state`` carries the venue check's verdict ([[FEAT-113]]);
@@ -394,27 +630,110 @@ class RiskEngine:
                 return refusal
 
         if action == "deploy":
-            cap = input_data.get("max_global_drawdown_quote")
-            if not cap:
-                return False, (
-                    "Bot deploy must declare max_global_drawdown_quote "
-                    f"(≤ ${self.limits.max_position_size_quote:.2f}) so the "
-                    "platform kill switch bounds the loss"
-                )
-            if float(cap) > self.limits.max_position_size_quote:
-                return False, (
-                    f"max_global_drawdown_quote ${float(cap):.2f} exceeds "
-                    f"position limit ${self.limits.max_position_size_quote:.2f}"
-                )
+            raw_cap = input_data.get("max_global_drawdown_quote")
+            cap: float | None = None
+            # Unset (None or "") means no platform-side loss cap at all,
+            # matching the hummingbot-api client's own default: it omits the
+            # field from the deploy payload rather than sending a sentinel
+            # (owner's call, GitHub condor#303 — risk caps are opt-in, not
+            # required). A cap that IS declared is still parsed and bounded
+            # below; this makes the cap optional, not meaningless.
+            if raw_cap is not None and raw_cap != "":
+                # Parsed like every other figure the gate values (SEC-632): a
+                # NaN cap is truthy but never fires on the backend, and a
+                # zero or negative cap is never installed, so neither may
+                # clear a cap the caller bothered to declare.
+                try:
+                    cap = _quote_amount(raw_cap, "max_global_drawdown_quote")
+                except ValueError as exc:
+                    return False, f"manage_bots {action}: {exc}"
+                if cap <= 0:
+                    return False, (
+                        "manage_bots deploy: max_global_drawdown_quote must "
+                        f"be a positive amount, got {raw_cap!r} — omit the "
+                        "field entirely for no loss cap"
+                    )
+                if cap > self.limits.max_position_size_quote:
+                    return False, (
+                        f"max_global_drawdown_quote {self._amount(cap)} exceeds "
+                        f"position limit {self._amount(self.limits.max_position_size_quote)}"
+                    )
+            if capital_quote is not None:
+                # DT-2: the money the bot will trade, not the loss it declares,
+                # and against what is LEFT of the allowance rather than all of
+                # it. Every other create accumulates into the snapshot on
+                # approval (see ``check_executor_action`` and
+                # ``check_dex_action``); a deploy did not, so two $300 deploys
+                # under a $500 limit both passed and committed $600 between
+                # them.
+                committed = current_state.total_exposure if current_state else 0.0
+                headroom = self.limits.max_position_size_quote - committed
+                if capital_quote > headroom:
+                    return False, (
+                        f"the controllers would trade {self._amount(capital_quote)}, "
+                        f"over the {self._amount(headroom)} left of this "
+                        f"session's {self._amount(self.limits.max_position_size_quote)} "
+                        f"position limit ({self._amount(committed)} already "
+                        "committed) — lower their total_amount_quote or raise "
+                        "the limit"
+                    )
+                # MM-4: a kill switch at or above the capital it guards fires
+                # only once that capital is gone. "Never above" is the hard
+                # rule; equality is the same degenerate case and is named as
+                # such rather than waved through for being arithmetically
+                # tidy. Only meaningful when a cap was actually declared.
+                if cap is not None and cap >= capital_quote:
+                    return False, (
+                        f"max_global_drawdown_quote {self._amount(cap)} is not "
+                        f"below the {self._amount(capital_quote)} the "
+                        "controllers trade, so the kill switch could only fire "
+                        "after the whole position is lost — set it to a "
+                        "fraction of the capital"
+                    )
         elif action == "update_config":
-            amount = float(
-                (input_data.get("config_data") or {}).get("total_amount_quote", 0) or 0
-            )
+            # A stringified config_data is a common model slip; its amount can't
+            # be read, so it is refused rather than raised out of the permission
+            # callback (which would skip RefusalLog) or passed as "no amount".
+            config_data = input_data.get("config_data") or {}
+            if not isinstance(config_data, dict):
+                return False, (
+                    f"manage_bots {action}: config_data must be an object, "
+                    f"got {type(config_data).__name__}"
+                )
+            try:
+                amount = _quote_amount(
+                    config_data.get("total_amount_quote"), "total_amount_quote"
+                )
+            except ValueError as exc:
+                return False, f"manage_bots {action}: {exc}"
             if amount > self.limits.max_position_size_quote:
                 return False, (
-                    f"update_config total_amount_quote ${amount:.2f} exceeds "
-                    f"position limit ${self.limits.max_position_size_quote:.2f}"
+                    f"update_config total_amount_quote {self._amount(amount)} "
+                    "exceeds position limit "
+                    f"{self._amount(self.limits.max_position_size_quote)}"
                 )
+
+        if action == "deploy" and capital_quote is not None and current_state:
+            # Approved: reserve it, so a second deploy in this run is gated
+            # against what is left rather than against the full allowance.
+            #
+            # The reservation is NOT released if the deploy then fails at the
+            # API, and cannot be from here: this gate decides a call before it
+            # runs and never learns the outcome — ``normalize_tool_call`` keeps
+            # ``{tool, title, input}`` and no id, so there is nothing to
+            # correlate a later failure against. ``check_executor_action`` and
+            # ``check_dex_action`` have had the same property since they were
+            # written.
+            #
+            # The cost is bounded and lands on the safe side: a delegated run
+            # whose deploy failed may refuse a same-size retry until the run
+            # ends (a tick recomputes its state from the venue every tick, so
+            # the tick case self-heals). The alternative — not reserving — is
+            # two deploys each judged against the full allowance, which is real
+            # over-exposure rather than a wasted retry. The refusal names the
+            # headroom and what is already committed, so a smaller retry is
+            # still possible.
+            current_state.total_exposure += capital_quote
 
         return True, ""
 
@@ -510,8 +829,8 @@ class RiskEngine:
         if projected > self.limits.max_position_size_quote:
             return False, (
                 f"DEX {_dex_call_label(tool_name, input_data)} would exceed "
-                f"position limit: ${projected:.2f} > "
-                f"${self.limits.max_position_size_quote:.2f}"
+                f"position limit: {self._amount(projected)} > "
+                f"{self._amount(self.limits.max_position_size_quote)}"
             )
 
         # Approved: accumulate so the next signature in this tick is gated
@@ -540,17 +859,41 @@ class RefusalLog:
     So the gate writes down why it said no. Same shape as ``BotLedger``'s
     violation list, and used the same way: appended here, drained by the engine
     after the tick, journaled, and shown in the next tick's prompt.
+
+    One tick has one refusal surface, so the *venue* refusing is recorded here
+    too rather than in a parallel store (FEAT-138): a 429 counted in the tool
+    path arrives with ``kind="throttle"`` and the venue it came from. The kind
+    is what keeps the two apart where it matters — a throttle refusal is a
+    venue condition and the agent did nothing wrong, while a gate refusal is a
+    decision about what the agent asked for — and reading them as one thing is
+    what made throttling look like a strategy bug (GitHub #276).
     """
+
+    #: The gate said no about this call.
+    KIND_RISK = "risk"
+    #: The venue said no about this host. Counted in the tool path, not here.
+    KIND_THROTTLE = "throttle"
 
     def __init__(self) -> None:
         self._pending: list[dict[str, Any]] = []
 
-    def note(self, tool: str, reason: str, now: float | None = None) -> None:
+    def note(
+        self,
+        tool: str,
+        reason: str,
+        now: float | None = None,
+        kind: str = KIND_RISK,
+        venue: str = "",
+        host: str = "",
+    ) -> None:
         self._pending.append(
             {
                 "tool": tool or "",
                 "reason": reason or "",
                 "at": time.time() if now is None else now,
+                "kind": kind or self.KIND_RISK,
+                "venue": venue or "",
+                "host": host or "",
             }
         )
         self._pending = self._pending[-_MAX_REFUSALS:]
@@ -693,6 +1036,14 @@ def auto_approve_with_risk_check(
         return {"outcome": {"outcome": "cancelled"}, "reason": reason}
 
     async def callback(tool_call: dict, options: list[dict]) -> dict:
+        # Controller code has one careful path (manage_agent_controllers: drift
+        # check, backup, confirmation), so the raw upsert is refused in every
+        # mode, like `place_order` below (SEC-713). It is checked first because
+        # the tool is not in `is_dangerous_tool_call`: nothing below would see it.
+        refusal = raw_controller_code_refusal(tool_call)
+        if refusal:
+            return deny(tool_call_name(tool_call), refusal)
+
         if is_dangerous_tool_call(tool_call):
             tool_name = tool_call_name(tool_call)
 
@@ -721,6 +1072,17 @@ def auto_approve_with_risk_check(
                     "this session runs in dry-run mode, where nothing mutates",
                     level=logging.INFO,
                 )
+
+            # Shutdown mode: the LLM cleanup pass after a kill switch (SEC-631).
+            # Only the brakes get through, and they then go on to the same
+            # ownership checks a tick's brakes do below; every other dangerous
+            # call opens, grows or re-prices exposure at the one moment a limit
+            # has just been breached. An allowlist, so a dangerous call this
+            # branch has not heard of is refused rather than approved.
+            if execution_mode == "shutdown":
+                refusal = _shutdown_refusal(tool_name, input_data)
+                if refusal:
+                    return deny(tool_name, refusal)
 
             # For executor creates, run risk check. The name is the classification
             # since FEAT-062 — `stop_executor` is dangerous too, but it reduces
@@ -811,15 +1173,49 @@ def auto_approve_with_risk_check(
                                 record=False,  # the ledger already has it
                             )
 
+                # What the CALL says, first: those checks are pure, and a
+                # malformed cap has to be reported as a malformed cap. Reading
+                # the server first meant a deploy with a NaN or zero cap was
+                # refused for "its capital could not be read" — true, and an
+                # answer about the wrong thing, which is the one kind of
+                # refusal an unattended agent cannot act on.
                 allowed, reason = risk_engine.check_bot_action(tool_call, risk_state)
                 if not allowed:
                     return deny(tool_name, reason)
 
+                # Then what the SERVER says. A deploy's real capital is not in
+                # the call — it names saved controller configs and the money is
+                # in those — so it is resolved and the same check re-run with
+                # it, the shape the executor creates above already use (DT-2).
+                # Only a deploy names configs, so nothing else pays for a
+                # lookup, and a call that failed above never makes one.
+                if input_data.get("action", "") == "deploy":
+                    try:
+                        capital_quote = await _deployed_capital_quote(
+                            input_data, price_client
+                        )
+                    except Exception as exc:
+                        return deny(tool_name, f"its capital could not be read: {exc}")
+                    if capital_quote is not None:
+                        allowed, reason = risk_engine.check_bot_action(
+                            tool_call, risk_state, capital_quote
+                        )
+                        if not allowed:
+                            return deny(tool_name, reason)
+
                 # Recorded only once the call is actually going through, so a
                 # risk-rejected deploy never lands in the ledger.
+                #
+                # A *claim*, not a confirmation: this runs before the call does,
+                # so the bot may never come into being. The engine confirms it
+                # on the way out from the call that returned. Ownership counts
+                # both (the session must be able to stop what it started); the
+                # drawdown guard counts only the confirmed, or a failed first
+                # deploy pins the loop on a reading the missing bot can never
+                # produce ([[CORR-750]]).
                 if ledger is not None:
                     if input_data.get("action", "") == "deploy":
-                        ledger.note_deploy(input_data.get("bot_name", "") or "")
+                        ledger.note_claim(input_data.get("bot_name", "") or "")
 
             # Gateway signatures move funds straight out of the user's wallet,
             # so they are priced and gated here (SEC-224). Interactive surfaces
@@ -848,6 +1244,20 @@ def auto_approve_with_risk_check(
                 if not allowed:
                     return deny(tool_name, reason)
 
+            # The Botcamp hub actions never run unattended (SEC review C1/C3).
+            # Chat puts them in front of a human; a loop has nobody to ask, and
+            # these are not exposure the risk limits could bound: a publish
+            # sends the agent off the box for good, and an install makes
+            # foreign instructions live — an injected "publish every agent"
+            # is exactly what this stops. Reaching this line means the call
+            # is one of DANGEROUS_AGENT_ACTIONS.
+            if tool_name == AGENTS_TOOL:
+                return deny(
+                    tool_name,
+                    "publishing to or installing from the Botcamp hub needs a "
+                    "human — do it from chat, not from a loop",
+                )
+
             # Block direct order placement entirely
             if tool_name == "place_order":
                 return deny(
@@ -861,19 +1271,36 @@ def auto_approve_with_risk_check(
         # and a routine is ordinary tick work, so gating either by name would
         # put a confirmation in front of every candle read. But both run
         # arbitrary Python holding the unrestricted API client, which makes them
-        # the ways to mutate the world for real from inside a dry run: every
-        # *named* write above is refused there, `await client.gateway.start(...)`
-        # inside a snippet was not (SEC-616), and neither was writing that same
-        # line into a routine and running it (SEC-626).
+        # the ways to mutate the world for real from inside a *constrained*
+        # session: every *named* write above is refused there, `await
+        # client.gateway.start(...)` inside a snippet was not (SEC-616), and
+        # neither was writing that same line into a routine and running it
+        # (SEC-626).
+        #
+        # Both constrained modes reach this line, because both had the same hole
+        # and for the same reason: the branches above only ever see calls
+        # `is_dangerous_tool_call` flagged, and these two tools are deliberately
+        # not flagged, so a shutdown pass could still run a snippet or a routine
+        # after a kill switch fired and re-open the exposure the winddown had
+        # just closed (SEC-697). What each mode forbids differs — a dry run
+        # forbids mutation, a winddown forbids exposure and so still lets the
+        # brake through — which is why they are two policies and not one.
         #
         # Which calls those are is `danger.py`'s policy and not this gate's, so
         # a third such tool never has to reach this file. Reads on both tools —
         # past runs, the routine list, a routine's source — change nothing and
-        # stay free.
+        # stay free in both modes.
         if execution_mode == "dry_run":
             refusal = dry_run_refusal(tool_call)
             if refusal:
                 return deny(tool_call_name(tool_call), refusal, level=logging.INFO)
+        elif execution_mode == "shutdown":
+            # Kept at WARNING, unlike a dry run's: there every mutation is
+            # refused and twenty warnings a tick is not a signal, whereas a
+            # cleanup pass reaching for arbitrary Python is one.
+            refusal = shutdown_refusal(tool_call)
+            if refusal:
+                return deny(tool_call_name(tool_call), refusal)
 
         # Auto-approve everything else
         for opt in options:
@@ -900,13 +1327,7 @@ def _quote_amount(value: Any, name: str) -> float:
         return 0.0
     if isinstance(value, str):
         value = value.strip().removeprefix("$")
-    try:
-        amount = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a number, got {value!r}") from exc
-    if not math.isfinite(amount) or amount < 0:
-        raise ValueError(f"{name} must be a non-negative finite number")
-    return amount
+    return _finite_number(value, name)
 
 
 def _is_quote_denominated(value: Any) -> bool:
@@ -918,6 +1339,72 @@ def _is_quote_denominated(value: Any) -> bool:
     marker has to be read before the multiplication, not stripped and forgotten.
     """
     return isinstance(value, str) and value.strip().startswith("$")
+
+
+async def _deployed_capital_quote(
+    input_data: dict[str, Any], client: Any
+) -> float | None:
+    """What a ``manage_bots`` deploy actually puts at risk, in quote (DT-2).
+
+    The sibling of :func:`_planned_amount_quote` over the other door onto real
+    capital, and it exists for the same reason: the gate values the call before
+    the pure check judges it. A bot's size is not in the call at all — the call
+    names *saved controller configs* and the money lives in those, on the API
+    server — so the gate used to bound only the loss cap the model declared and
+    nothing about the position it was opening. QA deployed a $60 controller
+    under a $10 session position limit and watched it open ~$29.55 of exposure
+    with the gate approving.
+
+    Sums ``total_amount_quote`` across every config the deploy names, because a
+    deploy takes a list and all of them run in the same bot against the same
+    limit.
+
+    Raises ``ValueError`` when the figure cannot be established for configs the
+    deploy *does* name — no client, a config that cannot be read, a config with
+    no readable size. The caller refuses on it, which is this module's standing
+    rule for a number it needs and does not have: an unreadable size is not a
+    small one.
+
+    Returns ``None`` when the deploy names no configs at all, which is not the
+    same question. There is then no capital to bound rather than capital that
+    could not be read, and the call deploys nothing either way: ``manage_bots``
+    answers a deploy with no ``controllers_config`` with "Error:
+    'controllers_config' is required" before reaching the API. Refusing it here
+    would guard nothing; if that guard is ever relaxed, this arm has to become
+    a refusal with it.
+    """
+    names = input_data.get("controllers_config") or []
+    if isinstance(names, str):  # a lone name, not yet a list
+        names = [names]
+    if not isinstance(names, list) or not names:
+        return None
+    if client is None:
+        raise ValueError("no API client is available to read the controller configs")
+
+    total = 0.0
+    for name in names:
+        config_id = str(name or "").strip()
+        if not config_id:
+            raise ValueError("one of its controllers_config entries is blank")
+        try:
+            config = await client.controllers.get_controller_config(config_id)
+        except Exception as exc:
+            raise ValueError(
+                f"controller config {config_id!r} could not be read: {exc}"
+            )
+        if not isinstance(config, dict):
+            raise ValueError(f"controller config {config_id!r} came back unreadable")
+        amount = _quote_amount(config.get("total_amount_quote"), "total_amount_quote")
+        if amount <= 0:
+            raise ValueError(
+                f"controller config {config_id!r} declares no usable "
+                "total_amount_quote, so the capital it would trade is unknown"
+            )
+        total += amount
+
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("the deploy's total capital must be a positive finite number")
+    return total
 
 
 async def _planned_amount_quote(
@@ -974,12 +1461,7 @@ async def _planned_amount_quote(
                 input_data.get("connector_name", ""),
                 input_data.get("trading_pair", ""),
             )
-            if price is None:
-                raise ValueError("reference price is unavailable")
-            price = float(price)
-            if not math.isfinite(price) or price <= 0:
-                raise ValueError("reference price must be a positive finite number")
-            amount = quote + base * price
+            amount = quote + base * _positive_price(price)
         else:
             amount = quote
     else:
@@ -1001,26 +1483,14 @@ def _amm_field(value: Any, name: str, default: float | None = None) -> float:
         if default is None:
             raise ValueError(f"{name} is required to price this call")
         return default
-    try:
-        amount = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a number, got {value!r}") from exc
-    if not math.isfinite(amount) or amount < 0:
-        raise ValueError(f"{name} must be a non-negative finite number")
-    return amount
+    return _finite_number(value, name)
 
 
 def _positive_price(value: Any) -> float:
     """A reference price, or ``ValueError`` if it cannot bound anything."""
     if value is None or value == "":
         raise ValueError("reference price is unavailable")
-    try:
-        price = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"reference price must be a number, got {value!r}") from exc
-    if not math.isfinite(price) or price <= 0:
-        raise ValueError("reference price must be a positive finite number")
-    return price
+    return _finite_number(value, "reference price", positive=True)
 
 
 async def _amm_base_price(input_data: dict[str, Any], client: Any) -> float:

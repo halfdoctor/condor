@@ -11,7 +11,7 @@ import asyncio
 import re
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from condor.memory.paths import CHAT_SLUG
 from condor.runtime.toolsets import (
@@ -50,6 +50,7 @@ HB_TRADING = {
     "quote_swap",
     "execute_swap",
     "get_swap_status",
+    "resolve_swap",
     "search_swaps",
     "explore_geckoterminal",
 }
@@ -66,6 +67,7 @@ CONDOR_COMMON = {
     "delegate",
     "send_notification",
     "manage_routines",
+    "manage_agent_controllers",
     "run_code",
     "manage_servers",
     "manage_memory",
@@ -75,7 +77,7 @@ CONDOR_COMMON = {
 }
 CONDOR_ORCHESTRATION = {
     "manage_agents",
-    "manage_strategies",
+    "manage_loops",
     "control_agent",
     "get_available_models",
 }
@@ -89,7 +91,7 @@ CONDOR_PROFILES = {
 
 def _registered(module, profile: str) -> set[str]:
     """The tool names ``profile`` puts on a fresh server."""
-    server = FastMCP("profile-probe")
+    server = MCPServer("profile-probe")
     module.register_tools(server, profile)
     return {tool.name for tool in asyncio.run(server.list_tools())}
 
@@ -154,7 +156,7 @@ def test_no_seat_can_reach_a_raw_market_data_reader(forbidden):
 
 @pytest.mark.parametrize(
     "forbidden",
-    ["manage_agents", "manage_strategies", "control_agent", "get_available_models"],
+    ["manage_agents", "manage_loops", "control_agent", "get_available_models"],
 )
 def test_a_tick_cannot_reach_the_orchestration_family(forbidden):
     """It is running inside the loop these tools start and stop."""
@@ -170,7 +172,7 @@ def test_the_split_dangerous_tools_stay_with_the_seat_that_trades():
     assert CREATE_EXECUTOR_TOOLS <= tick
     assert "execute_swap" in tick
     # …and the free half of the swap family is never gated, so it must be there.
-    assert {"quote_swap", "get_swap_status", "search_swaps"} <= tick
+    assert {"quote_swap", "get_swap_status", "search_swaps", "resolve_swap"} <= tick
 
 
 @pytest.mark.parametrize("is_dry_run", [True, False])
@@ -293,7 +295,7 @@ def test_the_manage_trading_agent_funnel_is_in_no_profile():
 @pytest.mark.parametrize("module", [hb_server, condor_server])
 def test_an_unknown_profile_raises_rather_than_falling_back_to_full(module):
     with pytest.raises(ValueError, match="Unknown tool profile"):
-        module.register_tools(FastMCP("probe"), "trading")
+        module.register_tools(MCPServer("probe"), "trading")
 
 
 # ── the default: a launch with no flag serves everything ─────────────────────
@@ -302,7 +304,7 @@ def test_an_unknown_profile_raises_rather_than_falling_back_to_full(module):
 @pytest.mark.parametrize("module", [hb_server, condor_server])
 def test_a_launch_with_no_flag_serves_the_full_surface(module):
     """External-host compat: uvx, the checked-in `.mcp.json`, a bare console run."""
-    server = FastMCP("probe")
+    server = MCPServer("probe")
     module.register_tools(server)
     assert {tool.name for tool in asyncio.run(server.list_tools())} == _registered(
         module, "full"
@@ -321,10 +323,10 @@ def test_the_module_singleton_is_registered_at_import(module):
 @pytest.mark.parametrize(
     "agent_slug,tick,expected",
     [
-        ("adaptive_grid_trader", True, "tick"),
+        ("market_making_expert", True, "tick"),
         (CHAT_SLUG, True, "tick"),
         (None, True, "tick"),
-        ("adaptive_grid_trader", False, "agent"),
+        ("market_making_expert", False, "agent"),
         (CHAT_SLUG, False, "full"),
         (None, False, "full"),
         ("", False, "full"),
@@ -364,7 +366,7 @@ def test_a_tick_session_mounts_the_narrow_surface_on_both_servers(monkeypatch):
     )
 
     servers = toolsets.build_mcp_servers_for_session(
-        42, 42, agent_slug="adaptive_grid_trader", tick=True
+        42, 42, agent_slug="market_making_expert", tick=True
     )
     by_name = {s["name"]: s["args"] for s in servers}
     for args in by_name.values():
@@ -444,11 +446,11 @@ def test_a_bound_specialist_and_a_tick_are_unaffected(monkeypatch):
 
     for permission in (ServerPermission.OWNER, ServerPermission.TRADER):
         bound = _session_profiles(
-            monkeypatch, permission, agent_slug="adaptive_grid_trader"
+            monkeypatch, permission, agent_slug="market_making_expert"
         )
         assert set(bound.values()) == {"agent"}
         tick = _session_profiles(
-            monkeypatch, permission, agent_slug="adaptive_grid_trader", tick=True
+            monkeypatch, permission, agent_slug="market_making_expert", tick=True
         )
         assert set(tick.values()) == {"tick"}
 

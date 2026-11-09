@@ -19,8 +19,17 @@ Two invariants every impl here shares:
 
 Signatures were verified field-by-field against ``GET /executors/types/{type}/config`` on
 a live API server. See ``mcp_servers/TOOL_STYLE.md``.
+
+The validators this module gates creates with — :func:`trading_rule_violation`,
+:func:`balance_violation` and the reads under them (:func:`balance_rows`,
+:func:`available_units`, :func:`describe_balances`, :func:`reference_price`,
+:func:`numeric_field`, :func:`usd`) — are public because :mod:`condor.preflight`
+runs the same ones ahead of a start (FEAT-139). One definition on purpose: a
+copied validator drifts from the one that actually gates orders, and then the
+preflight passes what the create path refuses.
 """
 
+import asyncio
 import logging
 from typing import Any
 
@@ -95,16 +104,45 @@ def _amount(value: Any) -> float | None:
     return number if number > 0 else None
 
 
-def _usd(value: float) -> str:
+def usd(value: float) -> str:
     return f"${value:,.2f}"
 
 
-def _rule(rules: dict[str, Any], *names: str) -> float | None:
+def numeric_field(data: dict[str, Any], *names: str) -> float | None:
+    """The first of ``names`` ``data`` holds as a positive number.
+
+    Written for a venue's trading rules, which spell the same rule differently
+    per connector; the preflight reads position rows with it too, so it takes
+    any mapping rather than naming one.
+    """
     for name in names:
-        value = _amount(rules.get(name))
+        value = _amount(data.get(name))
         if value is not None:
             return value
     return None
+
+
+async def reference_price(
+    client: Any, connector: str, pair: str, config: dict[str, Any]
+) -> float | None:
+    """The config's own price if it names one, else the venue's current price."""
+    price = _amount(config.get("entry_price")) or _amount(config.get("price"))
+    if price is not None:
+        return price
+    # Imported here, not at module scope: `condor.fetchers.market_data` is
+    # reached through the `condor.fetchers` package __init__, which pulls the
+    # connectors -> pool_data chain, and this MCP server is also run
+    # standalone. Same lazy-import precedent as tools/portfolio.py.
+    from condor.fetchers.market_data import fetch_current_price
+
+    # `_amount` still guards the result: a price a check can divide by has
+    # to be a positive number, and the fetcher returns the payload's value
+    # verbatim. A price we cannot read blocks nothing.
+    try:
+        return _amount(await fetch_current_price(client, connector, pair))
+    except Exception as exc:
+        logger.debug("price for %s %s unavailable: %s", connector, pair, exc)
+        return None
 
 
 async def _base_amount_violation(
@@ -130,18 +168,7 @@ async def _base_amount_violation(
 
     if min_notional is None:
         return None
-    price = _amount(config.get("entry_price")) or _amount(config.get("price"))
-    if price is None:
-        # Imported here, not at module scope: `condor.fetchers.market_data` is
-        # reached through the `condor.fetchers` package __init__, which pulls the
-        # connectors -> pool_data chain, and this MCP server is also run
-        # standalone. Same lazy-import precedent as tools/portfolio.py.
-        from condor.fetchers.market_data import fetch_current_price
-
-        # `_amount` still guards the result: a price this check can divide by has
-        # to be a positive number, and the fetcher returns the payload's value
-        # verbatim. A price we cannot read blocks nothing.
-        price = _amount(await fetch_current_price(client, connector, pair))
+    price = await reference_price(client, connector, pair, config)
     if price is None:
         return None
     notional = amount * price
@@ -149,13 +176,13 @@ async def _base_amount_violation(
         return None
     base = pair.split("-")[0]
     return (
-        f"Order notional {_usd(notional)} is below {connector}'s minimum of "
-        f"{_usd(min_notional)} for {pair}. Increase the amount to at least "
+        f"Order notional {usd(notional)} is below {connector}'s minimum of "
+        f"{usd(min_notional)} for {pair}. Increase the amount to at least "
         f"{min_notional / price:.8g} {base} at a price of {price:g}."
     )
 
 
-async def _trading_rule_violation(
+async def trading_rule_violation(
     client: Any, executor_type: str, config: dict[str, Any]
 ) -> str | None:
     """Name the venue rule this config breaks, or ``None`` to let it through.
@@ -174,8 +201,8 @@ async def _trading_rule_violation(
     rules = await trading_rules_cache.get(client, connector, pair)
     if not rules:
         return None
-    min_order_size = _rule(rules, "min_order_size")
-    min_notional = _rule(rules, "min_notional_size", "min_notional")
+    min_order_size = numeric_field(rules, "min_order_size")
+    min_notional = numeric_field(rules, "min_notional_size", "min_notional")
 
     if executor_type in ("position_executor", "order_executor"):
         return await _base_amount_violation(
@@ -196,18 +223,18 @@ async def _trading_rule_violation(
         per_level = _amount(config.get("min_order_amount_quote"))
         if per_level is not None and per_level < min_notional:
             return (
-                f"Grid min_order_amount_quote {_usd(per_level)} is below "
-                f"{connector}'s minimum order notional of {_usd(min_notional)} for "
+                f"Grid min_order_amount_quote {usd(per_level)} is below "
+                f"{connector}'s minimum order notional of {usd(min_notional)} for "
                 f"{pair}. Raise min_order_amount_quote to at least "
-                f"{_usd(min_notional)}."
+                f"{usd(min_notional)}."
             )
         total = _amount(config.get("total_amount_quote"))
         if total is not None and total < min_notional:
             return (
-                f"Grid total_amount_quote {_usd(total)} is below {connector}'s "
-                f"minimum order notional of {_usd(min_notional)} for {pair} — not "
+                f"Grid total_amount_quote {usd(total)} is below {connector}'s "
+                f"minimum order notional of {usd(min_notional)} for {pair} — not "
                 f"one level could be placed. Fund the grid with at least "
-                f"{_usd(min_notional)}."
+                f"{usd(min_notional)}."
             )
         return None
 
@@ -219,9 +246,9 @@ async def _trading_rule_violation(
             value = _amount(level)
             if value is not None and value < min_notional:
                 return (
-                    f"DCA level {index} of {len(levels)} is {_usd(value)}, below "
-                    f"{connector}'s minimum order notional of {_usd(min_notional)} "
-                    f"for {pair}. Raise that level to at least {_usd(min_notional)}."
+                    f"DCA level {index} of {len(levels)} is {usd(value)}, below "
+                    f"{connector}'s minimum order notional of {usd(min_notional)} "
+                    f"for {pair}. Raise that level to at least {usd(min_notional)}."
                 )
         return None
 
@@ -229,9 +256,9 @@ async def _trading_rule_violation(
         quote_amount = _amount(config.get("quote_amount"))
         if quote_amount is not None and quote_amount < min_notional:
             return (
-                f"LP quote_amount {_usd(quote_amount)} is below {connector}'s "
-                f"minimum order notional of {_usd(min_notional)} for {pair}. Fund "
-                f"the position with at least {_usd(min_notional)}."
+                f"LP quote_amount {usd(quote_amount)} is below {connector}'s "
+                f"minimum order notional of {usd(min_notional)} for {pair}. Fund "
+                f"the position with at least {usd(min_notional)}."
             )
     return None
 
@@ -251,6 +278,11 @@ async def create_executor(
     compacted and already type-checked by the host, so there is nothing left to validate
     server-side — the hand-written field validation the mega-tool needed
     (``validate_executor_config``) existed only because the config was an opaque dict.
+
+    After the POST the new executor is read back briefly (:func:`_read_back`), because
+    an accepted config is not a started executor: one the account cannot fund
+    terminates at once with ``INSUFFICIENT_BALANCE``, and reporting its id as a
+    success is what let an agent announce a position that never opened.
     """
     account = account_name or "master_account"
     tag = controller_id or "main"
@@ -270,7 +302,7 @@ async def create_executor(
         merged_config.get("trading_pair"),
     )
 
-    violation = await _trading_rule_violation(client, executor_type, merged_config)
+    violation = await trading_rule_violation(client, executor_type, merged_config)
     if violation:
         # Refused here, not by the backend: below a venue minimum the API answers
         # with an opaque error or accepts an order that never fills.
@@ -280,6 +312,18 @@ async def create_executor(
             "executor_type": executor_type,
             "error": violation,
             "formatted_output": f"Error creating {executor_type}: {violation}",
+        }
+
+    shortfall = await balance_violation(client, executor_type, merged_config, account)
+    if shortfall:
+        # Without this the API accepts the config and the executor terminates
+        # itself at start with INSUFFICIENT_BALANCE; refusing here creates nothing.
+        logger.info("create_%s refused for balance: %s", executor_type, shortfall)
+        return {
+            "action": "create",
+            "executor_type": executor_type,
+            "error": shortfall,
+            "formatted_output": f"Error creating {executor_type}: {shortfall}",
         }
 
     try:
@@ -301,13 +345,65 @@ async def create_executor(
 
     executor_id = result.get("executor_id") or result.get("id")
 
-    formatted = (
-        "Executor created successfully!\n\n"
+    # The POST answering 200 only means the backend accepted the config. The
+    # executor checks its budget when it starts and terminates itself if the
+    # account cannot fund it, so what it did is read back before anything is
+    # reported.
+    executor = await _read_back(client, executor_id) if executor_id else None
+    status = str(executor.get("status") or "").upper() if executor else ""
+    close_type = str(executor.get("close_type") or "").upper() if executor else ""
+
+    header = (
         f"Executor ID: {executor_id or 'N/A'}\n"
         f"Type: {executor_type}\n"
         f"Account: {account}\n"
         f"Controller: {tag}\n"
     )
+
+    if status == "TERMINATED" and close_type in _NEVER_STARTED_CLOSE_TYPES:
+        reason = f"it terminated immediately with close_type {close_type}"
+        if close_type == "INSUFFICIENT_BALANCE":
+            reason += ": the account cannot fund it"
+            balances = await _balances_line(
+                client, account, merged_config.get("connector_name")
+            )
+            if balances:
+                reason += f" ({balances})"
+        error = (
+            f"The {executor_type} was accepted by the API but {reason}. No position "
+            "was opened and nothing was traded. Do NOT report it as open."
+        )
+        logger.info("create_%s terminated at start: %s", executor_type, error)
+        return {
+            "action": "create",
+            "executor_id": executor_id,
+            "executor_type": executor_type,
+            "status": status,
+            "close_type": close_type,
+            "error": error,
+            "formatted_output": f"Error creating {executor_type}: {error}\n\n{header}",
+        }
+
+    filled = _amount(executor.get("filled_amount_quote")) if executor else None
+    if executor is None:
+        state = (
+            "Executor submitted, but its state could not be read back. It is NOT "
+            "confirmed running: check get_executor before saying a position is open."
+        )
+    elif status == "TERMINATED":
+        state = (
+            f"Executor already finished (close_type {close_type or 'unknown'}, "
+            f"volume {usd(filled or 0.0)})."
+        )
+    elif filled:
+        state = f"Executor {status or 'running'}; filled {usd(filled)} so far."
+    else:
+        state = (
+            f"Executor {status or 'running'}; nothing filled yet. The entry is "
+            "not confirmed: check get_executor before saying a position is open."
+        )
+
+    formatted = f"{state}\n\n{header}"
     if save_as_default:
         formatted += f"\nConfiguration saved as default for {executor_type}"
 
@@ -317,11 +413,213 @@ async def create_executor(
         "executor_type": executor_type,
         "account": account,
         "controller_id": tag,
+        "status": status or None,
+        "close_type": close_type or None,
+        "filled_amount_quote": filled,
         "config_used": merged_config,
         "saved_as_default": save_as_default,
         "result": result,
         "formatted_output": formatted,
     }
+
+
+#: Close types an executor reaches when it never got going. Anything else on a
+#: just-created executor (a market order executor filling and completing, say)
+#: is a real outcome, reported but not called an error.
+_NEVER_STARTED_CLOSE_TYPES = frozenset({"INSUFFICIENT_BALANCE", "FAILED"})
+
+#: How long to watch a new executor, and how often. The budget check runs in the
+#: executor's on_start, so a failure shows within about a tick; a healthy one
+#: costs the whole window, which is why it is short.
+READ_BACK_WINDOW_SECONDS = 3.0
+READ_BACK_INTERVAL_SECONDS = 0.75
+
+
+async def _read_back(client: Any, executor_id: str) -> dict[str, Any] | None:
+    """Watch a new executor for the read-back window; return what it last showed.
+
+    Returns early once it is TERMINATED. ``None`` means its state could not be
+    read at all — reported as unconfirmed, never as success or failure.
+    """
+    get_executor = getattr(getattr(client, "executors", None), "get_executor", None)
+    if get_executor is None:
+        return None
+
+    last: dict[str, Any] | None = None
+    polls = max(1, round(READ_BACK_WINDOW_SECONDS / READ_BACK_INTERVAL_SECONDS))
+    for _ in range(polls):
+        await asyncio.sleep(READ_BACK_INTERVAL_SECONDS)
+        try:
+            detail = await get_executor(executor_id)
+        except Exception as exc:
+            # Right after the POST the executor may not be listed yet; keep
+            # watching rather than give up on the first miss.
+            logger.debug("read-back of %s failed: %s", executor_id, exc)
+            continue
+        if isinstance(detail, dict):
+            last = detail
+            if str(detail.get("status") or "").upper() == "TERMINATED":
+                break
+    return last
+
+
+async def balance_rows(
+    client: Any, account: str, connector: str, *, refresh: bool = False
+) -> list[dict[str, Any]] | None:
+    """The connector's balance rows, or ``None`` if they cannot be read.
+
+    ``refresh=False`` is the API's own cached state: no exchange round trip.
+    """
+    portfolio = getattr(client, "portfolio", None)
+    if portfolio is None:
+        return None
+    kwargs: dict[str, Any] = {
+        "account_names": [account],
+        "connector_names": [connector],
+    }
+    if refresh:
+        kwargs["refresh"] = True
+    try:
+        state = await portfolio.get_state(**kwargs)
+    except Exception as exc:
+        logger.debug("balances for %s/%s unavailable: %s", account, connector, exc)
+        return None
+    if not isinstance(state, dict):
+        return None
+    account_state = state.get(account)
+    rows = account_state.get(connector) if isinstance(account_state, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def available_units(rows: list[dict[str, Any]], token: str) -> float:
+    """Units of ``token`` free to spend; a token with no row holds nothing."""
+    for row in rows:
+        if str(row.get("token", "")).upper() == token.upper():
+            return _amount(row.get("available_units", row.get("units"))) or 0.0
+    return 0.0
+
+
+def describe_balances(connector: str, rows: list[dict[str, Any]]) -> str:
+    held = []
+    for row in rows:
+        units = _amount(row.get("available_units", row.get("units")))
+        if units is None:
+            continue
+        value = _amount(row.get("value"))
+        held.append(
+            f"{row.get('token', '?')} {units:g}"
+            + (f" (~{usd(value)})" if value is not None else "")
+        )
+    if not held:
+        return f"{connector} holds no available balance"
+    return f"{connector} available: " + ", ".join(held)
+
+
+async def _balances_line(client: Any, account: str, connector: Any) -> str | None:
+    """Name what the connector holds, so an unfunded executor says what is there."""
+    if not isinstance(connector, str):
+        return None
+    rows = await balance_rows(client, account, connector)
+    return None if rows is None else describe_balances(connector, rows)
+
+
+def _is_buy(side: Any) -> bool | None:
+    if side in (1, "1") or str(side).upper() == "BUY":
+        return True
+    if side in (2, "2") or str(side).upper() == "SELL":
+        return False
+    return None
+
+
+async def _required_spend(
+    client: Any, executor_type: str, config: dict[str, Any], connector: str, pair: str
+) -> tuple[str, float, str] | None:
+    """What the executor spends up front: ``(token, units, how)``, or ``None``.
+
+    Spot only. ``how`` is the arithmetic, so the refusal can show its working.
+    """
+    buy = _is_buy(config.get("side"))
+    if buy is None or "-" not in pair:
+        return None
+    base, quote = pair.split("-", 1)
+
+    if executor_type in ("position_executor", "order_executor"):
+        amount = _amount(config.get("amount"))
+        if amount is None:
+            return None
+        if not buy:
+            return base, amount, f"a {amount:g} {base} sell"
+        price = await reference_price(client, connector, pair, config)
+        if price is None:
+            return None
+        return quote, amount * price, f"{amount:g} {base} at {price:g}"
+
+    if executor_type == "grid_executor":
+        total = _amount(config.get("total_amount_quote"))
+    elif executor_type == "dca_executor":
+        levels = config.get("amounts_quote")
+        if not isinstance(levels, (list, tuple)):
+            return None
+        total = sum(_amount(level) or 0.0 for level in levels) or None
+    else:
+        # An LP position is funded in two tokens on a gateway wallet; its
+        # own open transaction is the check.
+        return None
+    if total is None:
+        return None
+    if buy:
+        return quote, total, f"{usd(total)} of {quote}"
+    price = await reference_price(client, connector, pair, config)
+    if price is None:
+        return None
+    return base, total / price, f"{usd(total)} of {base} at {price:g}"
+
+
+async def balance_violation(
+    client: Any, executor_type: str, config: dict[str, Any], account: str
+) -> str | None:
+    """Refuse a spot executor the account visibly cannot fund, before the POST.
+
+    Read from the API's cached balances, so the common case costs no exchange
+    call. A cached shortfall is re-read with ``refresh=True`` before refusing,
+    so a stale cache (a deposit that just landed) can never block a trade.
+
+    Perpetuals are left to the executor's own start-up check (collateral,
+    leverage and fees are the connector's arithmetic, not ours), as is anything
+    this cannot read: the post-create read-back still catches those.
+    """
+    connector = config.get("connector_name")
+    pair = config.get("trading_pair")
+    if not isinstance(connector, str) or not isinstance(pair, str):
+        return None
+    if "perpetual" in connector:
+        return None
+
+    need = await _required_spend(client, executor_type, config, connector, pair)
+    if need is None:
+        return None
+    token, required, how = need
+
+    rows = await balance_rows(client, account, connector)
+    if not rows or available_units(rows, token) >= required:
+        # No rows at all is "unknown", not "empty": the connector may just be
+        # missing from the state.
+        return None
+    rows = await balance_rows(client, account, connector, refresh=True)
+    if not rows:
+        return None
+    available = available_units(rows, token)
+    if available >= required:
+        return None
+    return (
+        f"Insufficient balance on {connector} ({account}): this {executor_type} "
+        f"needs {required:.8g} {token} ({how}) but only {available:.8g} {token} is "
+        f"available. {describe_balances(connector, rows)}. Nothing was created. "
+        "Fund the account or ask the user how to proceed; do not switch to another "
+        "connector (a perpetual, say) without asking."
+    )
 
 
 async def create_position_executor(

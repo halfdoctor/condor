@@ -9,11 +9,12 @@ import sys
 from collections.abc import Iterable
 from typing import Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from mcp_servers._profiles import make_resolver
 from mcp_servers._profiles import register_tools as _register_tools
 from mcp_servers._profiles import resolve_profiles
+from mcp_servers.hummingbot_api.exceptions import ToolError
 from mcp_servers.hummingbot_api.formatters import (
     format_amm_result,
     format_clmm_result,
@@ -23,7 +24,7 @@ from mcp_servers.hummingbot_api.formatters import (
 )
 from mcp_servers.hummingbot_api.hummingbot_client import hummingbot_client
 from mcp_servers.hummingbot_api.middleware import GATEWAY_LOG_HINT, handle_errors
-from mcp_servers.hummingbot_api.profiles import PROFILE_TOOLS
+from mcp_servers.hummingbot_api.profiles import AGENT_SEAT_PROFILES, PROFILE_TOOLS
 from mcp_servers.hummingbot_api.schemas import (
     AMMRequest,
     CLMMRequest,
@@ -65,8 +66,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hummingbot-mcp")
 
-# Initialize FastMCP server
-mcp = FastMCP("hummingbot-mcp")
+# Initialize MCPServer server
+mcp = MCPServer("hummingbot-mcp")
 
 
 # Server Management Tools
@@ -550,6 +551,20 @@ async def manage_controllers(
         confirm_override: Required True if overwriting existing items.
         include_code: If True, include full controller source code in describe output. Default False.
     """
+    if (
+        action == "upsert"
+        and target != "config"
+        and settings.tool_profile in AGENT_SEAT_PROFILES
+    ):
+        # The backstop under the permission gates (SEC-713): a delegated or
+        # consulted agent run builds no gate, so the refusal has to live here too.
+        raise ToolError(
+            "Refused: an agent does not upload controller code with "
+            "manage_controllers. Controller code goes through "
+            "manage_agent_controllers (write → status → sync), which checks the "
+            "server copy and backs it up — use that. Saved configs "
+            "(target='config') still work here."
+        )
     client = await hummingbot_client.get_client()
     result = await controllers_tools.manage_controllers(
         client=client,
@@ -766,6 +781,13 @@ async def create_position_executor(
     ORDER TYPES are `1`=MARKET, `2`=LIMIT, `3`=LIMIT_MAKER. Omitting them uses the
     backend's own defaults (LIMIT to open, MARKET for every exit).
 
+    AN EXECUTOR ID IS NOT A POSITION. The API accepts the config first and the executor
+    checks its budget when it starts; an unfunded one terminates at once with
+    INSUFFICIENT_BALANCE. This tool watches the new executor for a few seconds and
+    reports what it did: an error means nothing was opened, and "nothing filled yet"
+    means the entry is not confirmed. Tell the user a position is open only when the
+    result (or `get_executor`) shows it running with volume filled.
+
     Args:
         connector_name: Exchange connector, e.g. 'binance_perpetual'.
         trading_pair: Trading pair, e.g. 'BTC-USDT'.
@@ -877,6 +899,13 @@ async def create_grid_executor(
     LEVEL COUNT is the intersection of two limits — `total_amount_quote /
     min_order_amount_quote`, and the price range divided by
     `min_spread_between_orders`. The tighter one wins.
+
+    AN EXECUTOR ID IS NOT A POSITION. The API accepts the config first and the executor
+    checks its budget when it starts; an unfunded one terminates at once with
+    INSUFFICIENT_BALANCE. This tool watches the new executor for a few seconds and
+    reports what it did: an error means nothing was opened, and "nothing filled yet"
+    means the entry is not confirmed. Tell the user a position is open only when the
+    result (or `get_executor`) shows it running with volume filled.
 
     Args:
         connector_name: Exchange connector, e.g. 'binance_perpetual'.
@@ -992,6 +1021,13 @@ async def create_dca_executor(
     here. Note this is the opposite convention from `create_position_executor`, whose
     `amount` is in base currency.
 
+    AN EXECUTOR ID IS NOT A POSITION. The API accepts the config first and the executor
+    checks its budget when it starts; an unfunded one terminates at once with
+    INSUFFICIENT_BALANCE. This tool watches the new executor for a few seconds and
+    reports what it did: an error means nothing was opened, and "nothing filled yet"
+    means the entry is not confirmed. Tell the user a position is open only when the
+    result (or `get_executor`) shows it running with volume filled.
+
     Args:
         connector_name: Exchange connector, e.g. 'binance_perpetual'.
         trading_pair: Trading pair, e.g. 'BTC-USDT'.
@@ -1089,6 +1125,13 @@ async def create_order_executor(
     `order_id` is internal and appears nowhere on chain), plus `slippage_pct` and
     `max_slippage_pct`. `slippage_pct` is the LIVE tolerance: above the configured start
     means earlier attempts failed on slippage and this one is paying to get through.
+
+    AN EXECUTOR ID IS NOT A POSITION. The API accepts the config first and the executor
+    checks its budget when it starts; an unfunded one terminates at once with
+    INSUFFICIENT_BALANCE. This tool watches the new executor for a few seconds and
+    reports what it did: an error means nothing was opened, and "nothing filled yet"
+    means the entry is not confirmed. Tell the user a position is open only when the
+    result (or `get_executor`) shows it running with volume filled.
 
     Args:
         connector_name: Exchange connector, or a NETWORK id for a DEX swap (see above).
@@ -1196,6 +1239,13 @@ async def create_lp_executor(
     A stopped executor always closes the on-chain position; `keep_position` only decides
     whether the net token change is KEPT as a spot position or swapped back to the
     original quote asset.
+
+    AN EXECUTOR ID IS NOT A POSITION. The API accepts the config first and the executor
+    checks its budget when it starts; an unfunded one terminates at once with
+    INSUFFICIENT_BALANCE. This tool watches the new executor for a few seconds and
+    reports what it did: an error means nothing was opened, and "nothing filled yet"
+    means the entry is not confirmed. Tell the user a position is open only when the
+    result (or `get_executor`) shows it running with volume filled.
 
     Args:
         connector_name: The NETWORK, e.g. 'solana-mainnet-beta'. See above.
@@ -2019,6 +2069,39 @@ async def get_swap_status(transaction_hash: str) -> str:
     return format_gateway_swap_result("get_status", result)
 
 
+@handle_errors("resolve a Gateway swap", GATEWAY_LOG_HINT)
+async def resolve_swap(transaction_hash: str, network: str | None = None) -> str:
+    """Get a swap out of SUBMITTED when no status read can confirm it. Signs nothing.
+
+    Use this tool when: `get_swap_status` or `search_swaps` reports a swap as
+    unverifiable — it has been SUBMITTED past the threshold and no status read has
+    succeeded. A swap leaves SUBMITTED only on a *successful* read, so a Gateway that
+    cannot be reached keeps one there indefinitely (GitHub #278), and before this tool
+    the only exit was redeploying the agent.
+
+    UNVERIFIABLE IS NOT FAILED. The swap may have landed on-chain. Read the explorer
+    before you tell the user anything about the outcome, and never report a stuck swap
+    as lost.
+
+    THE SERVER DECIDES, NOT CONDOR. This asks the API to read the chain and record the
+    swap's real outcome; it writes no state of its own and moves no funds. A server too
+    old to offer the route says so plainly and nothing changes — that is a capability
+    answer, not an outage, and not a reason to retry.
+
+    Args:
+        transaction_hash: The stuck swap's hash, from `search_swaps` or `execute_swap`.
+        network: Network id, e.g. 'solana-mainnet-beta'. Optional — the server
+            identifies the swap by hash; pass it only if you know it.
+    """
+    request = GatewaySwapRequest(
+        action="resolve", transaction_hash=transaction_hash, network=network
+    )
+
+    client = await hummingbot_client.get_client()
+    result = await manage_gateway_swaps_impl(client, request)
+    return format_gateway_swap_result("resolve", result)
+
+
 @handle_errors("search Gateway swaps", GATEWAY_LOG_HINT)
 async def search_swaps(
     connector: str | None = None,
@@ -2153,7 +2236,7 @@ async def explore_geckoterminal(
 # The rings themselves — which tool sits in which one, and why — moved to
 # ``profiles.py`` as plain name strings (FEAT-091), because the web process has
 # to read them to draw a switch per tool and cannot import *this* module to ask:
-# importing it parses argv and builds the ``FastMCP`` singleton. Here the names
+# importing it parses argv and builds the ``MCPServer`` singleton. Here the names
 # are resolved back into functions, at import, which is what keeps the table and
 # the functions provably in step.
 
@@ -2169,7 +2252,7 @@ TOOL_PROFILES: dict[str, tuple] = resolve_profiles(globals(), PROFILE_TOOLS)
 
 
 def register_tools(
-    server: FastMCP,
+    server: MCPServer,
     profile: str = DEFAULT_TOOL_PROFILE,
     muted: Iterable[str] = (),
 ) -> None:
@@ -2210,12 +2293,21 @@ def _apply_cli_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--url")
     parser.add_argument("--server-name")
+    # Who to attribute this process's calls to (FEAT-138). Non-secret labels,
+    # so argv is the right channel: they make a running subprocess identifiable
+    # in ``ps`` the way ``--server-name`` already does.
+    parser.add_argument("--agent-slug")
+    parser.add_argument("--caller-id")
     args, _ = parser.parse_known_args()
 
     if args.url:
         settings.api_url = args.url
     if args.server_name:
         settings.server_name = args.server_name
+    if args.agent_slug:
+        settings.agent_slug = args.agent_slug
+    if args.caller_id:
+        settings.caller_id = args.caller_id
 
 
 async def _run():
@@ -2231,7 +2323,7 @@ async def _run():
         "💡 Use 'configure_server' tool to view or update the API server connection"
     )
 
-    # Run the server with FastMCP
+    # Run the server with MCPServer
     # Connection to API will happen lazily on first tool use
     try:
         await mcp.run_stdio_async()

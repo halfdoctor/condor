@@ -1,6 +1,5 @@
 import { ChevronDown } from "lucide-react";
 
-import { TickSpine } from "@/components/agent/lab/TickSpine";
 import {
   formatDuration,
   isLiveRun,
@@ -8,7 +7,11 @@ import {
   runLabel,
 } from "@/components/agent/lab/runs";
 import {
+  driftLines,
   dueInSec,
+  effectiveModel,
+  throttleLines,
+  throttledVenues,
   tickCountdownLabel,
 } from "@/components/agent/workspace/fleet";
 import { useSeconds } from "@/hooks/useSeconds";
@@ -29,11 +32,11 @@ import type {
  * that wrote it was still running, and watching the countdown could not tell
  * you what the last tick decided.
  *
- * `TickSpine` is promoted out of the Lab's body to sit here, which is a move
- * and not a rewrite: it already takes `selectedTick` / `onSelectTick` and
- * derives its beat colours from `lab/runs.ts`. Selecting a beat sets `?tick=`
- * and swaps the body; it never navigates, because a tick is a selection that
- * has to survive changing what you are looking at.
+ * The run's ticks (`TickSpine`) are not drawn here: they share one row with
+ * the section tabs below this bar (ARCH-425), because each alone left most of
+ * a full-width row empty. This bar keeps the pickers, the status, the cadence,
+ * the countdown, and what the session is actually running — the model the
+ * adapter reports and whether its config still matches the file (FEAT-136).
  *
  * The two pickers are native selects on purpose. They are the scope of
  * everything below them and they have to be operable at any width, and the
@@ -41,7 +44,6 @@ import type {
  * carry state a select cannot show.
  */
 export function LoopBar({
-  slug,
   strategies,
   sslug,
   onSelectStrategy,
@@ -49,10 +51,7 @@ export function LoopBar({
   run,
   onSelectRun,
   instance,
-  tick,
-  onSelectTick,
 }: {
-  slug: string;
   /** Every strategy this agent owns — the scope selector's options. */
   strategies: readonly StrategySummary[];
   sslug: string | null;
@@ -63,8 +62,6 @@ export function LoopBar({
   onSelectRun: (runId: string) => void;
   /** The live engine, when there is one — the cadence and the countdown. */
   instance: RunningInstance | null;
-  tick: number | null;
-  onSelectTick: (tick: number | null) => void;
 }) {
   const live = !!run && isLiveRun(run);
   // One clock for the bar, alive only while a run is. A `Date.now()` here would
@@ -75,92 +72,134 @@ export function LoopBar({
 
   const duration = run ? formatDuration(runDurationSec(run, nowSec)) : "";
   const dueIn = dueInSec(instance, nowSec);
+  // What this session is actually running, beside what it was asked to run
+  // (FEAT-136). Both read off the live engine, so they are only here while
+  // there is one — a stopped run's drift is not a thing an operator can act on.
+  const drift = driftLines(instance);
+  const model = effectiveModel(instance);
+  // Which venues are refusing this session (FEAT-138). A venue condition, so it
+  // is worded as the venue's doing and sits apart from the run's own error —
+  // before this a throttled host reached the operator as a slow tick.
+  const throttled = throttledVenues(instance);
 
   return (
-    <>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-[var(--color-border)] px-4 py-1.5 text-xs">
-        {strategies.length > 0 && (
-          <Picker
-            label="Strategy"
-            value={sslug ?? ""}
-            onChange={onSelectStrategy}
-            options={strategies.map((s) => ({ value: s.slug, label: s.name }))}
-          />
-        )}
-
-        {run && (
-          <Picker
-            label="Run"
-            value={run.run_id}
-            onChange={onSelectRun}
-            options={runs.map((r) => ({
-              value: r.run_id,
-              label: `${runLabel(r)} · ${r.tick_count} tick${r.tick_count === 1 ? "" : "s"}`,
-            }))}
-          />
-        )}
-
-        {run && (
-          <>
-            <span
-              className={
-                live
-                  ? "text-emerald-400"
-                  : run.error
-                    ? "text-[var(--color-red)]"
-                    : "text-[var(--color-text-muted)]"
-              }
-            >
-              {run.status}
-            </span>
-            {duration && (
-              <>
-                <span className="opacity-40">·</span>
-                <span className="font-mono text-[var(--color-text-muted)]">
-                  {duration}
-                </span>
-              </>
-            )}
-          </>
-        )}
-
-        {instance && instance.frequency_sec > 0 && (
-          <>
-            <span className="opacity-40">·</span>
-            <span className="font-mono text-[var(--color-text-muted)]">
-              every {countdown(instance.frequency_sec)}
-            </span>
-          </>
-        )}
-
-        {dueIn !== null && (
-          <>
-            <span className="opacity-40">·</span>
-            <span
-              data-loop-countdown
-              className={`font-mono ${
-                dueIn > 0 ? "text-[var(--color-text-muted)]" : "text-amber-400"
-              }`}
-            >
-              {tickCountdownLabel(dueIn)}
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* The run's ticks, as navigation — the third region that stays put. A
-          dry run is a single tick in one file and has no spine to draw. */}
-      {run && run.kind === "session" && sslug && (
-        <TickSpine
-          slug={slug}
-          sslug={sslug}
-          sessionNum={run.number}
-          hasActionsLog={run.has_actions_log}
-          selectedTick={tick}
-          onSelectTick={onSelectTick}
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-[var(--color-border)] px-4 py-1.5 text-xs">
+      {strategies.length > 0 && (
+        <Picker
+          label="Loop"
+          value={sslug ?? ""}
+          onChange={onSelectStrategy}
+          options={strategies.map((s) => ({ value: s.slug, label: s.name }))}
         />
       )}
-    </>
+
+      {run && (
+        <Picker
+          label="Run"
+          value={run.run_id}
+          onChange={onSelectRun}
+          options={runs.map((r) => ({
+            value: r.run_id,
+            label: `${runLabel(r)} · ${r.tick_count} tick${r.tick_count === 1 ? "" : "s"}`,
+          }))}
+        />
+      )}
+
+      {run && (
+        <>
+          <span
+            className={
+              live
+                ? "text-emerald-400"
+                : run.error
+                  ? "text-[var(--color-red)]"
+                  : "text-[var(--color-text-muted)]"
+            }
+          >
+            {run.status}
+          </span>
+          {duration && (
+            <>
+              <span className="opacity-40">·</span>
+              <span className="font-mono text-[var(--color-text-muted)]">
+                {duration}
+              </span>
+            </>
+          )}
+        </>
+      )}
+
+      {instance && instance.frequency_sec > 0 && (
+        <>
+          <span className="opacity-40">·</span>
+          <span className="font-mono text-[var(--color-text-muted)]">
+            every {countdown(instance.frequency_sec)}
+          </span>
+        </>
+      )}
+
+      {dueIn !== null && (
+        <>
+          <span className="opacity-40">·</span>
+          <span
+            data-loop-countdown
+            className={`font-mono ${
+              dueIn > 0 ? "text-[var(--color-text-muted)]" : "text-amber-400"
+            }`}
+          >
+            {tickCountdownLabel(dueIn)}
+          </span>
+        </>
+      )}
+
+      {model && (
+        <>
+          <span className="opacity-40">·</span>
+          <span
+            data-effective-model
+            title={
+              model.requested
+                ? `Requested ${model.requested}; the adapter reports ${model.active}`
+                : `The adapter reports ${model.active}`
+            }
+            className={`font-mono ${
+              model.mismatch ? "text-amber-400" : "text-[var(--color-text-muted)]"
+            }`}
+          >
+            {model.active}
+            {model.mismatch ? ` (pinned ${model.requested})` : ""}
+          </span>
+        </>
+      )}
+
+      {throttled.length > 0 && (
+        <>
+          <span className="opacity-40">·</span>
+          <span
+            data-venue-throttled
+            title={`These venues are refusing our calls — not a strategy fault:\n${throttleLines(throttled).join("\n")}`}
+            className="rounded bg-amber-400/15 px-1.5 py-0.5 font-medium text-amber-400"
+          >
+            {throttled.length === 1
+              ? `${throttled[0].venue} throttling (${throttled[0].refusals} refused)`
+              : `${throttled.length} venues throttling`}
+          </span>
+        </>
+      )}
+
+      {drift.length > 0 && (
+        <>
+          <span className="opacity-40">·</span>
+          <span
+            data-config-drift
+            title={`This session is still running its start-time config. Restart to apply:\n${drift.join("\n")}`}
+            className="rounded bg-amber-400/15 px-1.5 py-0.5 font-medium text-amber-400"
+          >
+            config drifted ({drift.length})
+          </span>
+        </>
+      )}
+    </div>
   );
 }
 

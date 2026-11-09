@@ -18,6 +18,7 @@ import typing
 from condor.runtime.danger import READ_ONLY_CONFIG_ACTIONS, is_mutating_tool_call
 from handlers.agents._shared import (
     CREATE_EXECUTOR_TOOLS,
+    DANGEROUS_AGENT_ACTIONS,
     DANGEROUS_AMM_ACTIONS,
     DANGEROUS_BOT_ACTIONS,
     DANGEROUS_CLMM_ACTIONS,
@@ -71,6 +72,7 @@ def test_gated_actions_exist_on_their_tools():
         ("manage_clmm", DANGEROUS_CLMM_ACTIONS),
         ("manage_amm", DANGEROUS_AMM_ACTIONS),
         ("manage_bots", DANGEROUS_BOT_ACTIONS),
+        ("manage_agents", DANGEROUS_AGENT_ACTIONS),
         # Not a gate but the log's read set: a rename of `get` would record every
         # config read as a write, so the reads have to keep resolving too.
         ("manage_gateway_config", READ_ONLY_CONFIG_ACTIONS),
@@ -113,7 +115,7 @@ def test_the_swap_family_is_gated_by_name():
     assert "execute_swap" in DANGEROUS_TOOLS
     assert is_dangerous_tool_call({"tool": "execute_swap", "input": {}})
 
-    for name in ("quote_swap", "get_swap_status", "search_swaps"):
+    for name in ("quote_swap", "get_swap_status", "search_swaps", "resolve_swap"):
         assert name in registered, f"{name} is no longer registered"
         assert name not in DANGEROUS_TOOLS, f"{name} reads only; gating it is noise"
         assert not is_dangerous_tool_call(

@@ -72,6 +72,17 @@ class LiveLoop:
     #: Epoch seconds, or 0 when the loop has not ticked yet.
     last_tick_at: float
     frequency_sec: int
+    #: When this loop last obtained a reading, and last did something that
+    #: worked ([[FEAT-137]]). ``last_tick_at`` above is stamped at tick *start*
+    #: and so advances on a tick that achieved nothing; these two do not, which
+    #: is what tells a quiet strategy from a dead one. 0 = never.
+    last_reading_at: float = 0.0
+    last_successful_action_at: float = 0.0
+    #: How long the last completed tick took, in seconds ([[FEAT-141]]). The
+    #: host-capacity signal a slow tick *is*: an oversubscribed box showed up at
+    #: the race as long ticks and timeouts, never as a crash. 0 = no tick has
+    #: completed yet.
+    last_tick_duration: float = 0.0
     #: The ``Last action:`` line of the journal's Summary — what the agent last
     #: *said*. Kept under its own name and meaning; what it last *did* is the
     #: separate field below, and the band shows the two as separate statements.
@@ -180,9 +191,9 @@ def _pseudo_owners(known: set[str], agents: dict[str, Any]) -> list[FleetOwner]:
     now carries a ``controller_id`` tag of its own
     (:func:`~condor.agents.deeds.attribution_tag`), so these owners have a tag
     set exactly like a strategy's — the deed index's, where a loop's comes from
-    ``enumerate_agent_ids``. The browser's matcher needs no new case for it:
-    ``agentOfControllerId`` is exact-string membership over this list and does
-    not care which walk filled it.
+    ``enumerate_agent_ids``. The browser's matcher needs no new case for it: the
+    controller-id tag lookup in ``attributionIndex`` is exact-string membership
+    over this list and does not care which walk filled it.
     """
     from condor.agents.deed_index import PSEUDO_STRATEGY_NAMES, build_deed_index
 
@@ -294,6 +305,15 @@ def _live_owners() -> dict[str, tuple[FleetOwner, LiveLoop]]:
                     tick_count=int(getattr(journal, "tick_count", 0) or 0),
                     last_tick_at=float(getattr(engine, "_last_tick_at", 0.0) or 0.0),
                     frequency_sec=int(config.get("frequency_sec", 60) or 60),
+                    last_reading_at=float(
+                        getattr(engine, "_last_reading_at", 0.0) or 0.0
+                    ),
+                    last_successful_action_at=float(
+                        getattr(engine, "_last_successful_action_at", 0.0) or 0.0
+                    ),
+                    last_tick_duration=float(
+                        getattr(engine, "_last_tick_duration", 0.0) or 0.0
+                    ),
                     last_action=read_last_action(journal),
                     last_did=read_last_did(engine),
                     last_error=str(getattr(engine, "_last_error", "") or ""),

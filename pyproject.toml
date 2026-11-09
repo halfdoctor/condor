@@ -2,7 +2,7 @@
 name = "condor"
 version = "0.1.0"
 description = "Telegram bot for Hummingbot trading via Backend API"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "python-telegram-bot[job-queue]",
     "hummingbot-api-client==1.5.9",
@@ -20,14 +20,14 @@ dependencies = [
     # the API container runs (2.2.6), so the two environments stay aligned.
     "pandas-ta>=0.4.71b",
     "geckoterminal-py",
-    "mcp",
+    "mcp>=2.2,<3",
     "fastapi",
     "uvicorn[standard]",
     "python-jose[cryptography]",
     "faster-whisper",
     "matplotlib>=3.10.8",
     "scipy>=1.17.1",
-    "pydantic-ai[mcp]",
+    "pydantic-ai[groq]>=2.52,<3",
     "beautifulsoup4>=4.14.3",
     "markdown>=3.10.2",
     "bleach>=6.4.0",
@@ -45,8 +45,15 @@ dependencies = [
 # ``black --check`` with no black on PATH and failed to spawn it.
 dev = ["pytest", "pytest-asyncio", "black", "isort", "pre-commit"]
 
+[tool.black]
+# Agent controller folders hold Hummingbot controller source verbatim: the
+# folder copy is digest-compared against the API server's, so reformatting it
+# would report drift against every server holding the upstream file.
+extend-exclude = "agents/[^/]+/controllers/"
+
 [tool.isort]
 profile = "black"
+extend_skip_glob = ["agents/*/controllers/*"]
 
 [tool.setuptools.package-data]
 "condor.reports" = ["report_runtime.js"]

@@ -130,8 +130,8 @@ def test_strategy_crud_under_agent(tmp_path, monkeypatch):
     )
     assert s.slug == "brl_mm"
     assert s.key == "brigado.brl_mm"
-    assert s.home == tmp_path / "brigado" / "strategies" / "brl_mm"
-    assert (s.home / "strategy.md").exists()
+    assert s.home == tmp_path / "brigado" / "loops" / "brl_mm"
+    assert (s.home / "loop.md").exists()
 
     # get / get_by_key / list
     assert store.get("brigado", "brl_mm").instructions.strip() == "do the thing"
@@ -178,7 +178,7 @@ def test_agent_with_no_strategy_is_still_loopable(tmp_path, monkeypatch):
     assert resolved is not None
     assert resolved.slug == strategy_module.DEFAULT_STRATEGY_SLUG
     assert resolved.key == "brigado.default"
-    assert (resolved.home / "strategy.md").exists()
+    assert (resolved.home / "loop.md").exists()
     assert resolved.instructions.strip()  # a real playbook body, not empty
 
     # Idempotent: a second start reuses the same one instead of piling up.
@@ -269,7 +269,7 @@ def test_create_strategy_requires_existing_agent(tmp_path, monkeypatch):
     _patch_roots(monkeypatch, tmp_path)
     monkeypatch.setattr(settings, "user_id", 7, raising=False)
 
-    result = ta.manage_strategies(
+    result = ta.manage_loops(
         action="create",
         agent_slug="ghost",
         name="S",
@@ -558,6 +558,108 @@ def test_cancel_during_confirmation_preserves_semaphore_permits():
     asyncio.run(_run())
 
 
+# ── a consumer that walks away mid-turn (CORR-714) ──
+
+
+def _answering_client(sem):
+    """A real pydantic-ai run behind a local backend's one-request slot."""
+    from pydantic_ai import Agent
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+
+    client = PydanticAIClient(model="ollama:x")
+    client._agent = Agent(FunctionModel(lambda m, i: ModelResponse([TextPart("hi")])))
+    client._request_semaphore = sem
+    return client
+
+
+def _other_tasks():
+    return asyncio.all_tasks() - {asyncio.current_task()}
+
+
+def test_closing_the_stream_mid_turn_returns_the_slot_at_once():
+    # CORR-714: a WS drop or a page reload stops reading mid-answer. The slot is
+    # process-global per backend, so it must come back when the stream is
+    # closed — not whenever the half-read generator happens to be collected.
+    from condor.acp.client import TextChunk
+
+    async def _run():
+        sem = asyncio.Semaphore(1)
+        client = _answering_client(sem)
+
+        stream = client.prompt_stream("go")
+        async for event in stream:
+            if isinstance(event, TextChunk):
+                assert client._slot_held
+                break
+        await stream.aclose()
+
+        assert not client._slot_held
+        assert not sem.locked()
+        assert not _other_tasks(), "the turn kept running with nobody reading it"
+
+    asyncio.run(_run())
+
+
+def test_dropping_the_stream_mid_turn_returns_the_slot():
+    # No caller closes the stream by hand: a bare ``async for`` that breaks only
+    # drops its reference. That alone must end the turn, cleanly.
+    from condor.acp.client import TextChunk
+
+    async def _run():
+        sem = asyncio.Semaphore(1)
+        client = _answering_client(sem)
+
+        async for event in client.prompt_stream("go"):
+            if isinstance(event, TextChunk):
+                break
+        for _ in range(10):
+            if not _other_tasks():
+                break
+            await asyncio.sleep(0)
+
+        assert not client._slot_held
+        assert not sem.locked()
+        assert not _other_tasks(), "the turn kept running with nobody reading it"
+
+    asyncio.run(_run())
+
+
+def test_cancelling_the_reader_mid_turn_returns_the_slot():
+    # Web Stop cancels the task that is reading the stream, which is waiting on
+    # the model at that moment.
+    from pydantic_ai import Agent
+    from pydantic_ai.models.function import FunctionModel
+
+    async def _run():
+        sem = asyncio.Semaphore(1)
+        client = _answering_client(sem)
+        generating = asyncio.Event()
+
+        async def _slow_model(messages, info):
+            generating.set()
+            await asyncio.sleep(3600)
+
+        client._agent = Agent(FunctionModel(_slow_model))
+
+        async def _read():
+            async for _event in client.prompt_stream("go"):
+                pass
+
+        task = asyncio.create_task(_read())
+        await generating.wait()
+        assert client._slot_held
+        task.cancel()
+        done, _ = await asyncio.wait([task], timeout=0.5)
+        assert done and task.cancelled()
+
+        assert not client._slot_held
+        assert not sem.locked()
+        assert not _other_tasks(), "the turn kept running with nobody reading it"
+
+    asyncio.run(_run())
+
+
 def test_hold_request_slot_noop_for_cloud_providers():
     # CORR-330: the outer guard is explicit acquire/release now; cloud providers
     # (semaphore None) must still pass straight through it.
@@ -664,15 +766,18 @@ def test_extra_env_falls_back_to_chat_id(monkeypatch):
 def test_resolve_acp_model_suffix():
     from condor.acp.client import resolve_acp
 
-    # Returns (command, env, model_pref). The suffix is surfaced as model_pref so
-    # ACPClient can select it via session/set_model (the bridge ignores env).
+    # Returns (command, env, model_pref). The pin is surfaced ONLY as model_pref,
+    # so ACPClient applies it via session/set_model — the one channel on which a
+    # pin the bridge cannot apply fails loudly. The env overlay stays empty: the
+    # bridge advertises whatever env hands it and reports it as current, typos
+    # included, which made that failure unreachable (CORR-746).
     cmd, env, pref = resolve_acp("claude-acp:opus")
     assert cmd == "claude-agent-acp"
-    assert env == {"ANTHROPIC_MODEL": "opus"}
+    assert env == {}
     assert pref == "opus"
 
     _, env, pref = resolve_acp("claude-acp:claude-opus-4-8")
-    assert env == {"ANTHROPIC_MODEL": "claude-opus-4-8"}
+    assert env == {}
     assert pref == "claude-opus-4-8"
 
     assert resolve_acp("claude-code") == ("claude-agent-acp", {}, "")
@@ -765,11 +870,13 @@ def test_delegate_forces_caller_user_id(monkeypatch):
         seen.update(kw)
         return SimpleNamespace(task_id="em-delegate-1", status="running")
 
-    async def _no_conversation(session_key):
+    async def _no_conversation(session_key, user):
         return ""
 
     monkeypatch.setattr(agents_module, "_get_agent", lambda slug: SimpleNamespace())
-    monkeypatch.setattr(agents_module, "_conversation_for_session", _no_conversation)
+    monkeypatch.setattr(
+        agents_module, "_owned_conversation_for_session", _no_conversation
+    )
     monkeypatch.setattr(delegate_module, "start_delegation", _capture_start)
     monkeypatch.setattr(
         "condor.web.auth.get_config_manager",
@@ -867,3 +974,290 @@ def test_numeric_credentials_reach_the_subprocess_as_strings(monkeypatch):
     env = {e["name"]: e["value"] for e in hb["env"]}
     assert env["HUMMINGBOT_API_USERNAME"] == "999"
     assert env["HUMMINGBOT_API_PASSWORD"] == "123"
+
+
+# ── Creating over an existing name is refused, never an overwrite (CORR-635) ──
+
+
+def _create_client(monkeypatch):
+    """The create routes behind a FastAPI app, as a plain approved user."""
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+
+    from condor.web.auth import get_current_user
+    from condor.web.models import WebUser
+    from condor.web.routes import agents as routes
+
+    monkeypatch.setattr("condor.preferences.get_active_agent_key", lambda uid: "")
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[get_current_user] = lambda: WebUser(
+        id=555, username="u", first_name="U", role="user"
+    )
+    return TestClient(app)
+
+
+def test_post_agents_with_a_taken_name_is_409_and_leaves_agent_md(
+    tmp_path, monkeypatch
+):
+    _patch_roots(monkeypatch, tmp_path)
+    client = _create_client(monkeypatch)
+
+    first = client.post("/agents", json={"name": "Brigado", "instructions": "Keep."})
+    assert first.status_code == 200
+    md = tmp_path / "brigado" / "AGENT.md"
+    before = md.read_bytes()
+
+    again = client.post("/agents", json={"name": "brigado", "instructions": "Lost."})
+
+    assert again.status_code == 409
+    assert "brigado" in again.json()["detail"]
+    assert md.read_bytes() == before
+
+
+def test_post_agents_naming_a_stock_agent_is_409_without_a_local_fork(
+    tmp_path, monkeypatch
+):
+    from condor.memory.paths import agent_home, stock_agent_home
+
+    _patch_roots(monkeypatch, tmp_path)
+    shipped = stock_agent_home("scout") / "AGENT.md"
+    shipped.parent.mkdir(parents=True)
+    shipped.write_text("---\nname: Scout\ndescription: shipped\n---\n\nShip.\n")
+    before = shipped.read_bytes()
+
+    res = _create_client(monkeypatch).post("/agents", json={"name": "Scout"})
+
+    assert res.status_code == 409
+    assert "scout" in res.json()["detail"]
+    assert not (agent_home("scout") / "AGENT.md").exists()
+    assert shipped.read_bytes() == before
+
+
+def test_post_strategies_with_a_taken_name_is_409_and_leaves_playbook_and_config(
+    tmp_path, monkeypatch
+):
+    _patch_roots(monkeypatch, tmp_path)
+    client = _create_client(monkeypatch)
+    assert client.post("/agents", json={"name": "Brigado"}).status_code == 200
+
+    first = client.post(
+        "/agents/brigado/strategies",
+        json={
+            "name": "BRL MM",
+            "instructions": "Tuned tactic.",
+            "config": {"frequency_sec": 17, "total_amount_quote": 1234},
+        },
+    )
+    assert first.status_code == 200
+    home = tmp_path / "brigado" / "loops" / "brl_mm"
+    md, cfg = home / "loop.md", home / "config.yml"
+    before = (md.read_bytes(), cfg.read_bytes())
+
+    again = client.post(
+        "/agents/brigado/strategies",
+        json={"name": "brl mm", "instructions": "Other.", "config": {"x": 1}},
+    )
+
+    assert again.status_code == 409
+    assert "brl_mm" in again.json()["detail"]
+    assert (md.read_bytes(), cfg.read_bytes()) == before
+
+
+def test_reserved_names_are_400_not_500(tmp_path, monkeypatch):
+    _patch_roots(monkeypatch, tmp_path)
+    client = _create_client(monkeypatch)
+
+    res = client.post("/agents", json={"name": "condor"})
+    assert res.status_code == 400
+    assert "reserved" in res.json()["detail"]
+
+    assert client.post("/agents", json={"name": "Brigado"}).status_code == 200
+    res = client.post(
+        "/agents/brigado/strategies", json={"name": "chat", "instructions": "x"}
+    )
+    assert res.status_code == 400
+    assert "reserved" in res.json()["detail"]
+    assert not (tmp_path / "brigado" / "loops" / "chat").exists()
+
+
+def test_store_create_refuses_an_existing_agent_and_strategy(tmp_path, monkeypatch):
+    import pytest
+
+    _patch_roots(monkeypatch, tmp_path)
+    agents = AgentStore()
+    agents.create(name="Brigado", instructions="Keep.")
+    md = tmp_path / "brigado" / "AGENT.md"
+    before = md.read_bytes()
+
+    with pytest.raises(ValueError, match="already exists"):
+        agents.create(name="brigado", instructions="Lost.")
+    assert md.read_bytes() == before
+
+    strategies = StrategyStore()
+    strategies.create(agent_slug="brigado", name="BRL MM", instructions="Keep.")
+    smd = tmp_path / "brigado" / "loops" / "brl_mm" / "loop.md"
+    sbefore = smd.read_bytes()
+    with pytest.raises(ValueError, match="already exists"):
+        strategies.create(agent_slug="brigado", name="brl mm", instructions="Lost.")
+    assert smd.read_bytes() == sbefore
+
+    # The same name under another agent is a different strategy.
+    agents.create(name="Other")
+    strategies.create(agent_slug="other", name="BRL MM", instructions="Fine.")
+
+
+def test_ensure_default_twice_returns_the_same_strategy(tmp_path, monkeypatch):
+    _patch_roots(monkeypatch, tmp_path)
+    AgentStore().create(name="Brigado")
+    store = StrategyStore()
+
+    first = store.ensure_default("brigado")
+    second = store.ensure_default("brigado")
+
+    assert first is not None and second is not None
+    assert first.key == second.key
+    assert first.created_at == second.created_at
+
+
+def test_mcp_create_with_a_taken_name_returns_an_error_dict(tmp_path, monkeypatch):
+    from mcp_servers.condor.settings import settings
+    from mcp_servers.condor.tools import trading_agent as ta
+
+    _patch_roots(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "user_id", 7, raising=False)
+
+    assert ta.manage_agents(action="create", name="Brigado", agent_key="x")["created"]
+    dup = ta.manage_agents(action="create", name="brigado", agent_key="x")
+    assert "already exists" in dup["error"]
+    reserved = ta.manage_agents(action="create", name="condor", agent_key="x")
+    assert "reserved" in reserved["error"]
+
+    made = ta.manage_loops(
+        action="create", agent_slug="brigado", name="BRL MM", instructions="x"
+    )
+    assert made["created"] is True
+    dup = ta.manage_loops(
+        action="create", agent_slug="brigado", name="brl mm", instructions="y"
+    )
+    assert "already exists" in dup["error"]
+
+
+# ── MCP tool: the server pin is gated like the web routes' (SEC-698) ──
+
+
+class _FakeConfigManager:
+    """A config manager that knows which servers exist and who may reach them.
+
+    Existence and reach are separate sets on purpose: ``may_use_stored_server``
+    is the conjunction of the two, and a fake that folded them together could
+    not tell the shared predicate apart from a bare ``has_server_access``.
+    """
+
+    def __init__(self, servers, access):
+        self.servers = set(servers)
+        self.access = set(access)
+
+    def get_server(self, name):
+        return {"name": name} if name in self.servers else None
+
+    def has_server_access(self, user_id, name, permission=None):
+        return name in self.access
+
+
+def _patch_cm(monkeypatch, servers, access):
+    import config_manager
+
+    monkeypatch.setattr(
+        config_manager,
+        "get_config_manager",
+        lambda: _FakeConfigManager(servers, access),
+    )
+
+
+def test_mcp_update_refuses_a_server_pin_the_caller_cannot_reach(tmp_path, monkeypatch):
+    """The negative case: pinning an Agent to a foreign server is refused."""
+    from mcp_servers.condor.settings import settings
+    from mcp_servers.condor.tools import trading_agent as ta
+
+    _patch_roots(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "user_id", 7, raising=False)
+    _patch_cm(monkeypatch, servers=["mine", "foreign"], access=["mine"])
+
+    assert ta.manage_agents(action="create", name="Sentry", agent_key="x")["created"]
+
+    refused = ta.manage_agents(
+        action="update", agent_slug="sentry", server_name="foreign"
+    )
+    assert refused == {"error": "No access to server 'foreign'"}
+    # Nothing was written: the refusal is not a half-applied update.
+    assert ta.manage_agents(action="get", agent_slug="sentry")["server_name"] == ""
+
+
+def test_mcp_create_refuses_a_server_pin_the_caller_cannot_reach(tmp_path, monkeypatch):
+    """The same gate on create, where the stored pin is the empty one."""
+    from mcp_servers.condor.settings import settings
+    from mcp_servers.condor.tools import trading_agent as ta
+
+    _patch_roots(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "user_id", 7, raising=False)
+    _patch_cm(monkeypatch, servers=["mine", "foreign"], access=["mine"])
+
+    refused = ta.manage_agents(
+        action="create", name="Sentry", agent_key="x", server_name="foreign"
+    )
+    assert refused == {"error": "No access to server 'foreign'"}
+    # And no Agent was created by the attempt.
+    assert "error" in ta.manage_agents(action="get", agent_slug="sentry")
+
+
+def test_mcp_pin_gate_uses_the_stored_name_predicate(tmp_path, monkeypatch):
+    """A name that resolves to no server is refused even for a reaching caller.
+
+    ``may_use_stored_server`` is existence *and* reach; an admin's
+    ``has_server_access`` answers True on any string at all (SEC-164), so a
+    gate built on reach alone would store a pin that can never resolve.
+    """
+    from mcp_servers.condor.settings import settings
+    from mcp_servers.condor.tools import trading_agent as ta
+
+    _patch_roots(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "user_id", 7, raising=False)
+    _patch_cm(monkeypatch, servers=[], access=["ghost"])
+
+    refused = ta.manage_agents(
+        action="create", name="Sentry", agent_key="x", server_name="ghost"
+    )
+    assert refused == {"error": "No access to server 'ghost'"}
+
+
+def test_mcp_reachable_empty_and_unchanged_pins_are_stored(tmp_path, monkeypatch):
+    """The legitimate paths the gate must not break."""
+    from mcp_servers.condor.settings import settings
+    from mcp_servers.condor.tools import trading_agent as ta
+
+    _patch_roots(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "user_id", 7, raising=False)
+    _patch_cm(monkeypatch, servers=["mine", "foreign"], access=["mine"])
+
+    # A reachable name on create.
+    assert ta.manage_agents(
+        action="create", name="Sentry", agent_key="x", server_name="mine"
+    )["created"]
+    assert ta.manage_agents(action="get", agent_slug="sentry")["server_name"] == "mine"
+
+    # A reachable name on update, and clearing the pin, which needs no access.
+    assert ta.manage_agents(action="update", agent_slug="sentry", server_name="")[
+        "updated"
+    ]
+    assert ta.manage_agents(action="get", agent_slug="sentry")["server_name"] == ""
+
+    # Re-sending the stored name is not a change, so it is not re-checked: the
+    # editor round-trip of a pin someone else legitimately set stays writable
+    # even after the share is withdrawn.
+    ta.manage_agents(action="update", agent_slug="sentry", server_name="mine")
+    _patch_cm(monkeypatch, servers=["mine"], access=[])
+    assert ta.manage_agents(
+        action="update", agent_slug="sentry", server_name="mine", description="d"
+    )["updated"]
+    assert ta.manage_agents(action="get", agent_slug="sentry")["server_name"] == "mine"

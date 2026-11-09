@@ -10,13 +10,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  agentOfBot,
-  agentOfControllerId,
+  attributionOf,
   countdown,
   inNamespace,
+  livenessFacts,
   loopFacts,
   loopStatus,
   isPseudoRunKey,
+  ownerDisplayName,
   ownerOf,
   ownerRowLabel,
   ownerTitle,
@@ -48,22 +49,22 @@ describe("the namespace rule", () => {
   const owners = [owner()];
 
   it("owns the base itself", () => {
-    expect(agentOfBot(owners, "brigado-brl_mm")).toBe("brigado.brl_mm");
+    expect(attributionOf(owners, null, "brigado-brl_mm").runKey).toBe("brigado.brl_mm");
   });
 
   it("owns a tagged sibling", () => {
-    expect(agentOfBot(owners, "brigado-brl_mm-btc")).toBe("brigado.brl_mm");
+    expect(attributionOf(owners, null, "brigado-brl_mm-btc").runKey).toBe("brigado.brl_mm");
   });
 
   it("owns a deployed instance, timestamp and all", () => {
-    expect(agentOfBot(owners, "brigado-brl_mm-btc-20260731-101500")).toBe("brigado.brl_mm");
+    expect(attributionOf(owners, null, "brigado-brl_mm-btc-20260731-101500").runKey).toBe("brigado.brl_mm");
   });
 
   it("does not own a bot whose name merely starts with the slug", () => {
     // `-` delimits the namespace, so `brl_mm_v2` is a different strategy and
     // never `brl_mm`'s — this is the collision the convention exists to rule out.
-    expect(agentOfBot(owners, "brigado-brl_mm_v2")).toBe("");
-    expect(agentOfBot(owners, "brigado-brl_mm_v2-btc")).toBe("");
+    expect(attributionOf(owners, null, "brigado-brl_mm_v2").runKey).toBe("");
+    expect(attributionOf(owners, null, "brigado-brl_mm_v2-btc").runKey).toBe("");
   });
 
   it("gives a bot to the longest namespace that claims it", () => {
@@ -73,13 +74,13 @@ describe("the namespace rule", () => {
       // the rule from depending on the order the map came back in.
       owner({ strategySlug: "brl_mm", namespace: "brigado-brl-mm" }),
     ];
-    expect(agentOfBot(both, "brigado-brl-mm-btc")).toBe("brigado.brl_mm");
+    expect(attributionOf(both, null, "brigado-brl-mm-btc").runKey).toBe("brigado.brl_mm");
   });
 
   it("attributes nothing to nobody", () => {
-    expect(agentOfBot(owners, "some-hand-rolled-bot")).toBe("");
-    expect(agentOfBot(owners, "")).toBe("");
-    expect(agentOfBot([], "brigado-brl_mm")).toBe("");
+    expect(attributionOf(owners, null, "some-hand-rolled-bot").runKey).toBe("");
+    expect(attributionOf(owners, null, "").runKey).toBe("");
+    expect(attributionOf([], null, "brigado-brl_mm").runKey).toBe("");
   });
 });
 
@@ -87,15 +88,15 @@ describe("the legacy escape hatch", () => {
   const owners = [owner({ agentSlug: "river", strategySlug: "scalper", declaredBots: ["old_hand_bot"] })];
 
   it("owns a configured name the prefix cannot prove", () => {
-    expect(agentOfBot(owners, "old_hand_bot")).toBe("river.scalper");
+    expect(attributionOf(owners, null, "old_hand_bot").runKey).toBe("river.scalper");
   });
 
   it("owns its deployed instance too", () => {
-    expect(agentOfBot(owners, "old_hand_bot-20260731-101500")).toBe("river.scalper");
+    expect(attributionOf(owners, null, "old_hand_bot-20260731-101500").runKey).toBe("river.scalper");
   });
 
   it("owns its tagged siblings, exactly as the runtime's `owns()` does", () => {
-    expect(agentOfBot(owners, "old_hand_bot-btc")).toBe("river.scalper");
+    expect(attributionOf(owners, null, "old_hand_bot-btc").runKey).toBe("river.scalper");
   });
 
   it("loses to a namespace, which is the stronger proof", () => {
@@ -103,7 +104,7 @@ describe("the legacy escape hatch", () => {
       owner({ agentSlug: "river", strategySlug: "scalper", declaredBots: ["brigado-brl_mm"] }),
       owner(),
     ];
-    expect(agentOfBot(both, "brigado-brl_mm-btc")).toBe("brigado.brl_mm");
+    expect(attributionOf(both, null, "brigado-brl_mm-btc").runKey).toBe("brigado.brl_mm");
   });
 });
 
@@ -111,22 +112,22 @@ describe("standalone executors", () => {
   const owners = [owner({ agentIds: ["brigado.brl_mm_6", "brigado.brl_mm_7"] })];
 
   it("belong to the session that tagged them", () => {
-    expect(agentOfControllerId(owners, "brigado.brl_mm_7")).toBe("brigado.brl_mm");
+    expect(attributionOf(owners, null, "", "brigado.brl_mm_7").runKey).toBe("brigado.brl_mm");
   });
 
   it("belong to their strategy whichever session it was", () => {
-    expect(agentOfControllerId(owners, "brigado.brl_mm_6")).toBe("brigado.brl_mm");
+    expect(attributionOf(owners, null, "", "brigado.brl_mm_6").runKey).toBe("brigado.brl_mm");
   });
 
   it("claim nothing for a controller config id", () => {
     // A controller is attributed through its bot, never through this.
-    expect(agentOfControllerId(owners, "pmm_simple_1")).toBe("");
-    expect(agentOfControllerId(owners, "main")).toBe("");
-    expect(agentOfControllerId(owners, "")).toBe("");
+    expect(attributionOf(owners, null, "", "pmm_simple_1").runKey).toBe("");
+    expect(attributionOf(owners, null, "", "main").runKey).toBe("");
+    expect(attributionOf(owners, null, "", "").runKey).toBe("");
   });
 
   it("do not match a session that never existed", () => {
-    expect(agentOfControllerId(owners, "brigado.brl_mm_99")).toBe("");
+    expect(attributionOf(owners, null, "", "brigado.brl_mm_99").runKey).toBe("");
   });
 });
 
@@ -140,8 +141,24 @@ describe("labels", () => {
     expect(runKeyLabel("nonsense")).toBe("nonsense");
   });
 
+  it("split a run key the way splitRunKey does, so a trailing dot has no strategy half", () => {
+    // runKeyLabel and runOwner both delegate the first-dot split to splitRunKey;
+    // a hand-rolled copy used to print "x / " for a key splitRunKey reads as strategy "",
+    // which is not a two-part key and so stays the raw key.
+    expect(splitRunKey("x.")).toEqual({ agent: "x", strategy: "" });
+    expect(runKeyLabel("x.")).toBe("x.");
+    expect(runKeyLabel("a.b.c")).toBe("a / b.c");
+  });
+
   it("spell the same subject out in display names for the tooltip", () => {
     expect(ownerTitle(owners, "brigado.brl_mm")).toBe("Brigado / BRL MM");
+  });
+
+  it("spell a held owner through the same display-name rule as the lookup (ARCH-413)", () => {
+    expect(ownerTitle(owners, "brigado.brl_mm")).toBe(
+      ownerDisplayName(ownerOf(owners, "brigado.brl_mm")!),
+    );
+    expect(ownerDisplayName(owner({ agentName: "", strategyName: "BRL MM" }))).toBe("brigado / BRL MM");
   });
 
   it("fall back to the label for an owner the map no longer holds", () => {
@@ -236,6 +253,9 @@ describe("the loop's state", () => {
       status: "running",
       tickCount: 214,
       lastTickAt: NOW_S - 22,
+      lastReadingAt: 0,
+      lastSuccessfulActionAt: 0,
+      lastTickDuration: 0,
       frequencySec: 60,
       lastAction: "Spreads held.",
       lastDid: null,
@@ -266,6 +286,45 @@ describe("the loop's state", () => {
       "session 7",
       "tick 0",
       "first tick pending",
+    ]);
+  });
+
+  // ── Quiet or dead (FEAT-137) ──
+  //
+  // `lastTickAt` above advances on a tick whose every call failed, so the
+  // countdown band says a healthy-looking "next tick 38s" for a loop that has
+  // obtained nothing and done nothing for hours. These two ages are what the
+  // reader diagnoses that with.
+
+  it("says how long since the loop last read and last acted", () => {
+    const facts = livenessFacts(
+      loop({ lastReadingAt: NOW_S - 45, lastSuccessfulActionAt: NOW_S - 3860 }),
+      NOW,
+    );
+    expect(facts).toEqual(["read 45s ago", "acted 1h 04m ago"]);
+  });
+
+  it("says never rather than 1970 for a stamp that has never been set", () => {
+    // A loop that has only ever read is the normal state of a market maker
+    // between deploys, so "never acted" is an answer, not a missing value.
+    expect(livenessFacts(loop({ lastReadingAt: NOW_S - 10 }), NOW)).toEqual([
+      "read 10s ago",
+      "acted never",
+    ]);
+    expect(livenessFacts(loop(), NOW)).toEqual(["read never", "acted never"]);
+  });
+
+  it("has nothing to say about a loop that is not there", () => {
+    expect(livenessFacts(null, NOW)).toEqual([]);
+  });
+
+  it("leaves the schedule band alone — a diagnosis is not a countdown", () => {
+    // Deliberately NOT folded into `loopFacts`: that band answers "when does it
+    // tick next", and FEAT-141's fleet view wants these two without it.
+    expect(loopFacts(loop({ lastReadingAt: NOW_S - 45 }), NOW)).toEqual([
+      "session 7",
+      "tick 214",
+      "next tick 38s",
     ]);
   });
 

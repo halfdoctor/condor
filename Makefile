@@ -6,7 +6,7 @@ export PATH := $(HOME)/.local/bin:$(HOME)/.cargo/bin:$(PATH)
 # "Entering/Leaving directory" line around every sub-invocation.
 MAKEFLAGS += --no-print-directory
 
-.PHONY: help setup install run run-fg stop restart logs status check-stopped test lint build-frontend setup-chrome pick-model doctor
+.PHONY: help setup install run run-fg stop restart logs status check-stopped test lint build-frontend setup-chrome setup-worktree pick-model doctor live-backend refresh-codex
 
 # tmux session Condor runs in
 SESSION := condor
@@ -24,24 +24,42 @@ endef
 help:
 	@echo "Condor - Available Commands"
 	@echo ""
-	@echo "  make setup       - Interactive setup wizard"
-	@echo "  make pick-model  - Choose the AI model Condor thinks with"
-	@echo "  make install     - Setup + install all dependencies"
-	@echo "  make run         - Start Condor in the '$(SESSION)' tmux session"
-	@echo "  make run-fg      - Run in the foreground (debugging)"
-	@echo "  make logs        - Attach to the session (detach: Ctrl+B then D)"
-	@echo "  make stop        - Stop Condor"
-	@echo "  make restart     - Stop and start again"
-	@echo "  make status      - Is Condor running?"
-	@echo "  make doctor      - Verify dependencies, config, and Hummingbot API access"
-	@echo "  make test        - Run tests"
-	@echo "  make lint        - Run black + isort"
+	@echo "  make setup          - Interactive setup wizard"
+	@echo "  make pick-model     - Choose the AI model Condor thinks with"
+	@echo "  make refresh-codex  - Update the Codex ACP bridge and its bundled CLI"
+	@echo "  make install        - Setup + install all dependencies"
+	@echo "  make run            - Start Condor in the '$(SESSION)' tmux session"
+	@echo "  make run-fg         - Run in the foreground (debugging)"
+	@echo "  make logs           - Attach to the session (detach: Ctrl+B then D)"
+	@echo "  make stop           - Stop Condor"
+	@echo "  make restart        - Stop and start again"
+	@echo "  make status         - Is Condor running?"
+	@echo "  make doctor         - Verify dependencies, config, and Hummingbot API access"
+	@echo "  make doctor AGENT=x - ...and whether agent x's loops can actually trade"
+	@echo "  make live-backend   - Send a real prompt to the loaded local model (opt-in)"
+	@echo "  make test           - Run tests"
+	@echo "  make lint           - Run black + isort"
 
 setup:
 	@chmod +x setup-environment.sh && ./setup-environment.sh
 
 pick-model:
 	uv run python -m condor.setup_llm
+
+refresh-codex:
+	@if ! command -v npm >/dev/null 2>&1; then \
+		export NVM_DIR="$$HOME/.nvm"; \
+		if [ -s "$$NVM_DIR/nvm.sh" ]; then \
+			. "$$NVM_DIR/nvm.sh"; \
+		fi; \
+	fi; \
+	command -v npm >/dev/null 2>&1 || { \
+		echo "npm not found. Install Node.js or configure nvm."; \
+		exit 1; \
+	}; \
+	npm install -g @agentclientprotocol/codex-acp@latest && \
+	npm list -g @agentclientprotocol/codex-acp @openai/codex --depth=1 && \
+	echo "Start a new Codex session in Condor to use the updated bridge."
 
 install: setup
 	uv sync --dev
@@ -53,18 +71,49 @@ install: setup
 	@$(MAKE) setup-chrome
 	@-$(MAKE) doctor
 
+# Bounded, and says which way it failed. The bare `python -c` this replaces had
+# no timeout and sent stderr to /dev/null, so a stalled download sat on
+# "Setting up Chrome..." for ever with nothing to read and no way to finish the
+# install. See condor/setup_chrome.py; it always exits 0, because charts are
+# optional and an optional renderer must not fail an install.
 setup-chrome:
 	@echo "Setting up Chrome for chart rendering..."
-	@uv run python -c "import kaleido; kaleido.get_chrome_sync()" 2>/dev/null || \
-		echo "Chrome setup skipped (not required for basic usage)"
+	@uv run python -m condor.setup_chrome || true
 
+# Writes config.yml for a worktree that has none, so a preview boots without
+# the owner filling in localhost / admin / admin by hand. No-ops when
+# config.yml already exists (never overwrites one, e.g. the main checkout's).
+setup-worktree:
+	@uv run python scripts/seed_worktree_config.py
+
+# AGENT=slug[.loop] also runs that agent's trading preflight (FEAT-139).
 doctor:
 	@bash -c ' \
 		export NVM_DIR="$$HOME/.nvm"; \
 		[ -s "$$NVM_DIR/nvm.sh" ] && . "$$NVM_DIR/nvm.sh"; \
-		uv run python -m condor.doctor \
+		uv run python -m condor.doctor $(if $(AGENT),--agent $(AGENT),) \
 	'
 
+# The only tests that send a real prompt to a local model (tests/test_live_local_backend.py).
+# Deliberately not wired into `doctor`, `test` or `install`: doctor is a
+# reachability report and only GETs /models, which cannot tell a loaded model
+# that still answers from one an SDK bump broke, and a generation costing tens
+# of seconds has no place in an install. Run this after an SDK bump, with a
+# tool-capable model loaded. CONDOR_LIVE_BACKEND_MODEL=ollama:qwen3 picks the
+# agent key (default `ollama:`, the backend's first model), from the environment
+# or as a make variable; both tests skip when nothing answers.
+live-backend:
+	CONDOR_LIVE_BACKEND_CHECK=1 \
+		$(if $(CONDOR_LIVE_BACKEND_MODEL),CONDOR_LIVE_BACKEND_MODEL=$(CONDOR_LIVE_BACKEND_MODEL),) \
+		uv run pytest tests/test_live_local_backend.py
+
+# Builds into dist.new and swaps, exactly as the in-process updater does
+# (utils/updater.build_frontend). vite's `emptyOutDir` would otherwise empty the
+# directory in place: `run` and `restart` stop Condor first, but this target is
+# public and a Condor started any other way -- `run-fg`, a supervisor, a second
+# checkout -- is left serving an empty dist for the length of the build, and a
+# build that then fails leaves it with no dashboard at all.
+#
 # Reinstall when the lockfile moved, not merely when node_modules is absent:
 # after the first boot the directory always exists, so a pull that adds a
 # dependency would otherwise build against a stale tree and fail. npm rewrites
@@ -79,7 +128,11 @@ build-frontend:
 		   [ package-lock.json -nt node_modules/.package-lock.json ]; then \
 			npm ci || exit 1; \
 		fi; \
-		npm run build \
+		rm -rf dist.new && \
+		npm run build -- --outDir dist.new --emptyOutDir && \
+		rm -rf dist.old && \
+		{ [ -d dist ] && mv dist dist.old || true; } && \
+		mv dist.new dist \
 	'
 
 # Fails early (before the frontend build) if Condor is already up

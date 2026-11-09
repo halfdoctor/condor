@@ -28,6 +28,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { StrategyDetail } from "@/lib/api";
+import { parseYamlMapping } from "@/lib/configYaml";
 
 /** jsdom has none, and the editor dialogs' module graph reads the theme. */
 window.matchMedia = ((media: string) => ({
@@ -46,9 +47,23 @@ vi.mock("@/lib/api", () => ({
     deleteStrategy: vi.fn(),
     getRoutineInstances: vi.fn(() => Promise.resolve([])),
     setRestartOnBoot: vi.fn(),
+    updateStrategyConfig: vi.fn(),
     updateStrategyMd: vi.fn(),
     updateStrategyLearnings: vi.fn(),
   },
+}));
+
+// CodeMirror is a real editor widget needing layout jsdom has not got, and the
+// config editor's own file is where its behaviour is asserted. Here it only has
+// to hand back the buffer the card seeded it with.
+vi.mock("@/components/editor/CodeEditor", () => ({
+  CodeEditor: ({
+    value,
+    onChange,
+  }: {
+    value: string;
+    onChange?: (next: string) => void;
+  }) => <textarea data-yaml value={value} onChange={(e) => onChange?.(e.target.value)} />,
 }));
 
 vi.mock("@/components/routines/ReportBrowser", () => ({
@@ -56,6 +71,7 @@ vi.mock("@/components/routines/ReportBrowser", () => ({
 }));
 
 const { PlaybookView } = await import("./PlaybookView");
+const { api } = await import("@/lib/api");
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean;
@@ -84,6 +100,9 @@ const STRATEGY = {
     bot_name: "",
     agent_key: "",
     total_amount_quote: 100,
+    // A key no build of this card names — the `Other` group's case, and the one
+    // a typed form could not have edited at all.
+    sizing_hint: "aggressive",
     risk_limits: {
       max_position_size_quote: 500,
       max_open_executors: 5,
@@ -167,6 +186,79 @@ describe("PlaybookView", () => {
     expect(text).toContain("unlimited"); // max_ticks: 0
   });
 
+  /** The value cell of the setting labelled `label`, as the config card draws it. */
+  function settingValue(label: string): HTMLElement {
+    const dt = Array.from(container.querySelectorAll("dt")).find(
+      (el) => el.textContent === label,
+    );
+    const dd = dt?.nextElementSibling as HTMLElement | null;
+    if (!dd) throw new Error(`no setting "${label}"`);
+    return dd;
+  }
+  const isOff = (dd: HTMLElement) => dd.className.includes("opacity-60");
+
+  it("dims max ticks at its default 0 and shows a positive cap as a live number", () => {
+    render();
+    let dd = settingValue("max ticks");
+    expect(dd.textContent).toBe("unlimited");
+    expect(isOff(dd)).toBe(true);
+
+    act(() => root.unmount());
+    root = createRoot(container);
+    render({ ...STRATEGY, config: { ...STRATEGY.config, max_ticks: 25 } } as StrategyDetail);
+    dd = settingValue("max ticks");
+    expect(dd.textContent).toBe("25");
+    expect(isOff(dd)).toBe(false);
+  });
+
+  it("shows the money settings in the strategy's own quote asset", () => {
+    // LP-2: the Solana LP operator's limits are denominated in SOL, and a 0.5
+    // SOL ceiling rendered as "$0.50" is both the wrong unit and, read as
+    // dollars, three orders of magnitude out. Same rule as the agent's journal
+    // and the risk gate's refusals, so one ceiling reads in one unit wherever
+    // an operator meets it.
+    render({
+      ...STRATEGY,
+      config: {
+        ...STRATEGY.config,
+        quote_asset: "SOL",
+        total_amount_quote: 0.03,
+        // Written out rather than spread from the fixture: `config` is typed
+        // loosely enough that `config.risk_limits` is not a spreadable object
+        // type, and the explicit block says what this card is reading anyway.
+        risk_limits: {
+          max_position_size_quote: 0.5,
+          max_open_executors: 5,
+          max_drawdown_pct: -1,
+          max_leverage: -1,
+        },
+      },
+    } as unknown as StrategyDetail);
+
+    expect(settingValue("budget").textContent).toBe("0.0300 SOL");
+    expect(settingValue("max position").textContent).toBe("0.5000 SOL");
+  });
+
+  it("shows the money settings in dollars when the strategy quotes in one", () => {
+    render();
+
+    expect(settingValue("budget").textContent).toBe("$100.00");
+    expect(settingValue("max position").textContent).toBe("$500.00");
+  });
+
+  it("marks a risk limit off exactly when it reads no limit", () => {
+    render();
+    const drawdown = settingValue("max drawdown"); // -1
+    expect(drawdown.textContent).toBe("no limit");
+    expect(isOff(drawdown)).toBe(true);
+    const drift = settingValue("max drift"); // absent
+    expect(drift.textContent).toBe("no limit");
+    expect(isOff(drift)).toBe(true);
+    const executors = settingValue("max executors"); // 5
+    expect(executors.textContent).toBe("5");
+    expect(isOff(executors)).toBe(false);
+  });
+
   it("tells an empty playbook what it is for", () => {
     render({ ...STRATEGY, strategy_md: "" });
     expect(container.textContent).toContain("standing brief");
@@ -185,6 +277,107 @@ describe("PlaybookView", () => {
     const sw = container.querySelector('[role="switch"]');
     expect(sw?.getAttribute("aria-checked")).toBe("true");
     expect(sw?.textContent).toContain("resumes on restart");
+  });
+
+  /** The Configuration card — not the two documents, which each have one too. */
+  const configCard = () =>
+    [...container.querySelectorAll("section")].find(
+      (el) => el.querySelector("h3")?.textContent?.trim() === "Configuration",
+    )!;
+  /** That card's own Edit/Done door. */
+  const editButton = () =>
+    [...configCard().querySelectorAll("button")].find((b) =>
+      /^(Edit|Done)$/.test(b.textContent?.trim() ?? ""),
+    )!;
+
+  it("hands the whole stored mapping to the editor, nested block and unnamed key", () => {
+    render();
+    act(() => editButton().click());
+
+    const buffer = configCard().querySelector<HTMLTextAreaElement>("[data-yaml]")!.value;
+    const parsed = parseYamlMapping(buffer);
+    // A round trip, not a projection: the 22 rows the card names are a reading
+    // of the config, and an editor that could only write those would silently
+    // drop `sizing_hint` — the very key the `Other` group exists to show.
+    expect(parsed.ok && parsed.value).toEqual(STRATEGY.config);
+  });
+
+  it("puts the laid-out rows back when edit mode closes", () => {
+    render();
+    act(() => editButton().click());
+    expect(configCard().querySelector("[data-yaml]")).not.toBeNull();
+    expect(configCard().querySelector("dt")).toBeNull();
+
+    act(() => editButton().click());
+    expect(configCard().querySelector("[data-yaml]")).toBeNull();
+    // Still the stored values, still read as settings rather than as numbers.
+    expect(settingValue("max drawdown").textContent).toBe("no limit");
+    expect(settingValue("cadence").textContent).toBe("1h 00m");
+  });
+
+  it("asks before closing edit mode over unsaved config edits", () => {
+    render();
+    act(() => editButton().click());
+
+    const box = configCard().querySelector<HTMLTextAreaElement>("[data-yaml]")!;
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )!.set!;
+    act(() => {
+      setter.call(box, "frequency_sec: 60\n");
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    act(() => editButton().click());
+    // Done is not Discard. The same bargain `DocCard` strikes one row up.
+    expect(container.textContent).toContain("Unsaved Changes");
+    expect(configCard().querySelector("[data-yaml]")).not.toBeNull();
+
+    const discard = [...container.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "Discard changes",
+    )!;
+    act(() => discard.click());
+    expect(configCard().querySelector("[data-yaml]")).toBeNull();
+    expect(settingValue("cadence").textContent).toBe("1h 00m");
+  });
+
+  it("leaves the restart switch on its own route, not on the config editor", async () => {
+    vi.mocked(api.updateStrategyConfig).mockClear();
+    vi.mocked(api.setRestartOnBoot).mockResolvedValueOnce({
+      restart_on_boot: false,
+      applied_to_running: 1,
+    });
+    render();
+    const sw = container.querySelector<HTMLButtonElement>('[role="switch"]')!;
+    await act(async () => sw.click());
+
+    // It is the one config write that reaches live engines. Routing it through
+    // the editor — whose save reaches the file and no running session — would
+    // quietly make it stop doing that.
+    expect(api.setRestartOnBoot).toHaveBeenCalledWith("brigado", "pmm_king", false);
+    expect(api.updateStrategyConfig).not.toHaveBeenCalled();
+  });
+
+  it("says why a refused restart write snapped back", async () => {
+    vi.mocked(api.setRestartOnBoot).mockRejectedValueOnce(
+      new Error("Another user's loop is running this strategy — stop it first"),
+    );
+    render();
+    const sw = container.querySelector<HTMLButtonElement>('[role="switch"]')!;
+    await act(async () => sw.click());
+    for (let i = 0; i < 5; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    expect(api.setRestartOnBoot).toHaveBeenCalledWith("brigado", "pmm_king", false);
+    const after = container.querySelector('[role="switch"]');
+    expect(after?.getAttribute("aria-checked")).toBe("true");
+    // Beside the switch, in the Configuration card's own header.
+    expect(after?.closest("header")?.querySelector('[role="alert"]')?.textContent).toContain(
+      "Another user's loop is running this strategy",
+    );
   });
 });
 

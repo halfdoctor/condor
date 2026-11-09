@@ -155,7 +155,23 @@ MARKERS = ("current_position_average_price", "break_even_price", "held_position_
 # export, where the row's price is by definition the close price and the
 # timestamps arrive as ISO strings. It is listed here so a real second copy of the
 # live transform still trips the assertion below.
-KNOWN_SEPARATE_TRANSFORMS = {"condor/fetchers/archived_run.py"}
+#
+# ``condor/venue_drift.py`` is not a display row either: ``tracked_from_active``
+# divides a running executor's open quote by the exact price it was valued at
+# (CORR-708). The display chain would substitute ``config.entry_price`` first —
+# a position executor's limit price, not its fill — and misstate the base.
+#
+# ``condor/agents/shutdown.py`` names ``held_position_orders`` in
+# ``_CLAIM_ORDER_KEYS`` (SEC-739), the ownership test of the stop's order sweep.
+# It reads order *ids* out of that list and never a price, so it is not a second
+# copy of the fallback chain this guard is about: the display row's price comes
+# from ``build_executor_row`` and nowhere else, which is what the assertion below
+# still holds it to.
+KNOWN_SEPARATE_TRANSFORMS = {
+    "condor/fetchers/archived_run.py",
+    "condor/venue_drift.py",
+    "condor/agents/shutdown.py",
+}
 
 
 @pytest.mark.parametrize("marker", MARKERS)
@@ -206,17 +222,17 @@ def test_the_creators_tag_outranks_the_configs_default():
     ex = {
         "id": "e1",
         "status": "RUNNING",
-        "controller_id": "adaptive_grid_trader.sol_usdt_adaptive_grid_7",
+        "controller_id": "market_making_expert.pmm_mister_operator_7",
         "config": {"controller_id": "main"},
     }
 
     assert (
         build_executor_row(ex)["controller_id"]
-        == "adaptive_grid_trader.sol_usdt_adaptive_grid_7"
+        == "market_making_expert.pmm_mister_operator_7"
     )
     assert (
         _executor_row(ex)["controller_id"]
-        == "adaptive_grid_trader.sol_usdt_adaptive_grid_7"
+        == "market_making_expert.pmm_mister_operator_7"
     )
 
 

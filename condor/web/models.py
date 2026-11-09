@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from condor.fetchers.executors import build_executor_row, get_executor_type
 from condor.fetchers.models import (
@@ -115,10 +115,52 @@ class BotSummary(BaseModel):
     bot_name: str
     status: str = "unknown"
     num_controllers: int = 0
+    # ``status: "running"`` with no controller to run: the container is up and
+    # nothing is trading ([[CORR-725]]). Carried on the wire because without
+    # the field the REST body would drop the flag the builder sets and each
+    # client would be back to re-deriving it.
+    running_without_controllers: bool = False
     error_count: int = 0
     deployed_at: Optional[str] = None
     error_logs: list[dict[str, Any]] = []
     general_logs: list[dict[str, Any]] = []
+
+
+class OrphanedExecutorInfo(BaseModel):
+    """A RUNNING executor whose owning session is gone ([[CORR-726]]).
+
+    The single most expensive defect of the Agent Builder Cup: one such LP
+    executor polled every second for 13.5h and ate a host's whole RPC budget,
+    and nothing on any screen said it existed. The session number is part of
+    the identity — the lineage is alive, that *session* is not.
+    """
+
+    executor_id: str = ""
+    controller_id: str = ""
+    agent_slug: str = ""
+    strategy_slug: str = ""
+    session_num: int = 0
+    pair: str = ""
+    kind: str = ""
+
+
+class ExecutorHygieneModel(BaseModel):
+    """One host's executor hygiene ([[FEAT-141]]).
+
+    Folded from the executor rows the poller already cached, so it costs the
+    bots payload no extra call. ``available: False`` means nothing was cached
+    and nothing was fetched for it — rendered as *unknown*, never as a clean
+    host, which is the lesson of [[CORR-725]]. ``truncated`` says the counts
+    are a floor: the cache holds the newest page, and nothing upstream prunes a
+    terminal row ([[PERF-733]]).
+    """
+
+    available: bool = False
+    counted: int = 0
+    running: int = 0
+    terminated: int = 0
+    truncated: bool = False
+    orphaned_running: list[OrphanedExecutorInfo] = []
 
 
 class BotsPageResponse(BaseModel):
@@ -128,6 +170,10 @@ class BotsPageResponse(BaseModel):
     total_volume: float = 0.0
     server_online: bool = True
     error_hint: Optional[str] = None
+    #: Additive ([[FEAT-141]]): a client that ignores it gets the page it got
+    #: before. The default is the unavailable state, so a payload built without
+    #: the fold (an error path) reads as *unknown* rather than as a clean host.
+    executor_hygiene: ExecutorHygieneModel = Field(default_factory=ExecutorHygieneModel)
 
 
 # ── Bot Runs ──
@@ -735,6 +781,52 @@ class CredentialInfo(BaseModel):
 
 class GatewayPullRequest(BaseModel):
     image: str = "hummingbot/gateway:development"
+
+
+class ApiClientConfigUpdateRequest(BaseModel):
+    """A partial change to the client defaults new bot deploys inherit (FEAT-121).
+
+    Every field is optional and only the ones supplied are written, so a save that moves
+    the oracle source leaves the global token exactly as it was.
+
+    Values are *not* validated here beyond the shapes below. The authority is the
+    server's own bundled hummingbot — it checks the source against the rate-oracle
+    sources that build knows and the share against ``ClientConfigMap``'s own bound — and
+    a second copy of a rule that must agree with a remote library version is the copy
+    that goes stale. The share's range is the one exception, pinned because it is a plain
+    number with no server-side spelling to get wrong and rejecting it here saves a round
+    trip to be told 422.
+    """
+
+    rate_oracle_source: Optional[str] = None
+    global_token_name: Optional[str] = None
+    global_token_symbol: Optional[str] = None
+    rate_limits_share_pct: Optional[float] = Field(default=None, gt=0, le=100)
+
+    @field_validator("rate_oracle_source", "global_token_name", "global_token_symbol")
+    @classmethod
+    def _strip_and_reject_blank(cls, v: Optional[str]) -> Optional[str]:
+        # A pasted " binance" is the same choice as "binance"; a field cleared to "" is
+        # not a change to empty, it is a field the form should have omitted. Upstream
+        # refuses a blank token name outright, so let it never get there.
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+
+class ApiUpgradeRequest(BaseModel):
+    """Consent to what upgrading a server's hummingbot-api destroys (FEAT-122).
+
+    Restarting the API closes every RUNNING executor as ``SYSTEM_CLEANUP`` and they are
+    not restored; bot containers are separate and keep running. The one field is that
+    acknowledgement, and it defaults to False — a request that omits it is a caller who
+    consented to nothing, which the server refuses with a 409 rather than serving.
+    """
+
+    acknowledge_executor_loss: bool = False
 
 
 class GatewayNetworkUpdateRequest(BaseModel):

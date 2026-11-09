@@ -13,7 +13,7 @@ Four things are asserted here, in the order the feature builds them:
    server, and the registered set per profile is *unchanged* from before the
    tables moved out of ``server.py``;
 2. the subtraction — ``register_tools`` drops exactly the muted name off a bare
-   ``FastMCP`` and leaves every other tool alone;
+   ``MCPServer`` and leaves every other tool alone;
 3. the spawn — ``seat_tools`` describes the seat, no ``--mute-tools`` reaches
    argv when nothing is muted (byte-identical to before this feature), and the
    exact csv reaches both subprocesses when something is;
@@ -24,7 +24,7 @@ Four things are asserted here, in the order the feature builds them:
 import asyncio
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from condor.memory.mutes import load_mutes, set_muted
 from condor.runtime import toolsets
@@ -46,7 +46,7 @@ MODULES = [
 
 def _registered(module, profile: str = "full", muted=()) -> set[str]:
     """The tool names ``profile`` puts on a fresh server, minus ``muted``."""
-    server = FastMCP("mute-probe")
+    server = MCPServer("mute-probe")
     module.register_tools(server, profile, muted)
     return {tool.name for tool in asyncio.run(server.list_tools())}
 
@@ -87,7 +87,7 @@ def test_every_mounted_tool_has_a_line_for_the_panel(module, profiles):
 
 def test_the_leaf_modules_do_not_wake_a_server():
     """The web process imports these to draw the switches. Importing a
-    ``server.py`` parses argv and builds a ``FastMCP`` singleton — neither of
+    ``server.py`` parses argv and builds a ``MCPServer`` singleton — neither of
     which a web request has any business doing — so the tables have to be
     reachable without it."""
     import subprocess
@@ -113,7 +113,7 @@ def test_the_leaf_modules_do_not_wake_a_server():
 
 def test_the_shared_profile_helpers_are_a_leaf_too():
     """ARCH-289 moved the mechanics both servers share into
-    ``mcp_servers/_profiles.py``. It annotates ``FastMCP`` but must not import
+    ``mcp_servers/_profiles.py``. It annotates ``MCPServer`` but must not import
     it, and must never reach for a ``server`` module: anything it drags in, both
     servers drag in at import, and the leafness of the name tables above is only
     worth as much as the module they are resolved by."""
@@ -172,7 +172,7 @@ def test_a_mute_for_a_tool_this_seat_never_mounts_is_a_no_op(module, profiles):
 @pytest.mark.parametrize("module,profiles", MODULES)
 def test_muting_still_refuses_an_unknown_profile(module, profiles):
     with pytest.raises(ValueError, match="Unknown tool profile"):
-        module.register_tools(FastMCP("probe"), "trading", ["delegate"])
+        module.register_tools(MCPServer("probe"), "trading", ["delegate"])
 
 
 def test_muting_cannot_widen_a_seat():
@@ -458,3 +458,52 @@ def test_the_route_refuses_a_tool_this_seat_never_mounts(web_env):
     )
     assert bad.status_code == 400
     assert load_mutes("brigado")["tools"] == set()
+
+
+# ── FEAT-128: a stored old tool name means the tool it became ──
+
+
+def test_an_allowlist_naming_manage_strategies_keeps_manage_loops_on_both_backends(
+    monkeypatch,
+):
+    """An AGENT.md written before the rename must not mute its own loop tool.
+
+    ``manage_strategies`` is never registered again; the allowlist and the
+    pydantic-ai filter read the stored name as ``manage_loops`` instead.
+    """
+    from types import SimpleNamespace
+
+    from condor.acp.pydantic_ai_client import PydanticAIClient
+    from condor.agents.agent import AgentStore
+
+    slug = _agent_allowing("manage_strategies", "delegate")
+
+    # ACP (and every other) seat: the argv subtraction.
+    muted = _muted_on(_session_args(monkeypatch, agent_slug=slug)["condor"])
+    assert "manage_loops" not in muted and "delegate" not in muted
+    assert "manage_agents" in muted
+
+    # pydantic-ai: the definition filter.
+    client = PydanticAIClient(
+        model="ollama:x", allowed_tools=AgentStore().get(slug).tools
+    )
+    defs = [
+        SimpleNamespace(name="mcp__condor__manage_loops"),
+        SimpleNamespace(name="delegate"),
+        SimpleNamespace(name="manage_agents"),
+    ]
+    kept = asyncio.run(client._prepare_tools(None, defs))
+    assert sorted(d.name for d in kept) == ["delegate", "mcp__condor__manage_loops"]
+
+
+def test_a_mutes_file_naming_the_old_tool_mutes_the_new_one(tmp_path):
+    from condor.memory.mutes import mutes_path
+
+    path = mutes_path("perps")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("tools: [manage_strategies]\nskills: [strategy_builder]\n")
+
+    mutes = load_mutes("perps")
+    assert mutes["tools"] == {"manage_loops"}
+    assert mutes["skills"] == {"loop_builder"}
+    assert {r["name"] for r in seat_tools("perps") if r["muted"]} == {"manage_loops"}

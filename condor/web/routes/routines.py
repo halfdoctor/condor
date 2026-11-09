@@ -11,6 +11,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from condor import routine_hooks
+from condor.agents.code_trust import PendingConsentError
 from condor.reports import list_reports
 from condor.routine_store import get_routine_store, routine_source_roots
 from condor.runtime import client, wake
@@ -201,6 +202,10 @@ async def run_routine_v2(
             session_key=body.session_key,
             on_complete=on_complete,
         )
+    except PendingConsentError as e:
+        # 403, not 404: the routine is right there, and the operator has not
+        # allowed its file to execute on this install yet (FEAT-147).
+        raise HTTPException(403, str(e))
     except ValueError as e:
         raise HTTPException(404, str(e))
     # The *bounded* value, not the requested one: a caller told "resume" when
@@ -233,6 +238,10 @@ async def start_continuous_v2(
             conversation_id=await client.conversation_for_session(body.session_key),
             session_key=body.session_key,
         )
+    except PendingConsentError as e:
+        # 403, not 404: the routine is right there, and the operator has not
+        # allowed its file to execute on this install yet (FEAT-147).
+        raise HTTPException(403, str(e))
     except ValueError as e:
         raise HTTPException(404, str(e))
     return {"instance_id": instance_id}
@@ -254,6 +263,10 @@ async def schedule_routine_v2(
             interval_sec=body.interval_sec,
             user_id=user.id,
         )
+    except PendingConsentError as e:
+        # 403, not 404: the routine is right there, and the operator has not
+        # allowed its file to execute on this install yet (FEAT-147).
+        raise HTTPException(403, str(e))
     except ValueError as e:
         raise HTTPException(404, str(e))
     return {"instance_id": instance_id}
@@ -354,6 +367,27 @@ async def get_field_options(
     return {"options": []}
 
 
+@router.get("/{routine_name:path}/fields")
+async def get_routine_fields_route(
+    routine_name: str,
+    user: WebUser = Depends(get_current_user),
+):
+    """Return the ``Config`` fields of an allowed routine, for the Config form.
+
+    ``GET /routines`` lists an agent's own routines through
+    :func:`catalog_agent_routines`, which never imports the module and so
+    always reports ``fields: {}`` for them. The dashboard calls this one
+    instead, once the operator actually opens the Config panel, so importing
+    to read the fields happens on that explicit action rather than on the
+    page load that lists every routine.
+    """
+    store = get_routine_store()
+    try:
+        return {"fields": store.get_routine_fields(routine_name)}
+    except PendingConsentError as e:
+        raise HTTPException(403, str(e))
+
+
 @router.get("/{routine_name:path}/source")
 async def get_routine_source(
     routine_name: str,
@@ -369,14 +403,27 @@ async def get_routine_source(
     allowlist stopping ``..`` and symlink escapes out of the dirs discovery
     reads, never an authorization check. Agent homes stay out of those roots,
     so a journal or memory store next door is not in scope either way.
+
+    A routine awaiting execution consent, or one whose listing never imports
+    it (:class:`~routines.base.RoutineCatalogEntry`), is served from its own
+    ``source_path`` rather than through ``inspect.getfile(run_fn)``
+    (FEAT-147): resolving the file through the imported object would mean
+    importing it, and reading the code is the one thing the operator must be
+    able to do *before* that.
     """
     store = get_routine_store()
     all_routines = store._discover_all()
     routine = all_routines.get(routine_name)
-    if not routine:
+    pending = None if routine else store._pending_all().get(routine_name)
+    if not routine and not pending:
         raise HTTPException(404, "Routine not found")
     try:
-        source_file = inspect.getfile(routine.run_fn)
+        if pending is not None:
+            source_file = pending.source_path
+        elif hasattr(routine, "source_path"):
+            source_file = routine.source_path
+        else:
+            source_file = inspect.getfile(routine.run_fn)
         source_path = Path(source_file).resolve()
         # CORR-585: confine to the roots discovery actually reads — the general
         # library, the shared one and each agent's own routines/ — not just a
@@ -385,7 +432,7 @@ async def get_routine_source(
             raise HTTPException(403, "Source not available")
         source = source_path.read_text()
         return {"filename": source_path.name, "source": source}
-    except (TypeError, OSError) as e:
+    except (TypeError, OSError, AttributeError) as e:
         raise HTTPException(404, f"Source not available: {e}")
 
 
@@ -402,9 +449,11 @@ async def get_routine_reports(
     # SEC-593: scope to the caller before matching. The routine name is a free
     # string anyone may spell, so this listing is only as private as its owner
     # filter — the same one ``GET /reports`` applies.
+    # Exact source_name match (full prefixed or base name), applied in the store
+    # before the page is sliced so no match is lost past ``limit`` (ARCH-692).
     reports, total = list_reports(
-        search=base_name, limit=limit, owner_id=report_owner_filter(user)
+        source_name=(routine_name, base_name),
+        limit=limit,
+        owner_id=report_owner_filter(user),
     )
-    # Filter to exact source_name match (full prefixed or base name)
-    exact = [r for r in reports if r.get("source_name") in (routine_name, base_name)]
-    return {"reports": exact, "total": len(exact)}
+    return {"reports": reports, "total": total}

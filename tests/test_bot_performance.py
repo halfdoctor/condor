@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from condor.agents.attribution import OwnershipWindow
 from condor.agents.config import AgentConfig, load_full_config
 from condor.agents.performance import (
     AgentPerformance,
@@ -23,6 +24,7 @@ from condor.fetchers.bot_performance import (
     clear_snapshot_cache,
     extract_snapshots,
     fetch_all_bot_performance,
+    resolve_bots,
 )
 
 
@@ -357,6 +359,7 @@ def test_bot_executor_rows_from_positions():
     assert r["fees"] == 0.3
     assert r["entry_price"] == 60.0
     assert r["amount"] == 120.0  # abs(2.0) * 60.0 quote notional
+    assert r["amount_known"] is True  # both fields read, size is a fact
     assert r["timestamp"] > 0  # ISO parsed to epoch
 
 
@@ -368,6 +371,149 @@ def test_flat_controller_yields_no_rows_but_counts_pnl():
     # realized/unrealized still aggregate even with no open positions
     assert agg["bot"]["realized_pnl_quote"] == 1.0
     assert agg["bot"]["unrealized_pnl_quote"] == 2.0
+
+
+# ── A controller position's own sizing verdict (CORR-742) ──
+#
+# The row's quote size is derived, ``amount`` x ``breakeven_price`` off the
+# upstream ``positions_summary``, so it has an absence mode of its own that the
+# raw-executor builder's verdict (CORR-740) does not describe. Without one,
+# ``executors._size_unknown`` read the missing key as known-zero and a position
+# holding real base at no usable price entered the risk book at $0 *and* was
+# reported as priced, leaving ``book_trusted`` True over exposure of unknown
+# size -- the very failure CORR-740 closed, reached through the other builder.
+
+
+def _rows_for(pos):
+    agg = _aggregate_by_bot(
+        [_snap_with_positions("bot", "dn_CL_mm", "2026-07-24T18:00:00+00:00", [pos])]
+    )
+    return bot_executor_rows(agg["bot"])
+
+
+_UNPRICED_POSITION = {
+    "connector_name": "hyperliquid",
+    "trading_pair": "XYZ:CL-USD",
+    "side": "TradeType.SELL",
+    "amount": 2.0,
+}
+_ROW_ID = "dn_CL_mm:XYZ:CL-USD"
+
+
+@pytest.mark.parametrize(
+    "pos,known",
+    [
+        ({"amount": 2.0, "breakeven_price": 60.0}, True),
+        ({"amount": 2.0}, False),
+        ({"amount": 2.0, "breakeven_price": 0}, False),
+        ({"amount": 2.0, "breakeven_price": None}, False),
+        ({"amount": -2.0}, False),
+        ({"amount": 0, "breakeven_price": 60.0}, True),
+        ({"amount": 0}, True),
+    ],
+    ids=[
+        "priced",
+        "no-breakeven",
+        "breakeven-zero",
+        "breakeven-null",
+        "short-no-breakeven",
+        "flat-priced",
+        "flat",
+    ],
+)
+def test_a_controller_position_carries_its_own_sizing_verdict(pos, known):
+    """Unlike a quote sizing field, a price of 0 over held base is not a fact.
+
+    ``abs(amount) * 0`` says nothing about a position holding base, so an absent
+    and a present-zero ``breakeven_price`` are the same answer: unknown. A
+    genuinely flat position is known-zero and must refuse nothing.
+    """
+    rows = _rows_for({"trading_pair": "XYZ:CL-USD", **pos})
+
+    assert len(rows) == 1
+    assert rows[0]["amount_known"] is known
+
+
+def test_every_controller_row_carries_the_verdict():
+    agg = _aggregate_by_bot(
+        [
+            _snap_with_positions(
+                "bot",
+                "dn_CL_mm",
+                "2026-07-24T18:00:00+00:00",
+                [
+                    {"trading_pair": "A-USD", "amount": 2.0, "breakeven_price": 60.0},
+                    {"trading_pair": "B-USD", "amount": 2.0},
+                ],
+            )
+        ]
+    )
+
+    assert [r["amount_known"] for r in bot_executor_rows(agg["bot"])] == [True, False]
+
+
+def _provider_data_for(monkeypatch, rows, asked=None):
+    from condor.agents.providers.executors import ExecutorsProvider
+
+    async def _fake(client, agent_id, **_kw):
+        return AgentPerformance(agent_id=agent_id, executors=list(rows))
+
+    async def _price(client, *_a, **_kw):
+        if asked is not None:
+            asked.append(_a)
+        return 150.0
+
+    monkeypatch.setattr("condor.agents.performance.fetch_agent_performance", _fake)
+    monkeypatch.setattr("condor.fetchers.market_data.fetch_current_price", _price)
+    return asyncio.run(ExecutorsProvider().execute(object(), {}, agent_id="a_1")).data
+
+
+def test_an_unpriced_controller_position_unbooks_the_risk_book(monkeypatch):
+    """Driven through the real consumers: provider -> tick -> ``book_trusted``."""
+    from tests.test_executor_adoption import _book_engine
+
+    asked: list = []
+    data = _provider_data_for(monkeypatch, _rows_for(_UNPRICED_POSITION), asked)
+
+    assert data["total_exposure"] == 0.0
+    assert data["unpriced_exposure"] == [_ROW_ID]
+    # Reported, not priced: the row carries no base ``config.amount`` to value,
+    # so a live feed answering $150 is never even asked (CORR-740's answer).
+    assert asked == []
+
+    book, captured = _book_engine(
+        adopted=[],
+        own_rows=data["executors"],
+        own_exposure=data["total_exposure"],
+        own_unpriced=data["unpriced_exposure"],
+    )
+    asyncio.run(book._gather_tick_context(client=None))
+
+    assert not captured["state"].book_trusted
+    assert _ROW_ID in captured["state"].drift_reason
+
+
+def test_a_priced_controller_position_still_counts_as_valued_exposure(monkeypatch):
+    """The other half: the fix must not refuse creates over a sized position."""
+    from tests.test_executor_adoption import _book_engine
+
+    data = _provider_data_for(
+        monkeypatch, _rows_for({**_UNPRICED_POSITION, "breakeven_price": 60.0})
+    )
+
+    assert data["total_exposure"] == pytest.approx(120.0)
+    assert data["unpriced_exposure"] == []
+
+    book, captured = _book_engine(
+        adopted=[],
+        own_rows=data["executors"],
+        own_exposure=data["total_exposure"],
+        own_unpriced=data["unpriced_exposure"],
+    )
+    asyncio.run(book._gather_tick_context(client=None))
+
+    assert captured["state"].book_trusted
+    assert captured["state"].total_exposure == pytest.approx(120.0)
 
 
 # ── Merge into AgentPerformance ──
@@ -392,11 +538,11 @@ def test_merge_is_disjoint_addition():
     # Without bot_name: executor-only behavior.
     base = asyncio.run(fetch_agent_performance(client, agent_id))
     assert base.realized_pnl == 4.0
-    assert base.bot_name == ""
+    assert base.bot_names == []
 
     # With bot_name "river": adds river's 7/7/1500 on top, no double count.
     merged = asyncio.run(fetch_agent_performance(client, agent_id, bot_names=["river"]))
-    assert merged.bot_name == "river"
+    assert merged.bot_names == ["river"]
     assert merged.realized_pnl == 4.0 + 7.0
     assert merged.unrealized_pnl == 7.0
     assert merged.total_pnl == merged.realized_pnl + merged.unrealized_pnl
@@ -429,7 +575,7 @@ def test_merge_appends_bot_positions_as_rows():
     # base name resolves suffix-tolerantly to the deployed instance
     merged = asyncio.run(fetch_agent_performance(client, agent_id, bot_names=["dn-mm"]))
     # bot_name reflects the resolved deployed instance, not just the base
-    assert merged.bot_name == "dn-mm-20260724-1"
+    assert merged.bot_names == ["dn-mm-20260724-1"]
     assert len(merged.executors) == 1
     assert merged.executors[0]["pair"] == "XYZ:CL-USD"
     assert merged.open_count == 1
@@ -522,7 +668,7 @@ def test_no_snapshot_leaves_executor_totals_unchanged():
     no_bot = asyncio.run(fetch_agent_performance(client, agent_id))
     # bot_name set but no matching snapshot → totals identical to executor-only.
     ghost = asyncio.run(fetch_agent_performance(client, agent_id, bot_names=["ghost"]))
-    assert ghost.bot_name == "ghost"
+    assert ghost.bot_names == ["ghost"]
     assert ghost.unrealized_pnl == no_bot.unrealized_pnl == 2.0
     assert ghost.total_pnl == no_bot.total_pnl
     assert ghost.controllers == []
@@ -532,10 +678,18 @@ def test_batch_merges_only_named_agents():
     a1, a2 = "river.scalp_1", "plain.scalp_1"
     client = _FakeClient(rows_by_id={})
     out = asyncio.run(fetch_agent_performance_batch(client, [a1, a2], {a1: ["river"]}))
-    assert out[a1].bot_name == "river"
+    assert out[a1].bot_names == ["river"]
     assert out[a1].realized_pnl == 7.0
-    assert out[a2].bot_name == ""  # not named → untouched, executor-only
+    assert out[a2].bot_names == []  # not named → untouched, executor-only
     assert out[a2].realized_pnl == 0.0
+
+
+def test_agent_performance_has_no_single_bot_shims():
+    # READ-685: the single-bot wire is gone (FEAT-018); every reader uses the
+    # ``bot_names`` list, and the wire model projects fields via from_perf.
+    perf = AgentPerformance(agent_id="a.s_1", bot_names=["river"])
+    assert not hasattr(perf, "bot_name")
+    assert not hasattr(perf, "to_dict")
 
 
 # ── Config field ──
@@ -700,27 +854,37 @@ def test_slice_history_series_matches_per_stamp_slices():
 
 
 def test_slice_history_series_is_linear_not_quadratic():
-    """3 instances × 5000 rows: one merge pass stays well under 100ms."""
+    """A 4x bigger input costs about 4x, not the ~16x of a per-stamp rescan."""
+    import gc
     import time
 
     from condor.fetchers.bot_performance import slice_history_series
 
-    histories = []
-    for k in range(3):
-        histories.append(
+    def build_and_time(rows: int) -> float:
+        histories = [
             [
                 (float(k + i * 3), float(i), float(i * 10), float(i), float(i) / 10)
-                for i in range(5000)
+                for i in range(rows)
             ]
-        )
-    stamps = sorted({t for h in histories for t, *_ in h})
+            for k in range(3)
+        ]
+        stamps = sorted({t for h in histories for t, *_ in h})
 
-    t0 = time.perf_counter()
-    out = slice_history_series(histories, 0.0, stamps)
-    elapsed = time.perf_counter() - t0
+        gc.collect()
+        t0 = time.perf_counter()
+        out = slice_history_series(histories, 0.0, stamps)
+        elapsed = time.perf_counter() - t0
 
-    assert len(out) == len(stamps)
-    assert elapsed < 0.1, f"series build took {elapsed:.3f}s"
+        assert len(out) == len(stamps)
+        return elapsed
+
+    small = build_and_time(2500)
+    large = build_and_time(10000)
+
+    # Linear measures ~4x for this 4x step; a quadratic rescan ~16x.
+    assert (
+        large < small * 8
+    ), f"4x input cost {large / small:.2f}x ({small:.4f}s → {large:.4f}s)"
 
 
 def test_fetch_instance_history_sums_controllers_and_filters_trades():
@@ -766,6 +930,131 @@ def test_fetch_instance_history_sums_controllers_and_filters_trades():
     assert fees == 0.0
 
 
+# ── A dead strategy's 0/0 readings (quad_threat_orchestrator, 2026-10-08) ──
+#
+# A bot whose strategy died stays listed and keeps reporting 0/0. Read as a
+# cumulative, that is a fall back to zero, and session figures are differences
+# of cumulatives — so a bot adopted mid-life read as -$78k volume and invented
+# PnL, and a bot born and killed in one session vanished.
+
+
+def _dead_bot_client(rows_by_ts: list[tuple[str, list[tuple[float, float]]]]):
+    """Per timestamp, one (realized, volume) per controller, as history rows.
+
+    Built on :func:`_history_client` / :func:`_hist_row` further down.
+    """
+    return _history_client(
+        [
+            _hist_row(ts, f"c{i}", realized, volume)
+            for ts, controllers in rows_by_ts
+            for i, (realized, volume) in enumerate(controllers)
+        ]
+    )
+
+
+def _epoch(ts: str) -> float:
+    from condor.fetchers.bot_performance import _iso_to_epoch
+
+    return _iso_to_epoch(ts)
+
+
+_T0 = "2026-10-08T01:00:00+00:00"
+_T1 = "2026-10-08T02:00:00+00:00"
+_T2 = "2026-10-08T03:00:00+00:00"  # strategy dies after this reading
+_T3 = "2026-10-08T04:00:00+00:00"
+_T4 = "2026-10-08T05:00:00+00:00"
+
+
+def test_a_dead_strategys_zero_readings_carry_its_last_real_cumulative():
+    from condor.fetchers.bot_performance import fetch_instance_history
+
+    client = _dead_bot_client(
+        [
+            (_T0, [(1.0, 100.0)]),
+            (_T2, [(5.0, 900.0)]),
+            (_T3, [(0.0, 0.0)]),
+            (_T4, [(0.0, 0.0)]),
+        ]
+    )
+
+    hist = asyncio.run(fetch_instance_history(client, "quad-e4"))
+
+    assert [(r[1], r[2]) for r in hist] == [(1.0, 100.0), (5.0, 900.0)]
+
+
+def test_a_bot_adopted_mid_life_that_dies_keeps_what_it_did_in_session():
+    """The quad symptom: negative volume and invented PnL for the session."""
+    from condor.fetchers.bot_performance import fetch_instance_history, slice_history
+
+    client = _dead_bot_client(
+        [
+            (_T0, [(1.0, 100.0)]),
+            (_T1, [(3.0, 500.0)]),  # adopted here
+            (_T2, [(5.0, 900.0)]),
+            (_T3, [(0.0, 0.0)]),
+        ]
+    )
+    hist = asyncio.run(fetch_instance_history(client, "quad-e4"))
+
+    realized, volume, _, _ = slice_history([hist], _epoch(_T1), _epoch(_T4))
+
+    assert (realized, volume) == (2.0, 400.0)  # was (-3.0, -500.0)
+
+
+def test_a_bot_born_and_killed_in_one_session_does_not_vanish():
+    from condor.fetchers.bot_performance import fetch_instance_history, slice_history
+
+    client = _dead_bot_client([(_T1, [(4.0, 700.0)]), (_T3, [(0.0, 0.0)])])
+    hist = asyncio.run(fetch_instance_history(client, "quad-e4"))
+
+    realized, volume, _, _ = slice_history([hist], _epoch(_T0), _epoch(_T4))
+
+    assert (realized, volume) == (4.0, 700.0)  # was (0.0, 0.0)
+
+
+def test_zeros_before_a_controllers_first_trade_are_kept():
+    from condor.fetchers.bot_performance import fetch_instance_history
+
+    client = _dead_bot_client(
+        [(_T0, [(0.0, 0.0)]), (_T1, [(0.0, 0.0)]), (_T2, [(2.0, 50.0)])]
+    )
+
+    hist = asyncio.run(fetch_instance_history(client, "fresh-bot"))
+
+    assert [r[2] for r in hist] == [0.0, 0.0, 50.0]
+
+
+def test_only_the_dead_controller_is_held_its_live_sibling_keeps_moving():
+    from condor.fetchers.bot_performance import fetch_instance_history
+
+    client = _dead_bot_client(
+        [
+            (_T1, [(1.0, 100.0), (2.0, 200.0)]),
+            (_T2, [(0.0, 0.0), (3.0, 300.0)]),  # c0 died, c1 still trading
+            (_T3, [(0.0, 0.0), (4.0, 400.0)]),
+        ]
+    )
+
+    hist = asyncio.run(fetch_instance_history(client, "two-strategies"))
+
+    assert [(r[1], r[2]) for r in hist] == [
+        (3.0, 300.0),
+        (4.0, 400.0),
+        (5.0, 500.0),
+    ]
+
+
+def test_a_real_reading_after_a_loss_to_breakeven_is_not_dropped():
+    """Only an all-zero reading is dead: realized PnL back at 0 with volume is real."""
+    from condor.fetchers.bot_performance import fetch_instance_history
+
+    client = _dead_bot_client([(_T1, [(2.0, 100.0)]), (_T2, [(0.0, 300.0)])])
+
+    hist = asyncio.run(fetch_instance_history(client, "breakeven"))
+
+    assert [(r[1], r[2]) for r in hist] == [(2.0, 100.0), (0.0, 300.0)]
+
+
 # ── Provider wiring ──
 
 
@@ -774,10 +1063,10 @@ def _capture_provider_fetch(monkeypatch) -> dict:
 
     captured: dict = {}
 
-    async def _fake_fetch(client, agent_id, bot_names=None, since=0.0):
+    async def _fake_fetch(client, agent_id, bot_names=None, windows=None, **_kw):
         captured["agent_id"] = agent_id
         captured["bot_names"] = bot_names
-        captured["since"] = since
+        captured["windows"] = windows
         return _AP(agent_id=agent_id, bot_names=list(bot_names or []))
 
     monkeypatch.setattr(
@@ -802,7 +1091,7 @@ def test_executors_provider_falls_back_to_config_bot_name(monkeypatch):
     assert captured == {
         "agent_id": "river.scalp_1",
         "bot_names": ["river"],
-        "since": 0.0,  # no ledger → no takeover instant → unsliced, as before
+        "windows": {},  # no ledger → no takeover instant → unsliced, as before
     }
 
 
@@ -962,7 +1251,7 @@ def test_adopted_bot_pnl_is_sliced_to_the_sessions_window():
 
     perf = asyncio.run(
         fetch_agent_performance(
-            client, "ns.strat_2", bot_names=["ns-bot"], since=took_over
+            client, "ns.strat_2", windows={"ns-bot": OwnershipWindow(took_over)}
         )
     )
 
@@ -1356,8 +1645,8 @@ def test_a_stopped_bots_realized_pnl_reaches_the_agent():
         fetch_agent_performance(
             client,
             "directional_trader.ema_trend_loop_1",
-            bot_names=["ema_trend_loop"],
-            since=1786052340.0,  # 2026-08-06 21:39 UTC, the session's first tick
+            # 2026-08-06 21:39 UTC, the session's first tick
+            windows={"ema_trend_loop": OwnershipWindow(1786052340.0)},
         )
     )
 
@@ -1396,7 +1685,9 @@ def test_a_base_with_no_instance_anywhere_is_flagged_not_zeroed():
 
     perf = asyncio.run(
         fetch_agent_performance(
-            client, "agent.strat_1", bot_names=["vanished_bot"], since=1786052340.0
+            client,
+            "agent.strat_1",
+            windows={"vanished_bot": OwnershipWindow(1786052340.0)},
         )
     )
 
@@ -1482,9 +1773,156 @@ def test_pnl_series_is_continuous_across_a_redeploy():
     assert pnls[-1] == pytest.approx(-0.3053 + -0.4635, abs=1e-4)
 
 
+def test_pnl_series_from_histories_matches_the_network_fetch():
+    """PERF-639: the pure merge over fetched histories IS the standalone curve."""
+    from condor.agents.performance import (
+        fetch_agent_pnl_series,
+        pnl_series_from_histories,
+    )
+    from condor.fetchers.bot_performance import (
+        clear_archived_cache,
+        fetch_archived_instances,
+        fetch_base_histories,
+    )
+
+    clear_archived_cache()
+    since, end = 1786052340.0, 1786200000.0
+    history = {
+        "loop-20260806-213931": [
+            _hist_row("2026-08-06T22:00:00+00:00", "btc", 0.0, 193.0),
+            _hist_row("2026-08-06T22:45:00+00:00", "btc", -0.3053, 386.19),
+        ],
+        "loop-20260807-022130": [
+            _hist_row("2026-08-07T02:22:00+00:00", "btc", 0.0, 193.05),
+            _hist_row("2026-08-07T03:27:00+00:00", "btc", -0.4635, 385.84),
+        ],
+    }
+
+    class _Archived:
+        async def list_databases(self):
+            return [f"{n}.sqlite" for n in history]
+
+    class _Orch:
+        async def get_latest_controller_performance(self, bot_name=None):
+            return {"data": []}
+
+        async def get_controller_performance_history(self, bot_name, **kw):
+            return {"data": history.get(bot_name, [])}
+
+    client = SimpleNamespace(
+        base_url="", bot_orchestration=_Orch(), archived_bots=_Archived()
+    )
+
+    async def _both():
+        archived = await fetch_archived_instances(client)
+        histories = await fetch_base_histories(
+            client, {}, ["loop"], since, end, extra_names=archived
+        )
+        return (
+            pnl_series_from_histories(histories, since, end),
+            await fetch_agent_pnl_series(client, ["loop"], since, until=end),
+        )
+
+    derived, fetched = asyncio.run(_both())
+
+    assert [round(p["pnl"], 4) for p in derived] == [0.0, -0.3053, -0.3053, -0.7688]
+    assert derived == fetched
+    assert pnl_series_from_histories({}, since, end) == []
+
+
 def test_pnl_series_is_empty_without_an_owned_bot():
     """An executor-only session has no bot history; the journal stays the source."""
     from condor.agents.performance import fetch_agent_pnl_series
 
     assert asyncio.run(fetch_agent_pnl_series(object(), [], since=1.0)) == []
     assert asyncio.run(fetch_agent_pnl_series(object(), ["b"], since=0.0)) == []
+
+
+# ---------------------------------------------------------------------------
+# CORR-725: a performance object that says nothing is not a flat book
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_reports_the_reading_state_tri_state():
+    """``float(perf.get(..., 0) or 0)`` makes "no data" and "flat" the same
+    number. The state travels alongside the figures so a reader can tell them
+    apart (GitHub #272: "'No reading' is unknown, not zero")."""
+    agg = _aggregate_by_bot(
+        [
+            {"bot_name": "no_perf", "controller_id": "c1"},
+            {"bot_name": "bad_perf", "controller_id": "c2", "performance": "nope"},
+            {"bot_name": "empty_perf", "controller_id": "c3", "performance": {}},
+            {
+                "bot_name": "real_perf",
+                "controller_id": "c4",
+                "performance": {"realized_pnl_quote": 0.0, "volume_traded": 0.0},
+            },
+        ]
+    )
+
+    assert agg["no_perf"]["reading"] == "missing"
+    assert agg["bad_perf"]["reading"] == "missing"
+    assert agg["empty_perf"]["reading"] == "empty"
+    # A controller that genuinely reports zeros is a reading, not an absence.
+    assert agg["real_perf"]["reading"] == "ok"
+
+    # The numeric fields are all 0.0 in every one of the four, which is exactly
+    # why the state is needed: the figures cannot carry the difference.
+    for bn in ("no_perf", "bad_perf", "empty_perf", "real_perf"):
+        bot = agg[bn]
+        assert bot["realized_pnl_quote"] == 0.0
+        assert bot["unrealized_pnl_quote"] == 0.0
+        assert bot["volume_traded"] == 0.0
+        # Per-controller too, so a reader of the rows is not back to guessing.
+        assert bot["controllers"][0]["reading"] == bot["reading"]
+
+
+def test_a_flat_shaped_snapshot_still_reads_ok():
+    """``performance`` absent is only ``missing`` when nothing was reported --
+    a snapshot carrying the fields at its top level has the data, just not
+    nested."""
+    agg = _aggregate_by_bot(
+        [{"bot_name": "flat", "controller_id": "c", "volume_traded": 500.0}]
+    )
+
+    assert agg["flat"]["reading"] == "ok"
+    assert agg["flat"]["volume_traded"] == 500.0
+
+
+def test_one_reporting_controller_lifts_the_bots_reading():
+    agg = _aggregate_by_bot(
+        [
+            {"bot_name": "mixed", "controller_id": "quiet", "performance": {}},
+            {
+                "bot_name": "mixed",
+                "controller_id": "loud",
+                "performance": {"volume_traded": 10.0},
+            },
+        ]
+    )
+
+    assert agg["mixed"]["reading"] == "ok"
+    assert [c["reading"] for c in agg["mixed"]["controllers"]] == ["empty", "ok"]
+
+
+def test_resolve_bots_carries_the_reading_across_instances():
+    """``_merge_instance_aggregates`` pools the figures of a redeployed base;
+    the reading must be pooled too, or an instance that reports would be hidden
+    behind one that does not."""
+    all_perf = _aggregate_by_bot(
+        [
+            {"bot_name": "base-1", "controller_id": "a", "performance": {}},
+            {
+                "bot_name": "base-2",
+                "controller_id": "b",
+                "performance": {"volume_traded": 3.0},
+            },
+        ]
+    )
+    all_perf["base"] = all_perf.pop("base-1")
+    all_perf["base"]["bot_name"] = "base"
+
+    resolved = resolve_bots(all_perf, ["base"], live_names={"base", "base-2"})
+
+    assert resolved["base"]["reading"] == "ok"
+    assert resolved["base"]["volume_traded"] == 3.0

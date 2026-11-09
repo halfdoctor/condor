@@ -11,7 +11,13 @@ import {
   type ControllerPerformanceSnapshot,
   type BotRunInfo,
   type ExecutorInfo,
+  type ExecutorHygiene,
+  type FleetDiagnostics,
 } from "@/lib/api";
+import {
+  UNKNOWN_DIAGNOSTICS,
+  UNKNOWN_EXECUTOR_HYGIENE,
+} from "@/components/bots/fleet-diagnostics";
 import type { DeedIndex, FleetOwner } from "@/lib/agent-attribution";
 import type { ExecutorPaging } from "@/components/perf/PerfBrowser";
 import type { Population } from "@/lib/perf-tree";
@@ -64,6 +70,15 @@ export interface FleetData {
   terminatedControllers: ControllerInfo[];
   owners: FleetOwner[];
   deeds: DeedIndex | null;
+  /**
+   * The host, lag and throttle signals the fleet map carries (FEAT-141).
+   *
+   * Off the map rather than a query of its own: the diagnostics view may add
+   * no poll to a page that already polls per server.
+   */
+  diagnostics: FleetDiagnostics;
+  /** This host's executor hygiene, off the bots payload (FEAT-141). */
+  hygiene: ExecutorHygiene;
   /** Display-currency conversion over every quote on screen. */
   convert: ConvertFn;
   currencySymbol: string;
@@ -108,10 +123,10 @@ export function useFleetData(
      * Whether to walk the fleet's performance history (ARCH-324).
      *
      * On by default, because both pages that fold a whole fleet also chart it.
-     * A host that only wants the *fold* — the home overview's money column,
-     * which folds one population per server and draws nothing — would
-     * otherwise pay a paged request per controller per server for a series it
-     * never reads. Every other query is left exactly as it was, under the same
+     * A host that only wants the *fold* — the execution dock
+     * (`components/chat/DockExecution.tsx`, PERF-373), which folds the running
+     * population and draws nothing — would otherwise pay a paged request per controller per
+     * server for a series it never reads. Every other query is left exactly as it was, under the same
      * keys, so a host that turns the walk off still shares its fleet with the
      * pages that do chart it.
      */
@@ -370,6 +385,8 @@ export function useFleetData(
     terminatedControllers: terminatedData?.controllers ?? EMPTY_TERMINATED,
     owners: fleet?.owners ?? EMPTY_OWNERS,
     deeds: fleet?.deeds ?? null,
+    diagnostics: fleet?.diagnostics ?? UNKNOWN_DIAGNOSTICS,
+    hygiene: data?.executor_hygiene ?? UNKNOWN_EXECUTOR_HYGIENE,
     convert,
     currencySymbol,
     rateFormatPnl: formatPnlValue,

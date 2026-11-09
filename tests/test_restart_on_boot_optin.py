@@ -120,16 +120,14 @@ async def test_boot_restarts_only_the_run_that_opted_in(tmp_path, monkeypatch):
     supervisor = LoopSupervisor()
     restarted: list[str] = []
 
-    async def fake_restart(status):
+    async def fake_restart(status, session_dir=None):
         restarted.append(status["strategy_slug"])
         return True
 
     monkeypatch.setattr(supervisor, "_restart", fake_restart)
 
     for sslug, opted_in in (("keeps_going", True), ("stays_down", False)):
-        session_dir = (
-            tmp_path / "brigado" / "strategies" / sslug / "sessions" / "session_1"
-        )
+        session_dir = tmp_path / "brigado" / "loops" / sslug / "sessions" / "session_1"
         session_dir.mkdir(parents=True)
         (session_dir / "journal.md").write_text("# Journal\n\n## Decisions\n\n")
         (session_dir / "status.json").write_text(

@@ -28,29 +28,35 @@ retrofit here.
 from __future__ import annotations
 
 import asyncio
-import copy
 import hashlib
 import logging
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import condor.reports as reports
 from condor import primitives, routine_hooks
 from condor.memory.paths import (
+    ROUTINES_DIRNAME,
     agent_home_layers,
     iter_agent_slugs,
     shared_routines_roots,
 )
+from condor.runtime import code_guard
 from condor.telemetry import taps as telemetry_taps
 from routines.base import (
+    PendingRoutine,
     RoutineResult,
     _merged_from,
+    catalog_agent_routines,
     discover_routines,
     get_routine,
     library_dir,
     normalize_result,
+    pending_routines,
+    raise_if_pending,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 def _agent_routine_dirs(slug: str) -> tuple:
     """An agent's routine dirs in read order: local first, then shipped."""
-    return tuple(home / "routines" for home in agent_home_layers(slug))
+    return tuple(home / ROUTINES_DIRNAME for home in agent_home_layers(slug))
 
 
 def routine_source_roots() -> tuple[Path, ...]:
@@ -326,9 +332,12 @@ class RoutineStore:
         The chat ``condor`` sees the general library plus every agent's routines
         (prefixed). Each agent's own routines stay isolated under its slug.
 
-        Discovery is mtime-cached in routines.base: only new/changed files are
-        (re)imported, so this stays cheap on every list call while edits are
-        still picked up without a restart.
+        An agent's own routines are read through :func:`catalog_agent_routines`
+        — never ``exec_module`` — so a listing call can never be why a
+        hub-allowed routine's module runs; only an actual resolve-to-run
+        (:meth:`_resolve_routine`) does that. The general library is the
+        chat's own shipped code, never gated, and keeps discovering the normal
+        way.
         """
         all_routines = dict(discover_routines())
 
@@ -337,15 +346,26 @@ class RoutineStore:
         # can never surface here as a routine owner named `_shared/...`, and a
         # local routine shadows the shipped one of the same name.
         for slug in iter_agent_slugs():
-            agent_routines = _merged_from(_agent_routine_dirs(slug), agent_slug=slug)
-            for rname, rinfo in agent_routines.items():
-                # Shallow-copy before prefixing: the RoutineInfo is shared
-                # with the discovery cache and must keep its bare name.
-                prefixed_info = copy.copy(rinfo)
-                prefixed_info.name = f"{slug}/{rname}"
-                all_routines[prefixed_info.name] = prefixed_info
+            for rname, entry in catalog_agent_routines(slug).items():
+                prefixed_name = f"{slug}/{rname}"
+                all_routines[prefixed_name] = replace(entry, name=prefixed_name)
 
         return all_routines
+
+    def _pending_all(self) -> dict[str, PendingRoutine]:
+        """Every routine discovery refused to import, prefixed like the rest.
+
+        The other half of :meth:`_discover_all` (FEAT-147), and a separate
+        call because it returns a separate type: these rows carry no
+        ``run_fn``, so a caller that would run one cannot be handed one by
+        accident. Only an agent imported from a bundle has any — see
+        :mod:`condor.agents.code_trust`.
+        """
+        pending: dict[str, PendingRoutine] = {}
+        for slug in iter_agent_slugs():
+            for row in pending_routines(slug):
+                pending[f"{slug}/{row.name}"] = row
+        return pending
 
     def _get_report_counts(self, owner_id: int | None = None) -> dict[str, int]:
         """Get report count per routine source_name.
@@ -376,9 +396,20 @@ class RoutineStore:
         row set is deliberately the whole install's: see the module docstring
         (SEC-617) for why definitions are install-wide while the runs counted
         beside them are per-user.
+
+        A routine awaiting execution consent (FEAT-147) is listed here too,
+        flagged ``pending`` and carrying no ``fields`` — more visible than a
+        loaded one, not less, because reading it is exactly what the operator
+        is being asked to do before allowing it.
         """
         all_routines = self._discover_all()
         report_counts = self._get_report_counts(owner_id)
+
+        def tally(name: str) -> int:
+            return report_counts.get(name, 0) or report_counts.get(
+                name.split("/")[-1], 0
+            )
+
         out = []
         for name, info in all_routines.items():
             out.append(
@@ -390,8 +421,24 @@ class RoutineStore:
                     "source": info.source,
                     "fields": info.get_fields(),
                     "last_modified": info.last_modified,
-                    "report_count": report_counts.get(name, 0)
-                    or report_counts.get(name.split("/")[-1], 0),
+                    "report_count": tally(name),
+                    "pending": False,
+                    "pending_reason": "",
+                }
+            )
+        for name, row in self._pending_all().items():
+            out.append(
+                {
+                    "name": name,
+                    "description": row.description,
+                    "is_continuous": row.continuous,
+                    "category": row.category,
+                    "source": row.source,
+                    "fields": {},
+                    "last_modified": row.last_modified,
+                    "report_count": tally(name),
+                    "pending": True,
+                    "pending_reason": row.reason,
                 }
             )
         return out
@@ -764,12 +811,24 @@ class RoutineStore:
                     source_name=base_name,
                 ),
                 primitives.bind_context(ctx),
+                # Routines are agent-written code on the main loop too: the
+                # same policy as run_code, and exit() is an error, not a
+                # shutdown (condor/runtime/code_guard.py).
+                code_guard.guarded(code_guard.routine_scope(instance_id)),
+                code_guard.contain_exit(),
             ):
                 cfg = routine.config_class(**config)
                 raw = await routine.run_fn(cfg, ctx)
             result = normalize_result(raw)
         except asyncio.CancelledError:
             result = RoutineResult(text="Stopped by user")
+        except code_guard.CodeRunDeadline as e:
+            # A routine called under a snippet's deadline ran past it. Recorded
+            # like any failure: a BaseException passing through here would
+            # leave the instance "running" with no result, forever.
+            logger.warning(f"Routine {routine.name}[{instance_id}] interrupted: {e}")
+            result = RoutineResult(text=f"Error: CodeRunDeadline: {e}")
+            failed = True
         except Exception as e:
             tb = traceback.format_exc()
             logger.error(
@@ -832,7 +891,16 @@ class RoutineStore:
             await self._fire_hooks(instance_id, result, report_id, failed)
 
     def _resolve_routine(self, routine_name: str):
-        """Resolve a routine by name, supporting 'agent_slug/routine_name' format."""
+        """Resolve a routine by name, supporting 'agent_slug/routine_name' format.
+
+        Raises :class:`~condor.agents.code_trust.PendingConsentError` for a
+        routine that exists but has not been allowed to execute on this
+        install (FEAT-147). Raising rather than returning ``None`` is the
+        point: every run path — the web runner, the scheduler, the MCP tool
+        and ``condor.primitives`` — goes through here, and "not found" would
+        send the operator looking for a file that is sitting right in front of
+        them in the panel.
+        """
         # Try global first
         routine = get_routine(routine_name)
         if routine:
@@ -841,8 +909,27 @@ class RoutineStore:
         if "/" in routine_name:
             slug, rname = routine_name.split("/", 1)
             agent_routines = _merged_from(_agent_routine_dirs(slug), agent_slug=slug)
-            return agent_routines.get(rname)
+            found = agent_routines.get(rname)
+            if found:
+                return found
+            raise_if_pending(slug, rname)
         return None
+
+    def get_routine_fields(self, routine_name: str) -> dict[str, dict]:
+        """Resolve ``routine_name`` and return its ``Config`` fields.
+
+        ``list_routines`` reads an agent's own routines through
+        :func:`catalog_agent_routines`, which never imports the module, so an
+        allowed-but-not-yet-imported routine lists with ``fields: {}`` there.
+        This is the Config form's own lookup, used only once the operator
+        opens it: resolving to read the fields crosses the same trust
+        boundary ``execute``/``start_continuous`` already cross for an
+        *allowed* routine, so doing it here is no new exposure — a pending
+        one still raises :class:`~condor.agents.code_trust.PendingConsentError`
+        through :meth:`_resolve_routine` and gets no fields either.
+        """
+        routine = self._resolve_routine(routine_name)
+        return routine.get_fields() if routine else {}
 
     async def execute(
         self,
@@ -879,10 +966,13 @@ class RoutineStore:
             on_complete=on_complete,
         )
 
+        # Detached: a background run started from a snippet must not inherit
+        # that snippet's deadline and die with it (code_guard).
         task = asyncio.create_task(
             self._run_oneshot(
                 instance_id, routine, config, server_name, user_id, agent=agent
-            )
+            ),
+            context=code_guard.detached_context(),
         )
         self._tasks[instance_id] = task
         return instance_id
@@ -939,10 +1029,13 @@ class RoutineStore:
             session_key=session_key,
         )
 
+        # Detached: a background run started from a snippet must not inherit
+        # that snippet's deadline and die with it (code_guard).
         task = asyncio.create_task(
             self._run_continuous(
                 instance_id, routine, config, server_name, user_id, agent=agent
-            )
+            ),
+            context=code_guard.detached_context(),
         )
         self._tasks[instance_id] = task
         return instance_id
@@ -995,10 +1088,13 @@ class RoutineStore:
             schedule={"type": "interval", "interval_sec": interval_sec},
         )
 
+        # Detached: a background run started from a snippet must not inherit
+        # that snippet's deadline and die with it (code_guard).
         task = asyncio.create_task(
             self._run_scheduled(
                 instance_id, routine, config, server_name, interval_sec, user_id
-            )
+            ),
+            context=code_guard.detached_context(),
         )
         self._tasks[instance_id] = task
         return instance_id
